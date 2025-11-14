@@ -1,11 +1,20 @@
 import json
 import os
 import re
+import time
 from itertools import zip_longest
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from requests.exceptions import ReadTimeout
+except Exception:  # pragma: no cover - optional dependency
+    class ReadTimeout(Exception):  # type: ignore
+        pass
+
 DIM_PLACEHOLDER = "__DXF_DIM__"
 OPENAI_SAFE_TEXT = 4500
+OPENAI_RETRY_ATTEMPTS = 3
+OPENAI_RETRY_DELAY = 3.0
 
 OPENAI_REASONING_MODELS = {
     "gpt-5-chat-latest",
@@ -322,7 +331,7 @@ class TranslationEngine:
         client = translator.get("client")
         module = translator.get("module")
         model = translator.get("model")
-        batch_size = translator.get("batch_size", 16)
+        batch_size = translator.get("batch_size", 12)
 
         if self.openai_api_key:
             os.environ["OPENAI_API_KEY"] = self.openai_api_key
@@ -514,24 +523,32 @@ class TranslationEngine:
                     {"role": "system", "content": system_content},
                     {"role": "user", "content": single_payload},
                 ]
-                try:
-                    base_kwargs = {
-                        "model": model,
-                        "messages": single_messages,
-                    }
-                    base_kwargs.update(self._openai_generation_kwargs(model))
-                    if chat_completion_create:
-                        modern_kwargs = dict(base_kwargs)
-                        modern_kwargs["response_format"] = {"type": "json_object"}
-                        completion = chat_completion_create(**modern_kwargs)  # type: ignore[misc]
-                    elif module is not None:
-                        completion = module.ChatCompletion.create(  # type: ignore[attr-defined]
-                            **base_kwargs
-                        )
-                    else:  # pragma: no cover - defensive
-                        raise RuntimeError("OpenAI legacy клиент недоступен")
-                except Exception as exc:  # pragma: no cover - network
-                    raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
+                base_kwargs = {
+                    "model": model,
+                    "messages": single_messages,
+                }
+                base_kwargs.update(self._openai_generation_kwargs(model))
+
+                completion = None
+                for attempt in range(OPENAI_RETRY_ATTEMPTS):
+                    try:
+                        if chat_completion_create:
+                            modern_kwargs = dict(base_kwargs)
+                            modern_kwargs["response_format"] = {"type": "json_object"}
+                            completion = chat_completion_create(**modern_kwargs)  # type: ignore[misc]
+                        elif module is not None:
+                            completion = module.ChatCompletion.create(  # type: ignore[attr-defined]
+                                **base_kwargs
+                            )
+                        else:  # pragma: no cover - defensive
+                            raise RuntimeError("OpenAI legacy клиент недоступен")
+                        break
+                    except Exception as exc:  # pragma: no cover - network
+                        if (attempt + 1 == OPENAI_RETRY_ATTEMPTS) or not self._should_retry_openai(exc):
+                            raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
+                        time.sleep(OPENAI_RETRY_DELAY)
+                if completion is None:
+                    continue
 
                 message = extract_message(completion) or "{}"
                 translated_text = part_text
@@ -559,18 +576,26 @@ class TranslationEngine:
                     {"role": "system", "content": system_content},
                     {"role": "user", "content": user_content},
                 ]
-                try:
-                    modern_kwargs = {
-                        "model": model,
-                        "messages": messages_payload,
-                        "response_format": {"type": "json_object"},
-                    }
-                    modern_kwargs.update(self._openai_generation_kwargs(model))
-                    completion = client.chat.completions.create(  # type: ignore[attr-defined]
-                        **modern_kwargs
-                    )
-                except Exception as exc:  # pragma: no cover - network
-                    raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
+
+                completion = None
+                for attempt in range(OPENAI_RETRY_ATTEMPTS):
+                    try:
+                        modern_kwargs = {
+                            "model": model,
+                            "messages": list(messages_payload),
+                            "response_format": {"type": "json_object"},
+                        }
+                        modern_kwargs.update(self._openai_generation_kwargs(model))
+                        completion = client.chat.completions.create(  # type: ignore[attr-defined]
+                            **modern_kwargs
+                        )
+                        break
+                    except Exception as exc:  # pragma: no cover - network
+                        if (attempt + 1 == OPENAI_RETRY_ATTEMPTS) or not self._should_retry_openai(exc):
+                            raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
+                        time.sleep(OPENAI_RETRY_DELAY)
+                if completion is None:
+                    continue
 
                 message = extract_message(completion) or "{}"
                 try:
@@ -615,6 +640,12 @@ class TranslationEngine:
             return {}
         return {"temperature": self.openai_temperature}
 
+    def _should_retry_openai(self, exc: Exception) -> bool:
+        if isinstance(exc, ReadTimeout):
+            return True
+        message = str(exc).lower()
+        return "timed out" in message or "timeout" in message
+
     def _split_openai_payload(self, text: str, limit: int = OPENAI_SAFE_TEXT) -> List[str]:
         if len(text) <= limit or limit <= 0:
             return [text]
@@ -625,11 +656,19 @@ class TranslationEngine:
             end = min(start + limit, length)
             split_pos = end
             if end < length:
+                candidates: List[int] = []
                 newline_pos = text.rfind("\n", start, end)
+                if newline_pos > start:
+                    candidates.append(newline_pos + 1)
                 space_pos = text.rfind(" ", start, end)
-                candidate = max(newline_pos, space_pos)
-                if candidate > start:
-                    split_pos = candidate + 1
+                if space_pos > start:
+                    candidates.append(space_pos + 1)
+                for char in ".!?;:,":
+                    pos = text.rfind(char, start, end)
+                    if pos > start:
+                        candidates.append(pos + 1)
+                if candidates:
+                    split_pos = max(candidates)
             piece = text[start:split_pos]
             if not piece:
                 piece = text[start:end]
