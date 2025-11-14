@@ -19,6 +19,15 @@ import apply_dxf_translation as applier
 import extract_dxf_texts as extractor
 from auto_translation import TranslationEngine
 
+DEFAULT_MAP_CACHE = Path("map_auto.csv")
+
+
+def paths_equal(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except Exception:
+        return a == b
+
 
 class Spinner:
     def __init__(self, message: str = "", enabled: bool = True, interval: float = 0.1) -> None:
@@ -151,6 +160,27 @@ def write_map_csv(path: Path, english: List[str], russian: List[str]) -> None:
             writer.writerow([en, ru])
 
 
+def read_map_csv(path: Optional[Path]) -> Dict[str, str]:
+    cache: Dict[str, str] = {}
+    if not path:
+        return cache
+    try:
+        if not path.exists():
+            return cache
+        with path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+                en = (row.get("text_en") or "").strip()
+                ru = row.get("text_ru") or ""
+                if en:
+                    cache[en] = ru
+    except Exception:
+        return {}
+    return cache
+
+
 def apply_translations(doc, pairs: List[Tuple[str, str]], style_font: Optional[str] = None) -> None:
     if style_font:
         applier.STYLE_FONT = style_font
@@ -201,6 +231,14 @@ def translate_dxf(
     sorted_items = extractor.sort_frequency(freq)
     english_texts = [text for text, _ in sorted_items]
     logger(f"Найдено {len(english_texts)} текстовых элементов для перевода")
+    cache_lookup_path: Optional[Path] = None
+    if map_path:
+        cache_lookup_path = map_path
+    elif DEFAULT_MAP_CACHE.exists():
+        cache_lookup_path = DEFAULT_MAP_CACHE
+    translation_cache = read_map_csv(cache_lookup_path)
+    if translation_cache and cache_lookup_path:
+        logger(f"Loaded {len(translation_cache)} cached translations from {cache_lookup_path}")
 
     translator = TranslationEngine(
         provider=translator_name,
@@ -219,27 +257,42 @@ def translate_dxf(
     context_factory = translation_context_factory or (lambda _msg: nullcontext())
     logger("Начинаем перевод... [0%]")
     total_items = len(english_texts)
-    russian_texts: List[str] = []
-    if total_items == 0:
+    translation_slots: List[Optional[str]] = [None] * total_items
+    text_to_indices: Dict[str, List[int]] = {}
+    cached_hits = 0
+    for idx, text in enumerate(english_texts):
+        cached_value = translation_cache.get(text) if translation_cache else None
+        if cached_value is not None:
+            translation_slots[idx] = cached_value
+            cached_hits += 1
+        else:
+            bucket = text_to_indices.setdefault(text, [])
+            bucket.append(idx)
+    unique_pending = list(text_to_indices.keys())
+    if total_items == 0 or not unique_pending:
         logger("Начинаем перевод... [100%]")
     else:
-        batch_size = max(1, total_items // 20)  # целимся максимум в ~20 шагов
-        processed = 0
+        processed = cached_hits
+        batch_size = max(1, len(unique_pending) // 20)
         with context_factory("Переводим..."):
-            for start in range(0, total_items, batch_size):
-                chunk = english_texts[start : start + batch_size]
-                translated_chunk = translator.translate_many(chunk)
-                russian_texts.extend(translated_chunk)
-                processed += len(translated_chunk)
-                percent = min(100, int(processed / total_items * 100))
+            for start_idx in range(0, len(unique_pending), batch_size):
+                chunk_texts = unique_pending[start_idx : start_idx + batch_size]
+                translated_chunk = translator.translate_many(chunk_texts)
+                for original_text, translated_text in zip(chunk_texts, translated_chunk):
+                    translation_cache[original_text] = translated_text
+                    for text_index in text_to_indices.get(original_text, []):
+                        translation_slots[text_index] = translated_text
+                        processed += 1
+                percent = min(100, int(processed / total_items * 100)) if total_items else 100
                 logger(f"Начинаем перевод... [{percent}%]")
         if processed < total_items:
-            # На случай, если последний перевод не дожал до 100%
             logger("Начинаем перевод... [100%]")
-        if len(russian_texts) < total_items:
-            russian_texts.extend(english_texts[len(russian_texts) :])
-        elif len(russian_texts) > total_items:
-            del russian_texts[total_items:]
+    russian_texts: List[str] = []
+    for idx, original in enumerate(english_texts):
+        translated_value = translation_slots[idx] if idx < len(translation_slots) else None
+        if not translated_value:
+            translated_value = original
+        russian_texts.append(translated_value)
     logger("Перевод завершён")
 
     if save_txt and extracted_txt_path:
@@ -255,6 +308,14 @@ def translate_dxf(
         ensure_parent(map_path)
         write_map_csv(map_path, english_texts, russian_texts)
         logger(f"Сохранена карта переводов CSV: {map_path}")
+    cache_output_path: Optional[Path] = DEFAULT_MAP_CACHE
+    if save_map and map_path and paths_equal(map_path, DEFAULT_MAP_CACHE):
+        cache_output_path = None
+    if cache_output_path:
+        ensure_parent(cache_output_path)
+        write_map_csv(cache_output_path, english_texts, russian_texts)
+        if not (save_map and map_path and paths_equal(map_path, DEFAULT_MAP_CACHE)):
+            logger(f"Обновлён локальный кэш переводов: {cache_output_path}")
 
     pairs = list(zip(english_texts, russian_texts))
     pairs.sort(key=lambda x: -len(x[0]))

@@ -2,9 +2,10 @@ import json
 import os
 import re
 from itertools import zip_longest
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 DIM_PLACEHOLDER = "__DXF_DIM__"
+OPENAI_SAFE_TEXT = 4500
 
 OPENAI_REASONING_MODELS = {
     "gpt-5-chat-latest",
@@ -403,6 +404,13 @@ class TranslationEngine:
                 return False
             if re.fullmatch(r"[-+]?\d+[\d\s./-]*", stripped):
                 return False
+            compact = stripped.replace(" ", "")
+            if (
+                re.fullmatch(r"[A-Za-z0-9*\-./]+", compact)
+                and any(ch.isalpha() for ch in compact)
+                and any(ch.isdigit() for ch in compact)
+            ):
+                return False
             return True
 
         def extract_message(completion_obj) -> str:
@@ -470,98 +478,134 @@ class TranslationEngine:
         if not candidate_indices:
             return results
 
+        split_jobs: List[Tuple[str, int, int, str]] = []
+        part_counts: Dict[int, int] = {}
+        part_sources: Dict[Tuple[int, int], str] = {}
+        for idx in candidate_indices:
+            segments = self._split_openai_payload(texts[idx])
+            part_counts[idx] = len(segments)
+            for part_idx, segment in enumerate(segments):
+                job_id = f"{idx}:{part_idx}"
+                split_jobs.append((job_id, idx, part_idx, segment))
+                part_sources[(idx, part_idx)] = segment
+
+        if not split_jobs:
+            return results
+
         reasoning_note = self._openai_reasoning_note(model)
         system_content = (
             "You are a professional technical translator of elevator drawing manuals. Translate the provided values from "
             f"{self.source_lang or 'auto-detected'} to {self.target_lang}. Preserve numbers, "
-            "placeholders like '__DXF_DIM__', and DXF control sequences such as '\n'. Respond "
+            "placeholders like '__DXF_DIM__', and DXF control sequences such as \"\n\". Respond "
             "with strict JSON: {\"translations\": [{\"id\": \"<id>\", \"text\": \"<translated>\"}, ...]}"
         )
         if reasoning_note:
             system_content = f"{system_content} {reasoning_note}"
 
-        for chunk in chunked(candidate_indices, batch_size):
-            payload = [
-                {"id": str(idx), "text": texts[idx]}
-                for idx in chunk
-            ]
-            user_content = json.dumps({"items": payload}, ensure_ascii=False)
-            messages_payload = [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content},
-            ]
+        assembled_parts: Dict[int, Dict[int, str]] = {}
 
-            if mode == "legacy":
-                for idx in chunk:
-                    single_payload = json.dumps(
-                        {"items": [{"id": str(idx), "text": texts[idx]}]},
-                        ensure_ascii=False,
+        if mode == "legacy":
+            for job_id, orig_idx, part_idx, part_text in split_jobs:
+                single_payload = json.dumps(
+                    {"items": [{"id": job_id, "text": part_text}]},
+                    ensure_ascii=False,
+                )
+                single_messages = [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": single_payload},
+                ]
+                try:
+                    base_kwargs = {
+                        "model": model,
+                        "messages": single_messages,
+                    }
+                    base_kwargs.update(self._openai_generation_kwargs(model))
+                    if chat_completion_create:
+                        modern_kwargs = dict(base_kwargs)
+                        modern_kwargs["response_format"] = {"type": "json_object"}
+                        completion = chat_completion_create(**modern_kwargs)  # type: ignore[misc]
+                    elif module is not None:
+                        completion = module.ChatCompletion.create(  # type: ignore[attr-defined]
+                            **base_kwargs
+                        )
+                    else:  # pragma: no cover - defensive
+                        raise RuntimeError("OpenAI legacy клиент недоступен")
+                except Exception as exc:  # pragma: no cover - network
+                    raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
+
+                message = extract_message(completion) or "{}"
+                translated_text = part_text
+                try:
+                    data = json.loads(message or "{}")
+                    for item in data.get("translations", []):
+                        if isinstance(item, dict) and item.get("id") == job_id:
+                            candidate = item.get("text")
+                            if isinstance(candidate, str) and candidate:
+                                translated_text = candidate
+                                break
+                except json.JSONDecodeError:
+                    cleaned = message.strip()
+                    if cleaned:
+                        translated_text = cleaned
+                assembled_parts.setdefault(orig_idx, {})[part_idx] = translated_text
+        else:
+            for chunk in chunked(split_jobs, batch_size):
+                payload = [
+                    {"id": job_id, "text": text_part}
+                    for job_id, _, _, text_part in chunk
+                ]
+                user_content = json.dumps({"items": payload}, ensure_ascii=False)
+                messages_payload = [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": user_content},
+                ]
+                try:
+                    modern_kwargs = {
+                        "model": model,
+                        "messages": messages_payload,
+                        "response_format": {"type": "json_object"},
+                    }
+                    modern_kwargs.update(self._openai_generation_kwargs(model))
+                    completion = client.chat.completions.create(  # type: ignore[attr-defined]
+                        **modern_kwargs
                     )
-                    single_messages = [
-                        {"role": "system", "content": system_content},
-                        {"role": "user", "content": single_payload},
-                    ]
-                    try:
-                        base_kwargs: Dict[str, Any] = {
-                            "model": model,
-                            "messages": single_messages,
-                        }
-                        base_kwargs.update(self._openai_generation_kwargs(model))
-                        if chat_completion_create:
-                            modern_kwargs = dict(base_kwargs)
-                            modern_kwargs["response_format"] = {"type": "json_object"}
-                            completion = chat_completion_create(**modern_kwargs)  # type: ignore[misc]
-                        elif module is not None:
-                            completion = module.ChatCompletion.create(  # type: ignore[attr-defined]
-                                **base_kwargs
-                            )
-                        else:  # pragma: no cover - defensive
-                            raise RuntimeError("OpenAI legacy интерфейс недоступен")
-                    except Exception as exc:  # pragma: no cover - network
-                        raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
+                except Exception as exc:  # pragma: no cover - network
+                    raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
 
-                    message = extract_message(completion) or "{}"
+                message = extract_message(completion) or "{}"
+                try:
+                    data = json.loads(message or "{}")
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("ChatGPT не вернул корректный JSON") from exc
 
-                    translated_text = texts[idx]
-                    try:
-                        data = json.loads(message or "{}")
-                        for item in data.get("translations", []):
-                            if isinstance(item, dict) and item.get("id") == str(idx):
-                                candidate = item.get("text")
-                                if isinstance(candidate, str) and candidate:
-                                    translated_text = candidate
-                                    break
-                    except json.JSONDecodeError:
-                        cleaned = message.strip()
-                        if cleaned:
-                            translated_text = cleaned
-                    results[idx] = translated_text
+                mapping = {
+                    item.get("id"): item.get("text")
+                    for item in data.get("translations", [])
+                    if isinstance(item, dict)
+                }
+
+                for job_id, orig_idx, part_idx, part_text in chunk:
+                    translated = mapping.get(job_id)
+                    assembled_parts.setdefault(orig_idx, {})[part_idx] = translated if translated else part_text
+
+        for idx in candidate_indices:
+            total_parts = part_counts.get(idx, 0)
+            part_dict = assembled_parts.get(idx, {})
+            if total_parts <= 1:
+                translated_value = part_dict.get(0)
+                if translated_value is None:
+                    translated_value = part_sources.get((idx, 0), texts[idx])
+                results[idx] = translated_value if translated_value else texts[idx]
                 continue
 
-            try:
-                modern_kwargs: Dict[str, Any] = {
-                    "model": model,
-                    "messages": messages_payload,
-                    "response_format": {"type": "json_object"},
-                }
-                modern_kwargs.update(self._openai_generation_kwargs(model))
-                completion = client.chat.completions.create(  # type: ignore[attr-defined]
-                    **modern_kwargs
-                )
-            except Exception as exc:  # pragma: no cover - network
-                raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
-
-            message = extract_message(completion) or "{}"
-            try:
-                data = json.loads(message or "{}")
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("ChatGPT вернул неожиданный ответ (не JSON)") from exc
-
-            mapping = {item.get("id"): item.get("text") for item in data.get("translations", []) if isinstance(item, dict)}
-
-            for idx in chunk:
-                translated = mapping.get(str(idx))
-                results[idx] = translated if translated else texts[idx]
+            combined: List[str] = []
+            for part_idx in range(total_parts):
+                piece = part_dict.get(part_idx)
+                if piece is None:
+                    piece = part_sources.get((idx, part_idx), "")
+                combined.append(piece)
+            merged = "".join(combined)
+            results[idx] = merged if merged else texts[idx]
 
         return results
 
@@ -570,6 +614,31 @@ class TranslationEngine:
         if model_key in OPENAI_REASONING_MODELS:
             return {}
         return {"temperature": self.openai_temperature}
+
+    def _split_openai_payload(self, text: str, limit: int = OPENAI_SAFE_TEXT) -> List[str]:
+        if len(text) <= limit or limit <= 0:
+            return [text]
+        segments: List[str] = []
+        start = 0
+        length = len(text)
+        while start < length:
+            end = min(start + limit, length)
+            split_pos = end
+            if end < length:
+                newline_pos = text.rfind("\n", start, end)
+                space_pos = text.rfind(" ", start, end)
+                candidate = max(newline_pos, space_pos)
+                if candidate > start:
+                    split_pos = candidate + 1
+            piece = text[start:split_pos]
+            if not piece:
+                piece = text[start:end]
+                split_pos = end
+                if not piece:
+                    break
+            segments.append(piece)
+            start = split_pos
+        return segments if segments else [text]
 
     def _openai_reasoning_note(self, model: Optional[str]) -> str:
         model_key = (model or "").lower()
