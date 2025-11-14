@@ -69,7 +69,6 @@ OPENAI_MODEL_CHOICES = [
     "gpt-4o",
     "gpt-4.1-mini",
     "gpt-4.1",
-    "gpt-3.5-turbo",
 ]
 
 OPENAI_REASONING_MODELS = {
@@ -82,15 +81,28 @@ OPENAI_REASONING_MODELS = {
 
 OPENAI_BASE_URL_CHOICES = [
     "https://api.openai.com/v1",
-    "https://api.groq.com/openai/v1",
-    "https://openrouter.ai/api/v1",
-    "https://api.perplexity.ai",
 ]
 
 OUTPUT_FORMAT_CHOICES = ["dwg", "dxf"]
 
 
-def populate_combo(combo: QComboBox, options: Iterable[str], current: str = "", allow_empty: bool = False) -> None:
+TRANSLATOR_CHOICES = [
+    "google",
+    "deep_google",
+    "googletrans",
+    "deepl",
+    "chatgpt",
+    "noop",
+]
+
+
+def populate_combo(
+    combo: QComboBox,
+    options: Iterable[str],
+    current: str = "",
+    allow_empty: bool = False,
+    editable: bool = True,
+) -> None:
     combo.blockSignals(True)
     combo.clear()
     entries = list(options)
@@ -105,7 +117,7 @@ def populate_combo(combo: QComboBox, options: Iterable[str], current: str = "", 
     if current and current not in seen:
         combo.addItem(current)
         seen.add(current)
-    combo.setEditable(True)
+    combo.setEditable(editable)
     default_text = current or ("" if allow_empty else (entries[0] if entries else ""))
     combo.setCurrentText(default_text)
     combo.blockSignals(False)
@@ -289,13 +301,34 @@ class MainWindow(QWidget):
         output_row.addWidget(self.output_format_combo)
 
         self.translator_combo = QComboBox()
-        self.translator_combo.addItems(["google", "deep_google", "googletrans", "deepl", "chatgpt", "noop"])
+        populate_combo(
+            self.translator_combo,
+            TRANSLATOR_CHOICES,
+            settings_manager.data.translator_name,
+            editable=False,
+        )
         self.source_lang_combo = QComboBox()
-        populate_combo(self.source_lang_combo, LANGUAGE_CHOICES, settings_manager.data.source_lang)
+        populate_combo(
+            self.source_lang_combo,
+            LANGUAGE_CHOICES,
+            settings_manager.data.source_lang,
+            editable=False,
+        )
         self.target_lang_combo = QComboBox()
-        populate_combo(self.target_lang_combo, LANGUAGE_CHOICES, settings_manager.data.target_lang)
+        populate_combo(
+            self.target_lang_combo,
+            LANGUAGE_CHOICES,
+            settings_manager.data.target_lang,
+            editable=False,
+        )
         self.style_font_combo = QComboBox()
-        populate_combo(self.style_font_combo, STYLE_FONT_CHOICES, settings_manager.data.style_font, allow_empty=True)
+        populate_combo(
+            self.style_font_combo,
+            STYLE_FONT_CHOICES,
+            settings_manager.data.style_font,
+            allow_empty=True,
+            editable=False,
+        )
 
         self.map_checkbox = QCheckBox("Сохранить CSV карту переводов")
         self.map_path_edit = QLineEdit()

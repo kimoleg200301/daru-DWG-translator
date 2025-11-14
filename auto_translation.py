@@ -472,7 +472,7 @@ class TranslationEngine:
 
         reasoning_note = self._openai_reasoning_note(model)
         system_content = (
-            "You are a professional technical translator. Translate the provided values from "
+            "You are a professional technical translator of elevator drawing manuals. Translate the provided values from "
             f"{self.source_lang or 'auto-detected'} to {self.target_lang}. Preserve numbers, "
             "placeholders like '__DXF_DIM__', and DXF control sequences such as '\n'. Respond "
             "with strict JSON: {\"translations\": [{\"id\": \"<id>\", \"text\": \"<translated>\"}, ...]}"

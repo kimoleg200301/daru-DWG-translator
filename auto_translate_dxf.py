@@ -195,7 +195,7 @@ def translate_dxf(
         processing_input = _prepare_input_file(input_path, logger, stack)
 
         logger(f"Загружаем чертёж: {processing_input}")
-        doc = ezdxf.readfile(str(processing_input))
+        doc = ezdxf.readfile(str(processing_input)) # основная загрузка DXF и обработка
 
         freq = extractor.extract_text_counts(doc)
     sorted_items = extractor.sort_frequency(freq)
