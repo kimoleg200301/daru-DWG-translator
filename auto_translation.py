@@ -403,8 +403,9 @@ class TranslationEngine:
             stripped = (src or "").strip()
             if len(stripped) < 3:
                 return False
-            if not re.search(r"[A-Za-z]", stripped):
-                return False
+            if self.source_lang == 'en':
+                if not re.search(r"[A-Za-z]", stripped):
+                    return False
             if re.fullmatch(r"[A-Za-z]\.?", stripped):
                 return False
             if re.fullmatch(r"[A-Za-z]\d+", stripped):
@@ -412,13 +413,6 @@ class TranslationEngine:
             if stripped.isupper() and len(stripped) <= 3 and " " not in stripped:
                 return False
             if re.fullmatch(r"[-+]?\d+[\d\s./-]*", stripped):
-                return False
-            compact = stripped.replace(" ", "")
-            if (
-                re.fullmatch(r"[A-Za-z0-9*\-./]+", compact)
-                and any(ch.isalpha() for ch in compact)
-                and any(ch.isdigit() for ch in compact)
-            ):
                 return False
             return True
 
