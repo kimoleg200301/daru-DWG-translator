@@ -520,6 +520,7 @@ class TranslationEngine:
                 base_kwargs = {
                     "model": model,
                     "messages": single_messages,
+                    "store": True,
                 }
                 base_kwargs.update(self._openai_generation_kwargs(model))
 
@@ -578,6 +579,7 @@ class TranslationEngine:
                             "model": model,
                             "messages": list(messages_payload),
                             "response_format": {"type": "json_object"},
+                            "store": True,
                         }
                         modern_kwargs.update(self._openai_generation_kwargs(model))
                         completion = client.chat.completions.create(  # type: ignore[attr-defined]

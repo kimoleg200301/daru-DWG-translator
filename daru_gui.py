@@ -3,7 +3,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 try:
     from PySide6.QtCore import QThread, Signal
@@ -33,6 +33,7 @@ except ImportError as exc:  # pragma: no cover - GUI dependency guard
     raise SystemExit(1) from exc
 
 from auto_translate_dxf import translate_dxf
+from pdf_translation import PDF_TYPE_NATIVE, PDF_TYPE_SCANNED, translate_pdf
 
 SETTINGS_PATH = Path.home() / ".daru_gui_settings.json"
 
@@ -85,6 +86,10 @@ OPENAI_BASE_URL_CHOICES = [
 
 OUTPUT_FORMAT_CHOICES = ["dwg", "dxf"]
 
+PDF_TYPE_CHOICES: Tuple[Tuple[str, str], ...] = (
+    ("Отсканированный", PDF_TYPE_SCANNED),
+    ("Не отсканированный", PDF_TYPE_NATIVE),
+)
 
 TRANSLATOR_CHOICES = [
     "google",
@@ -260,8 +265,14 @@ class TranslateWorker(QThread):
         self._params = params
 
     def run(self) -> None:
+        params = dict(self._params)
+        job_type = params.pop("job_type", "cad")
         try:
-            result = translate_dxf(log=self.log_signal.emit, **self._params)
+            if job_type == "pdf":
+                result = translate_pdf(log=self.log_signal.emit, **params)
+            else:
+                result = translate_dxf(log=self.log_signal.emit, **params)
+            result["job_type"] = job_type
             self.finished_signal.emit(result)
         except Exception as exc:  # pragma: no cover - background thread errors
             self.error_signal.emit(str(exc))
@@ -272,6 +283,7 @@ class MainWindow(QWidget):
         super().__init__()
         self.settings_manager = settings_manager
         self.worker: Optional[TranslateWorker] = None
+        self._pdf_input_active = False
         self.setWindowTitle("Daru DWG Translator")
         self.resize(860, 640)
         self.setAcceptDrops(True)
@@ -287,6 +299,18 @@ class MainWindow(QWidget):
         input_row.addWidget(self.input_edit)
         input_row.addWidget(self.input_browse)
 
+        self.pdf_type_widget = QWidget()
+        pdf_type_layout = QHBoxLayout(self.pdf_type_widget)
+        pdf_type_layout.setContentsMargins(0, 0, 0, 0)
+        self.pdf_type_label = QLabel("Тип PDF")
+        self.pdf_type_combo = QComboBox()
+        for label, code in PDF_TYPE_CHOICES:
+            self.pdf_type_combo.addItem(label, code)
+        pdf_type_layout.addWidget(self.pdf_type_label)
+        pdf_type_layout.addWidget(self.pdf_type_combo)
+        pdf_type_layout.addStretch()
+        self.pdf_type_widget.setVisible(False)
+
         self.output_edit = QLineEdit()
         self.output_browse = QPushButton("Сохранить как...")
         self.output_browse.clicked.connect(self.select_output_file)
@@ -297,7 +321,8 @@ class MainWindow(QWidget):
         output_row.addWidget(QLabel("Выходной файл"))
         output_row.addWidget(self.output_edit)
         output_row.addWidget(self.output_browse)
-        output_row.addWidget(QLabel("Формат"))
+        self.output_format_label = QLabel("Формат")
+        output_row.addWidget(self.output_format_label)
         output_row.addWidget(self.output_format_combo)
 
         self.translator_combo = QComboBox()
@@ -364,6 +389,7 @@ class MainWindow(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.addWidget(self.status_label)
         main_layout.addLayout(input_row)
+        main_layout.addWidget(self.pdf_type_widget)
         main_layout.addLayout(output_row)
 
         options_layout = QFormLayout()
@@ -432,26 +458,44 @@ class MainWindow(QWidget):
             self,
             "Выберите файл",
             start_dir,
-            "CAD files (*.dxf *.dwg)"
+            "CAD/PDF files (*.dxf *.dwg *.pdf)"
         )
         if filename:
             self.set_input_file(Path(filename))
 
     def select_output_file(self) -> None:
         start_dir = Path(self.output_edit.text()).parent if self.output_edit.text() else self.settings_manager.data.last_directory
-        fmt = (self.output_format_combo.currentText() or "dwg").lower()
-        pattern = "DWG files (*.dwg)" if fmt == "dwg" else "DXF files (*.dxf)"
-        caption = "Сохранить DWG" if fmt == "dwg" else "Сохранить DXF"
+        if self.is_pdf_input():
+            pattern = "PDF files (*.pdf)"
+            caption = "Сохранить PDF"
+        else:
+            fmt = (self.output_format_combo.currentText() or "dwg").lower()
+            pattern = "DWG files (*.dwg)" if fmt == "dwg" else "DXF files (*.dxf)"
+            caption = "Сохранить DWG" if fmt == "dwg" else "Сохранить DXF"
         filename, _ = QFileDialog.getSaveFileName(self, caption, str(start_dir), pattern)
         if filename:
             self.output_edit.setText(filename)
             self.sync_output_suffix()
 
     def update_aux_controls(self) -> None:
-        self.map_path_edit.setEnabled(self.map_checkbox.isChecked())
-        self.map_browse.setEnabled(self.map_checkbox.isChecked())
+        pdf_mode = self.is_pdf_input()
+        map_active = self.map_checkbox.isChecked() and not pdf_mode
+        txt_active = self.txt_checkbox.isChecked() and not pdf_mode
+        self.map_checkbox.setEnabled(not pdf_mode)
+        self.txt_checkbox.setEnabled(not pdf_mode)
+        self.map_path_edit.setEnabled(map_active)
+        self.map_browse.setEnabled(map_active)
         for widget in (self.extracted_path_edit, self.extracted_browse, self.translated_path_edit, self.translated_browse):
-            widget.setEnabled(self.txt_checkbox.isChecked())
+            widget.setEnabled(txt_active)
+
+    def _reset_auxiliary_for_pdf(self) -> None:
+        for checkbox in (self.map_checkbox, self.txt_checkbox):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
+
+    def is_pdf_input(self) -> bool:
+        return self._pdf_input_active
 
     def handle_output_format_change(self, _value: str) -> None:
         self.sync_output_suffix()
@@ -461,14 +505,14 @@ class MainWindow(QWidget):
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
-                if url.isLocalFile() and url.toLocalFile().lower().endswith((".dxf", ".dwg")):
+                if url.isLocalFile() and url.toLocalFile().lower().endswith((".dxf", ".dwg", ".pdf")):
                     event.acceptProposedAction()
                     return
         event.ignore()
 
     def dropEvent(self, event) -> None:  # type: ignore[override]
         for url in event.mimeData().urls():
-            if url.isLocalFile() and url.toLocalFile().lower().endswith((".dxf", ".dwg")):
+            if url.isLocalFile() and url.toLocalFile().lower().endswith((".dxf", ".dwg", ".pdf")):
                 self.set_input_file(Path(url.toLocalFile()))
                 event.acceptProposedAction()
                 return
@@ -478,7 +522,13 @@ class MainWindow(QWidget):
         self.input_edit.setText(str(path))
         self.status_label.setText(f"Выбран файл: {path.name}")
         suffix = path.suffix.lower()
-        if suffix == ".dwg":
+        self._pdf_input_active = suffix == ".pdf"
+        self.pdf_type_widget.setVisible(self._pdf_input_active)
+        self.output_format_combo.setVisible(not self._pdf_input_active)
+        self.output_format_label.setVisible(not self._pdf_input_active)
+        if self._pdf_input_active:
+            self._reset_auxiliary_for_pdf()
+        elif suffix == ".dwg":
             self.output_format_combo.setCurrentText("dwg")
         elif suffix == ".dxf" and self.output_format_combo.currentText() not in OUTPUT_FORMAT_CHOICES:
             self.output_format_combo.setCurrentText("dwg")
@@ -495,7 +545,10 @@ class MainWindow(QWidget):
     def derive_default_paths(self, input_path: Path) -> Dict[str, Path]:
         stem = input_path.stem
         parent = input_path.parent
-        out_suffix = ".dwg" if (self.output_format_combo.currentText() or "dwg").lower() == "dwg" else ".dxf"
+        if input_path.suffix.lower() == ".pdf":
+            out_suffix = ".pdf"
+        else:
+            out_suffix = ".dwg" if (self.output_format_combo.currentText() or "dwg").lower() == "dwg" else ".dxf"
         return {
             "output": parent / f"{stem}_ru{out_suffix}",
             "map": parent / f"{stem}_map.csv",
@@ -504,8 +557,11 @@ class MainWindow(QWidget):
         }
 
     def sync_output_suffix(self) -> None:
-        fmt = (self.output_format_combo.currentText() or "dwg").lower()
-        suffix = ".dwg" if fmt == "dwg" else ".dxf"
+        if self.is_pdf_input():
+            suffix = ".pdf"
+        else:
+            fmt = (self.output_format_combo.currentText() or "dwg").lower()
+            suffix = ".dwg" if fmt == "dwg" else ".dxf"
         current = self.output_edit.text().strip()
         if current:
             path = Path(current)
@@ -532,16 +588,21 @@ class MainWindow(QWidget):
         if not output_path:
             QMessageBox.warning(self, "Ошибка", "Укажите путь для сохранения файла")
             return
-        format_choice = (self.output_format_combo.currentText() or "dwg").lower()
-        expected_suffix = ".dwg" if format_choice == "dwg" else ".dxf"
+        input_obj = Path(input_path)
         output_path_obj = Path(output_path)
-        if output_path_obj.suffix.lower() != expected_suffix:
-            output_path_obj = output_path_obj.with_suffix(expected_suffix)
-            self.output_edit.setText(str(output_path_obj))
+        is_pdf = input_obj.suffix.lower() == ".pdf"
+        if is_pdf:
+            if output_path_obj.suffix.lower() != ".pdf":
+                output_path_obj = output_path_obj.with_suffix(".pdf")
+                self.output_edit.setText(str(output_path_obj))
         else:
-            output_path_obj = output_path_obj
+            format_choice = (self.output_format_combo.currentText() or "dwg").lower()
+            expected_suffix = ".dwg" if format_choice == "dwg" else ".dxf"
+            if output_path_obj.suffix.lower() != expected_suffix:
+                output_path_obj = output_path_obj.with_suffix(expected_suffix)
+                self.output_edit.setText(str(output_path_obj))
         params: Dict[str, Any] = {
-            "input_path": Path(input_path),
+            "input_path": input_obj,
             "output_path": output_path_obj,
             "translator_name": self.translator_combo.currentText(),
             "source_lang": self.source_lang_combo.currentText().strip() or "en",
@@ -554,13 +615,27 @@ class MainWindow(QWidget):
             "openai_temperature": self.settings_manager.data.openai_temperature,
             "openai_strict_mode": self.settings_manager.data.openai_strict_mode or None,
             "openai_strict_value": self.settings_manager.data.openai_strict_value,
-            "output_format": format_choice,
-            "map_path": Path(self.map_path_edit.text()) if self.map_checkbox.isChecked() and self.map_path_edit.text() else None,
-            "save_map": self.map_checkbox.isChecked(),
-            "extracted_txt_path": Path(self.extracted_path_edit.text()) if self.txt_checkbox.isChecked() and self.extracted_path_edit.text() else None,
-            "translated_txt_path": Path(self.translated_path_edit.text()) if self.txt_checkbox.isChecked() and self.translated_path_edit.text() else None,
-            "save_txt": self.txt_checkbox.isChecked(),
         }
+        if is_pdf:
+            params.update(
+                {
+                    "pdf_type": self.pdf_type_combo.currentData() or PDF_TYPE_SCANNED,
+                    "job_type": "pdf",
+                }
+            )
+        else:
+            format_choice = (self.output_format_combo.currentText() or "dwg").lower()
+            params.update(
+                {
+                    "output_format": format_choice,
+                    "map_path": Path(self.map_path_edit.text()) if self.map_checkbox.isChecked() and self.map_path_edit.text() else None,
+                    "save_map": self.map_checkbox.isChecked(),
+                    "extracted_txt_path": Path(self.extracted_path_edit.text()) if self.txt_checkbox.isChecked() and self.extracted_path_edit.text() else None,
+                    "translated_txt_path": Path(self.translated_path_edit.text()) if self.txt_checkbox.isChecked() and self.translated_path_edit.text() else None,
+                    "save_txt": self.txt_checkbox.isChecked(),
+                    "job_type": "cad",
+                }
+            )
         self.append_log("Запуск процесса перевода...")
         self.start_button.setEnabled(False)
         self.worker = TranslateWorker(params)
@@ -583,16 +658,19 @@ class MainWindow(QWidget):
         QMessageBox.information(self, "Готово", f"Файл сохранён: {payload['output_path']}")
         self.start_button.setEnabled(True)
         self.status_label.setText("Перевод завершён")
-        format_choice = (self.output_format_combo.currentText() or "dwg").lower()
-        self.settings_manager.update(
-            translator_name=self.translator_combo.currentText(),
-            source_lang=self.source_lang_combo.currentText().strip() or "en",
-            target_lang=self.target_lang_combo.currentText().strip() or "ru",
-            style_font=self.style_font_combo.currentText().strip(),
-            save_map=self.map_checkbox.isChecked(),
-            save_txt=self.txt_checkbox.isChecked(),
-            output_format=format_choice,
-        )
+        job_type = payload.get("job_type", "cad")
+        update_payload: Dict[str, Any] = {
+            "translator_name": self.translator_combo.currentText(),
+            "source_lang": self.source_lang_combo.currentText().strip() or "en",
+            "target_lang": self.target_lang_combo.currentText().strip() or "ru",
+            "style_font": self.style_font_combo.currentText().strip(),
+            "save_map": self.map_checkbox.isChecked(),
+            "save_txt": self.txt_checkbox.isChecked(),
+        }
+        if job_type != "pdf":
+            format_choice = (self.output_format_combo.currentText() or "dwg").lower()
+            update_payload["output_format"] = format_choice
+        self.settings_manager.update(**update_payload)
 
     def reset_worker(self) -> None:
         self.worker = None
