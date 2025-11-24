@@ -45,6 +45,11 @@ DEFAULT_MAP_CACHE = Path("map_auto.csv")
 _FONT_CACHE: Dict[str, object] = {}
 _TEXT_ALIGN_LEFT = getattr(pymupdf, "TEXT_ALIGN_LEFT", 0) if pymupdf is not None else 0
 
+_INVISIBLE_CHAR_TRANSLATION = str.maketrans(
+    "",
+    "",
+    "\u200b\u200c\u200d\u200e\u200f\u2060\ufeff\u202a\u202b\u202c\u202d\u202e\u00ad",
+)
 
 
 def translate_pdf(
@@ -353,18 +358,38 @@ def _render_translated_pdf(
 def _prepare_source_text(value: str) -> str:
     if not value:
         return ""
-    flattened = value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    cleaned = _strip_invisible_chars(value).replace("\xa0", " ")
+    flattened = cleaned.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     tokens = flattened.split()
     return " ".join(tokens)
 
 
 def _normalize_translated_text(value: str) -> str:
-    stripped = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    stripped = _strip_invisible_chars(value).replace("\r\n", "\n").replace("\r", "\n").strip()
     if not stripped:
         return ""
     tokens = [token.strip() for token in stripped.split("\n") if token.strip()]
     normalized = " ".join(tokens)
     return normalized.strip()
+
+
+def _strip_invisible_chars(value: str) -> str:
+    if not value:
+        return ""
+    return value.translate(_INVISIBLE_CHAR_TRANSLATION)
+
+
+def _normalize_line_fragment(value: str) -> str:
+    if not value:
+        return ""
+    cleaned = _strip_invisible_chars(value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")).replace(
+        "\xa0", " "
+    )
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    stripped = cleaned.strip()
+    if len(stripped) <= 1 and not stripped.isalnum():
+        return ""
+    return stripped
 
 
 def _collect_paragraph_refs(line_refs: Sequence[PdfLineRef]) -> Tuple[List[_ParagraphRef], int]:
@@ -379,23 +404,14 @@ def _collect_paragraph_refs(line_refs: Sequence[PdfLineRef]) -> Tuple[List[_Para
     for key in sorted(grouped.keys()):
         refs = grouped[key]
         refs.sort(key=lambda item: item.line_index)
-        current: List[PdfLineRef] = []
-        for ref in refs:
-            text = _extract_line_text(ref)
-            if not text:
-                if current:
-                    paragraphs.append(_make_paragraph_ref(current, index))
-                    index += 1
-                    current = []
-                continue
-            current.append(ref)
-        if current:
-            paragraph = _make_paragraph_ref(current, index)
-            if paragraph.meaningful:
-                paragraphs.append(paragraph)
-                index += 1
-            else:
-                skipped += 1
+        if not refs:
+            continue
+        paragraph = _make_paragraph_ref(refs, index)
+        if paragraph.meaningful:
+            paragraphs.append(paragraph)
+            index += 1
+        else:
+            skipped += 1
     return paragraphs, skipped
 
 
@@ -403,7 +419,11 @@ def _make_paragraph_ref(lines: Sequence[PdfLineRef], paragraph_index: int) -> _P
     line_list = list(lines)
     first = line_list[0]
     bbox = _union_bboxes(line_list)
-    parts = [_extract_line_text(ref) for ref in line_list if _extract_line_text(ref)]
+    parts: List[str] = []
+    for ref in line_list:
+        cleaned = _extract_line_text(ref)
+        if cleaned:
+            parts.append(cleaned)
     text = "\n".join(parts)
     if not text:
         text = "\n".join(ref.text for ref in line_list if ref.text)
@@ -434,7 +454,7 @@ def _extract_line_text(ref: PdfLineRef) -> str:
 
 def _line_text_with_spacing(line: PdfLayoutLine) -> str:
     if not line.spans:
-        return line.text().strip()
+        return _normalize_line_fragment(line.text())
     parts: List[str] = []
     prev_end = None
     base_size = _infer_font_size(line)
@@ -453,11 +473,7 @@ def _line_text_with_spacing(line: PdfLayoutLine) -> str:
         parts.append(segment)
         prev_end = span.bbox[2]
     text = "".join(parts)
-    text = re.sub(r"[ \t]+", " ", text)
-    stripped = text.strip()
-    if len(stripped) <= 1 and not stripped.isalnum():
-        return ""
-    return stripped
+    return _normalize_line_fragment(text)
 
 
 def _is_meaningful_text(value: str) -> bool:
