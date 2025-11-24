@@ -3,14 +3,15 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import tempfile
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Set
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from auto_translation import TranslationEngine
+from auto_translation import TranslationEngine, prepare_for_translation
 from pdf_layout import (
     PdfLayout,
     PdfLayoutLine,
@@ -41,8 +42,8 @@ PdfLog = Callable[[str], None]
 PDF_TYPE_SCANNED = "scanned"
 PDF_TYPE_NATIVE = "native"
 DEFAULT_MAP_CACHE = Path("map_auto.csv")
-_FREETEXT_FONT_WARNINGS: Set[str] = set()
-_FREETEXT_DRAW_WARNING = False
+_FONT_CACHE: Dict[str, object] = {}
+_TEXT_ALIGN_LEFT = getattr(pymupdf, "TEXT_ALIGN_LEFT", 0) if pymupdf is not None else 0
 
 
 
@@ -87,6 +88,12 @@ def translate_pdf(
         if not line_refs:
             raise RuntimeError("Не удалось извлечь текст из PDF документа")
         log(f"Найдено {len(line_refs)} текстовых строк для обработки")
+        paragraph_refs, skipped_blocks = _collect_paragraph_refs(line_refs)
+        if not paragraph_refs:
+            raise RuntimeError("Не удалось сформировать текстовые абзацы для перевода")
+        log(f"Сформировано {len(paragraph_refs)} абзацев для перевода")
+        if skipped_blocks:
+            log(f"PDF: пропущено {skipped_blocks} блоков без значимого текста")
 
         translator = TranslationEngine(
             provider=translator_name,
@@ -102,9 +109,12 @@ def translate_pdf(
             openai_strict_value=openai_strict_value,
         )
         log(f"Инициализирован движок перевода: {translator.backend_name()}")
-        segments = [ref.text for ref in line_refs]
-        log(f"Готовим {len(segments)} блоков текста к переводу")
-        total_segments = len(segments)
+        raw_segments = [paragraph.text for paragraph in paragraph_refs]
+        normalized_segments = [_prepare_source_text(text) for text in raw_segments]
+        payload_segments = [raw if raw else normalized for raw, normalized in zip(raw_segments, normalized_segments)]
+        filter_keys = [prepare_for_translation(text) for text in normalized_segments]
+        log(f"Готовим {len(raw_segments)} абзацев текста к переводу")
+        total_segments = len(raw_segments)
         cache_path = _resolve_cache_path(translation_cache_path)
         translation_cache = _read_translation_cache(cache_path)
         if translation_cache and cache_path.exists():
@@ -115,13 +125,13 @@ def translate_pdf(
         text_to_indices: Dict[str, List[int]] = {}
         cache_updates: Dict[str, str] = {}
         cached_hits = 0
-        for idx, segment in enumerate(segments):
-            cached_value = translation_cache.get(segment) if translation_cache else None
+        for idx, (cache_key, filter_key) in enumerate(zip(normalized_segments, filter_keys)):
+            cached_value = translation_cache.get(cache_key) if translation_cache else None
             if cached_value is not None:
                 translation_slots[idx] = cached_value
                 cached_hits += 1
             else:
-                bucket = text_to_indices.setdefault(segment, [])
+                bucket = text_to_indices.setdefault(filter_key, [])
                 bucket.append(idx)
         unique_pending = list(text_to_indices.keys())
         processed = cached_hits
@@ -132,14 +142,17 @@ def translate_pdf(
             log("Начинаем перевод... [0%]")
             chunk_size = max(1, len(unique_pending) // 20)
             for start in range(0, len(unique_pending), chunk_size):
-                chunk = unique_pending[start : start + chunk_size]
-                translated_chunk = translator.translate_many(chunk)
-                for original_text, translated_text in zip(chunk, translated_chunk):
-                    previous_value = translation_cache.get(original_text)
-                    if previous_value != translated_text:
-                        translation_cache[original_text] = translated_text
-                        cache_updates[original_text] = translated_text
-                    for text_index in text_to_indices.get(original_text, []):
+                chunk_keys = unique_pending[start : start + chunk_size]
+                chunk_texts = [payload_segments[text_to_indices[key][0]] for key in chunk_keys]
+                translated_chunk = translator.translate_many(chunk_texts)
+                for key, translated_text in zip(chunk_keys, translated_chunk):
+                    indices = text_to_indices.get(key, [])
+                    for text_index in indices:
+                        cache_key = normalized_segments[text_index]
+                        previous_value = translation_cache.get(cache_key)
+                        if previous_value != translated_text:
+                            translation_cache[cache_key] = translated_text
+                            cache_updates[cache_key] = translated_text
                         translation_slots[text_index] = translated_text
                         processed += 1
                 percent = min(100, int(processed / total_segments * 100)) if total_segments else 100
@@ -147,15 +160,20 @@ def translate_pdf(
             if processed < total_segments:
                 log("Начинаем перевод... [100%]")
             log("Перевод завершён")
-        if any(slot is None for slot in translation_slots):
-            raise RuntimeError("Сбой перевода: не совпадает количество строк")
-        translated_segments = [slot or "" for slot in translation_slots]
+        translated_segments: List[str] = []
+        for idx, slot in enumerate(translation_slots):
+            value = slot
+            if not value:
+                value = payload_segments[idx] if idx < len(payload_segments) else ""
+            if not value and idx < len(paragraph_refs):
+                value = paragraph_refs[idx].text
+            translated_segments.append(value or "")
         if cache_updates and cache_path:
             _write_translation_cache(cache_path, cache_updates, log)
         overlay_records = _render_translated_pdf(
             source_pdf=searchable_source,
             layout=layout,
-            line_refs=line_refs,
+            paragraphs=paragraph_refs,
             translated_segments=translated_segments,
             output_path=output_path,
             style_font=style_font,
@@ -223,6 +241,18 @@ class _LineAnnotationStyle:
     font_size: float
     text_color: Tuple[float, float, float]
     background_color: Tuple[float, float, float]
+    font_handle: Optional[object] = None
+
+
+@dataclass
+class _ParagraphRef:
+    page_index: int
+    block_index: int
+    paragraph_index: int
+    lines: List[PdfLineRef]
+    bbox: Tuple[float, float, float, float]
+    text: str
+    meaningful: bool
 
 
 @dataclass
@@ -244,7 +274,7 @@ def _render_translated_pdf(
     *,
     source_pdf: Path,
     layout: PdfLayout,
-    line_refs: Sequence[PdfLineRef],
+    paragraphs: Sequence[_ParagraphRef],
     translated_segments: Sequence[str],
     output_path: Path,
     style_font: Optional[str],
@@ -254,51 +284,57 @@ def _render_translated_pdf(
     doc = pymupdf.open(str(source_pdf))  # type: ignore[attr-defined]
     try:
         custom_font_handle: Optional[object] = None
-        custom_font_name: Optional[str] = None
-        custom_font_handle: Optional[object] = None
-        custom_font_name: Optional[str] = None
         if style_font:
-            custom_font_name, custom_font_handle = _load_custom_font(style_font, log)
+            _, custom_font_handle = _load_custom_font(style_font, log)
         overlay_count = 0
         page_cache: Dict[int, object] = {}
         records: List[_OverlayRecord] = []
-        for ref, translated in zip(line_refs, translated_segments):
+        for paragraph, translated in zip(paragraphs, translated_segments):
             text = _normalize_translated_text(translated)
             if not text:
                 continue
-            page = page_cache.get(ref.page_index)
+            if not paragraph.lines:
+                continue
+            page = page_cache.get(paragraph.page_index)
             if page is None:
-                page = doc.load_page(ref.page_index)  # type: ignore[attr-defined]
-                page_cache[ref.page_index] = page
-            page_meta = layout.pages[ref.page_index]
-            style = _build_line_style(ref.line, style_font, custom_font_name)
+                page = doc.load_page(paragraph.page_index)  # type: ignore[attr-defined]
+                page_cache[paragraph.page_index] = page
+            page_meta = layout.pages[paragraph.page_index]
+            style_line = paragraph.lines[0].line
+            style = _build_line_style(style_line, style_font, custom_font_handle)
             rect = _prepare_annotation_rect(
-                ref.line,
+                paragraph.bbox,
                 page_meta.width,
                 page_meta.height,
                 style.font_size,
             )
-            annotation_name = _try_apply_freetext_overlay(
+            rect = _ensure_rect_capacity(
+                rect,
+                text,
+                style,
+                page_meta.width,
+            )
+            annotation_name = _draw_text_overlay(
                 page,
                 rect,
                 text,
                 style,
                 annotation_index=overlay_count,
-                log=log,
+                page_rect=page.rect,  # type: ignore[attr-defined]
             )
             overlay_count += 1
             records.append(
                 _OverlayRecord(
                     annotation=annotation_name,
-                    page_index=ref.page_index,
-                    block_index=ref.block_index,
-                    line_index=ref.line_index,
-                    bbox=tuple(float(coord) for coord in ref.line.bbox),
+                    page_index=paragraph.page_index,
+                    block_index=paragraph.block_index,
+                    line_index=paragraph.lines[0].line_index if paragraph.lines else 0,
+                    bbox=tuple(float(coord) for coord in paragraph.bbox),
                     font_name=style.font_name,
                     font_size=style.font_size,
                     text_color=style.text_color,
                     background_color=style.background_color,
-                    source_text=ref.text,
+                    source_text=paragraph.text,
                     translated_text=text,
                 )
             )
@@ -314,6 +350,14 @@ def _render_translated_pdf(
         doc.close()  # type: ignore[attr-defined]
 
 
+def _prepare_source_text(value: str) -> str:
+    if not value:
+        return ""
+    flattened = value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    tokens = flattened.split()
+    return " ".join(tokens)
+
+
 def _normalize_translated_text(value: str) -> str:
     stripped = value.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not stripped:
@@ -323,27 +367,142 @@ def _normalize_translated_text(value: str) -> str:
     return normalized.strip()
 
 
+def _collect_paragraph_refs(line_refs: Sequence[PdfLineRef]) -> Tuple[List[_ParagraphRef], int]:
+    grouped: Dict[Tuple[int, int], List[PdfLineRef]] = {}
+    for ref in line_refs:
+        key = (ref.page_index, ref.block_index)
+        bucket = grouped.setdefault(key, [])
+        bucket.append(ref)
+    paragraphs: List[_ParagraphRef] = []
+    index = 0
+    skipped = 0
+    for key in sorted(grouped.keys()):
+        refs = grouped[key]
+        refs.sort(key=lambda item: item.line_index)
+        current: List[PdfLineRef] = []
+        for ref in refs:
+            text = _extract_line_text(ref)
+            if not text:
+                if current:
+                    paragraphs.append(_make_paragraph_ref(current, index))
+                    index += 1
+                    current = []
+                continue
+            current.append(ref)
+        if current:
+            paragraph = _make_paragraph_ref(current, index)
+            if paragraph.meaningful:
+                paragraphs.append(paragraph)
+                index += 1
+            else:
+                skipped += 1
+    return paragraphs, skipped
+
+
+def _make_paragraph_ref(lines: Sequence[PdfLineRef], paragraph_index: int) -> _ParagraphRef:
+    line_list = list(lines)
+    first = line_list[0]
+    bbox = _union_bboxes(line_list)
+    parts = [_extract_line_text(ref) for ref in line_list if _extract_line_text(ref)]
+    text = "\n".join(parts)
+    if not text:
+        text = "\n".join(ref.text for ref in line_list if ref.text)
+    normalized = _prepare_source_text(text)
+    meaningful = _is_meaningful_text(normalized)
+    return _ParagraphRef(
+        page_index=first.page_index,
+        block_index=first.block_index,
+        paragraph_index=paragraph_index,
+        lines=line_list,
+        bbox=bbox,
+        text=text,
+        meaningful=meaningful,
+    )
+
+
+def _union_bboxes(line_refs: Sequence[PdfLineRef]) -> Tuple[float, float, float, float]:
+    x0 = min(ref.line.bbox[0] for ref in line_refs)
+    y0 = min(ref.line.bbox[1] for ref in line_refs)
+    x1 = max(ref.line.bbox[2] for ref in line_refs)
+    y1 = max(ref.line.bbox[3] for ref in line_refs)
+    return (float(x0), float(y0), float(x1), float(y1))
+
+
+def _extract_line_text(ref: PdfLineRef) -> str:
+    return _line_text_with_spacing(ref.line)
+
+
+def _line_text_with_spacing(line: PdfLayoutLine) -> str:
+    if not line.spans:
+        return line.text().strip()
+    parts: List[str] = []
+    prev_end = None
+    base_size = _infer_font_size(line)
+    gap_threshold = max(base_size * 0.18, 0.6)
+    for span in line.spans:
+        segment = (span.text or "").replace("\xa0", " ")
+        if not segment.strip():
+            prev_end = span.bbox[2]
+            continue
+        start = span.bbox[0]
+        if parts:
+            gap = start - (prev_end or start)
+            if gap > gap_threshold and not parts[-1].endswith(" ") and not segment.startswith(" "):
+                if not parts[-1].endswith("-"):
+                    parts.append(" ")
+        parts.append(segment)
+        prev_end = span.bbox[2]
+    text = "".join(parts)
+    text = re.sub(r"[ \t]+", " ", text)
+    stripped = text.strip()
+    if len(stripped) <= 1 and not stripped.isalnum():
+        return ""
+    return stripped
+
+
+def _is_meaningful_text(value: str) -> bool:
+    if not value:
+        return False
+    stripped = value.strip()
+    if len(stripped) < 3:
+        return False
+    tokens = [token for token in stripped.split(" ") if token]
+    if not tokens:
+        return False
+    long_tokens = sum(1 for token in tokens if len(token) >= 3)
+    alpha_tokens = sum(1 for token in tokens if any(ch.isalpha() for ch in token))
+    if long_tokens == 0 and alpha_tokens == 0:
+        return False
+    if alpha_tokens == 0:
+        return False
+    if long_tokens == 0 and len(tokens) > 4:
+        return False
+    return True
+
+
 def _build_line_style(
     line: PdfLayoutLine,
     style_font: Optional[str],
-    custom_font_name: Optional[str],
+    custom_font: Optional[object],
 ) -> _LineAnnotationStyle:
     font_size = _infer_font_size(line)
-    if custom_font_name:
-        font_name = custom_font_name
+    font_handle: Optional[object]
+    if custom_font is not None:
+        font_name = getattr(custom_font, "name", None) or "helv"
+        font_handle = custom_font
     else:
         font_name = _resolve_annotation_font(line, style_font)
+        font_handle = _resolve_font_handle(font_name)
     text_rgb = _select_text_color(line)
     background_rgb = _select_background_color(line)
     text_color = _color_to_pdf_tuple(text_rgb, fallback=(0, 0, 0))
     background_color = _color_to_pdf_tuple(background_rgb, fallback=(255, 255, 255))
-    if _color_distance(text_color, background_color) < 0.2:
-        background_color = _nudge_background(background_color)
     return _LineAnnotationStyle(
         font_name=font_name,
         font_size=font_size,
         text_color=text_color,
         background_color=background_color,
+        font_handle=font_handle,
     )
 
 
@@ -365,6 +524,26 @@ def _resolve_annotation_font(line: PdfLayoutLine, style_font: Optional[str]) -> 
         if mapped:
             return mapped
     return "helv"
+
+
+def _resolve_font_handle(font_name: str) -> object:
+    key = (font_name or "helv").lower()
+    cached = _FONT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    target_name = font_name or "helv"
+    try:
+        handle = pymupdf.Font(target_name)  # type: ignore[attr-defined]
+    except Exception:
+        target_name = "helv"
+        key = target_name
+        handle = _FONT_CACHE.get(key)
+        if handle is None:
+            handle = pymupdf.Font(target_name)  # type: ignore[attr-defined]
+            _FONT_CACHE[key] = handle
+        return handle
+    _FONT_CACHE[key] = handle
+    return handle
 
 
 def _map_font_name(name: Optional[str]) -> Optional[str]:
@@ -409,25 +588,14 @@ def _color_serialization(color: Tuple[float, float, float]) -> Dict[str, Sequenc
     }
 
 
-def _color_distance(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
-    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
-
-
-def _nudge_background(color: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    # Ensure text remains legible by slightly adjusting similar colors.
-    factor = 0.15
-    adjusted = tuple(min(1.0, max(0.0, channel + factor if channel < 0.5 else channel - factor)) for channel in color)
-    return adjusted  # type: ignore[return-value]
-
-
 def _prepare_annotation_rect(
-    line: PdfLayoutLine,
+    bbox: Tuple[float, float, float, float],
     page_width: float,
     page_height: float,
     font_size: float,
 ):
     padding = max(0.8, font_size * 0.15)
-    rect = pymupdf.Rect(line.bbox)  # type: ignore[attr-defined]
+    rect = pymupdf.Rect(bbox)  # type: ignore[attr-defined]
     min_height = max(font_size * 1.2, 5.0)
     if rect.height < min_height:
         delta = (min_height - rect.height) / 2
@@ -450,33 +618,44 @@ def _prepare_annotation_rect(
     return rect
 
 
-def _apply_freetext_overlay(
-    page: object,
+def _ensure_rect_capacity(
     rect: "pymupdf.Rect",
     text: str,
     style: _LineAnnotationStyle,
-    *,
-    annotation_index: int,
-) -> str:
-    annot = page.add_freetext_annot(  # type: ignore[attr-defined]
-        rect,
-        text,
-        fontsize=style.font_size,
-        fontname=style.font_name,
-        text_color=style.text_color,
-    )
-    annot.set_border(width=0)  # type: ignore[attr-defined]
-    annot.set_colors(fill=style.background_color)  # type: ignore[attr-defined]
-    annot.set_opacity(0.98)  # type: ignore[attr-defined]
-    annot.set_flags(pymupdf.PDF_ANNOT_PRINT)  # type: ignore[attr-defined]
-    annot.set_info(
-        title="Daru Translator",
-        content="Переведено Daru DWG Translator",
-    )  # type: ignore[attr-defined]
-    annotation_name = f"DARU_TEXT_{annotation_index:05d}"
-    annot.set_name(annotation_name)  # type: ignore[attr-defined]
-    annot.update()  # type: ignore[attr-defined]
-    return annotation_name
+    page_width: float,
+) -> "pymupdf.Rect":
+    if not text or not style.font_name:
+        return rect
+    text_length = _estimate_text_width(text, style)
+    if text_length is None:
+        return rect
+    available = rect.width
+    if text_length <= available:
+        return rect
+    deficit = text_length - available
+    extra_padding = max(0.0, style.font_size * 0.2)
+    deficit += extra_padding
+    space_right = max(0.0, page_width - rect.x1)
+    extend_right = min(space_right, deficit)
+    rect.x1 += extend_right
+    remaining = deficit - extend_right
+    if remaining > 0:
+        rect.x0 = max(0.0, rect.x0 - remaining)
+    if rect.x1 <= rect.x0:
+        rect.x1 = min(page_width, rect.x0 + text_length + extra_padding)
+    return rect
+
+
+def _estimate_text_width(text: str, style: _LineAnnotationStyle) -> Optional[float]:
+    if not text.strip():
+        return None
+    font_handle = style.font_handle
+    if font_handle is None:
+        font_handle = _resolve_font_handle(style.font_name or "helv")
+    try:
+        return float(font_handle.text_length(text, fontsize=style.font_size))  # type: ignore[attr-defined]
+    except Exception:
+        return None
 
 
 def _draw_text_overlay(
@@ -486,104 +665,62 @@ def _draw_text_overlay(
     style: _LineAnnotationStyle,
     *,
     annotation_index: int,
+    page_rect: "pymupdf.Rect",
 ) -> str:
-    font_name = style.font_name or "helv"
+    font_handle = style.font_handle or _resolve_font_handle(style.font_name or "helv")
     background = style.background_color or (1.0, 1.0, 1.0)
     text_color = style.text_color or (0.0, 0.0, 0.0)
+    working_rect = pymupdf.Rect(rect)  # type: ignore[attr-defined]
+    max_attempts = 8
+    growth_step = max(style.font_size * 0.9, 4.0)
+    writer_to_use: Optional[object] = None
+    final_rect = pymupdf.Rect(working_rect)  # type: ignore[attr-defined]
+    for _ in range(max_attempts):
+        writer = pymupdf.TextWriter(page_rect)  # type: ignore[attr-defined]
+        try:
+            leftovers = writer.fill_textbox(
+                working_rect,
+                text,
+                font=font_handle,
+                fontsize=style.font_size,
+                align=_TEXT_ALIGN_LEFT,
+                warn=None,
+            )
+        except ValueError:
+            leftovers = [("overflow", 0.0)]
+        writer_to_use = writer
+        final_rect = pymupdf.Rect(working_rect)  # type: ignore[attr-defined]
+        if not leftovers:
+            break
+        if working_rect.y0 <= 0.0 and working_rect.y1 >= page_rect.height:
+            break
+        extend_down = min(growth_step, page_rect.height - working_rect.y1)
+        working_rect.y1 += extend_down
+        remaining = growth_step - extend_down
+        if remaining > 0:
+            working_rect.y0 = max(0.0, working_rect.y0 - remaining)
+    _draw_background_rect(page, final_rect, background)
+    if writer_to_use is not None:
+        writer_to_use.write_text(page, color=text_color, overlay=True)  # type: ignore[attr-defined]
+    return f"DARU_DRAWN_{annotation_index:05d}"
+
+
+def _draw_background_rect(
+    page: object,
+    rect: "pymupdf.Rect",
+    color: Optional[Tuple[float, float, float]],
+) -> None:
+    if not color:
+        return
     try:
         page.draw_rect(  # type: ignore[attr-defined]
             rect,
-            color=background,
-            fill=background,
+            color=color,
+            fill=color,
             overlay=True,
         )
     except Exception:
         pass
-    page.insert_textbox(  # type: ignore[attr-defined]
-        rect,
-        text,
-        fontsize=style.font_size,
-        fontname=font_name,
-        color=text_color,
-        overlay=True,
-    )
-    return f"DARU_DRAWN_{annotation_index:05d}"
-
-
-def _try_apply_freetext_overlay(
-    page: object,
-    rect: "pymupdf.Rect",
-    text: str,
-    style: _LineAnnotationStyle,
-    *,
-    annotation_index: int,
-    log: PdfLog,
-) -> str:
-    attempted_fonts = []
-    font_candidates: List[str] = []
-    seen_fonts = set()
-    primary_font = style.font_name or "helv"
-    font_candidates.append(primary_font)
-    seen_fonts.add(primary_font.lower())
-    for fallback_font in ("helv", "cour", "tiro"):
-        if fallback_font.lower() not in seen_fonts:
-            font_candidates.append(fallback_font)
-            seen_fonts.add(fallback_font.lower())
-    for font_name in font_candidates:
-        variant = style
-        if font_name.lower() != (style.font_name or "").lower():
-            variant = _LineAnnotationStyle(
-                font_name=font_name,
-                font_size=style.font_size,
-                text_color=style.text_color,
-                background_color=style.background_color,
-            )
-        try:
-            result = _apply_freetext_overlay(
-                page,
-                rect,
-                text,
-                variant,
-                annotation_index=annotation_index,
-            )
-            style.font_name = variant.font_name
-            return result
-        except Exception as exc:
-            attempted_fonts.append(font_name)
-            if not _is_freetext_font_error(exc):
-                raise
-            _log_freetext_font_warning(font_name, log)
-            continue
-    _log_freetext_draw_warning(log)
-    style.font_name = font_candidates[-1] if font_candidates else "helv"
-    return _draw_text_overlay(
-        page,
-        rect,
-        text,
-        style,
-        annotation_index=annotation_index,
-    )
-
-
-def _is_freetext_font_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return "freetext" in message
-
-
-def _log_freetext_font_warning(font_name: str, log: PdfLog) -> None:
-    normalized = font_name.lower()
-    if normalized in _FREETEXT_FONT_WARNINGS:
-        return
-    _FREETEXT_FONT_WARNINGS.add(normalized)
-    log(f"PDF: шрифт '{font_name}' не подходит для FreeText, пытаемся другой")
-
-
-def _log_freetext_draw_warning(log: PdfLog) -> None:
-    global _FREETEXT_DRAW_WARNING
-    if _FREETEXT_DRAW_WARNING:
-        return
-    _FREETEXT_DRAW_WARNING = True
-    log("PDF: FreeText недоступен, рисуем текст прямо на странице")
 
 
 def _export_overlay_metadata(
@@ -726,10 +863,11 @@ def _read_translation_cache(path: Optional[Path]) -> Dict[str, str]:
             for row in reader:
                 if not row:
                     continue
-                source = (row.get("text_en") or "").strip()
-                if not source:
+                source_raw = (row.get("text_en") or "").strip()
+                if not source_raw:
                     continue
-                cache[source] = row.get("text_ru") or ""
+                key = _prepare_source_text(source_raw) or source_raw
+                cache[key] = row.get("text_ru") or ""
     except Exception:
         return {}
     return cache
@@ -755,7 +893,7 @@ def _write_translation_cache(path: Optional[Path], updates: Dict[str, str], log:
             writer = csv.writer(handle)
             writer.writerow(["text_en", "text_ru"])
             for source, translated in merged_cache.items():
-                writer.writerow([source, translated])
+                writer.writerow([_prepare_source_text(source) or source, translated])
     except Exception as exc:
         log(f"PDF: не удалось обновить кэш переводов ({exc})")
     else:

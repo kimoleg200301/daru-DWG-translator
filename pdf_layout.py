@@ -365,21 +365,47 @@ class _PageSnapshot:
             y1 = min(self.height, center_y + half)
         if x1 <= x0 or y1 <= y0:
             return None
-        total_r = total_g = total_b = 0
-        count = 0
+
+        inner_rect = rect & clipped  # type: ignore[attr-defined]
+        inner_x0 = inner_y0 = inner_x1 = inner_y1 = 0
+        if not inner_rect.is_empty:  # type: ignore[attr-defined]
+            inner_x0 = self._to_pixel_x(inner_rect.x0)
+            inner_y0 = self._to_pixel_y(inner_rect.y0)
+            inner_x1 = self._to_pixel_x(inner_rect.x1)
+            inner_y1 = self._to_pixel_y(inner_rect.y1)
+        else:
+            inner_x0 = inner_x1 = -1
+            inner_y0 = inner_y1 = -1
+
         data = self.samples
         stride = self.stride
         channels = self.n
-        for py in range(y0, y1):
-            row_offset = py * stride
-            for px in range(x0, x1):
-                offset = row_offset + px * channels
-                if offset + 2 >= len(data):
-                    continue
-                total_r += data[offset]
-                total_g += data[offset + 1]
-                total_b += data[offset + 2]
-                count += 1
+
+        def accumulate(skip_inner: bool) -> Tuple[int, int, int, int]:
+            total_r = total_g = total_b = 0
+            count = 0
+            for py in range(y0, y1):
+                row_offset = py * stride
+                inside_y = inner_y0 <= py < inner_y1
+                for px in range(x0, x1):
+                    if (
+                        skip_inner
+                        and inner_x0 <= px < inner_x1
+                        and inside_y
+                    ):
+                        continue
+                    offset = row_offset + px * channels
+                    if offset + 2 >= len(data):
+                        continue
+                    total_r += data[offset]
+                    total_g += data[offset + 1]
+                    total_b += data[offset + 2]
+                    count += 1
+            return total_r, total_g, total_b, count
+
+        total_r, total_g, total_b, count = accumulate(True)
+        if count == 0:
+            total_r, total_g, total_b, count = accumulate(False)
         if count == 0:
             return None
         return (
