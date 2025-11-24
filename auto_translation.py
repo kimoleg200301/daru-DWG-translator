@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from http.client import RemoteDisconnected
 from itertools import zip_longest
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -67,6 +68,7 @@ class TranslationEngine:
         openai_api_key: Optional[str] = None,
         openai_model: Optional[str] = None,
         openai_base_url: Optional[str] = None,
+        openai_project: Optional[str] = None,
         openai_temperature: float = 0.2,
         openai_strict_mode: Optional[str] = None,
         openai_strict_value: Optional[float] = None,
@@ -78,6 +80,8 @@ class TranslationEngine:
         self.openai_api_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
         self.openai_model = openai_model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
         self.openai_base_url = openai_base_url or os.environ.get("OPENAI_BASE_URL")
+        project_candidate = openai_project or os.environ.get("OPENAI_PROJECT")
+        self.openai_project = project_candidate.strip() if project_candidate else None
         self.openai_temperature = openai_temperature
         mode_candidate = (openai_strict_mode or os.environ.get("OPENAI_STRICT_MODE", "")).strip().lower()
         self.openai_strict_mode = mode_candidate if mode_candidate in {"verbosity", "effort"} else "verbosity"
@@ -163,6 +167,8 @@ class TranslationEngine:
             os.environ["OPENAI_API_KEY"] = self.openai_api_key
             if self.openai_base_url:
                 os.environ["OPENAI_BASE_URL"] = self.openai_base_url
+            if self.openai_project:
+                os.environ["OPENAI_PROJECT"] = self.openai_project
             try:
                 import openai  # type: ignore
 
@@ -174,6 +180,8 @@ class TranslationEngine:
                     client_kwargs = {"api_key": self.openai_api_key}
                     if self.openai_base_url:
                         client_kwargs["base_url"] = self.openai_base_url
+                    if self.openai_project:
+                        client_kwargs["project"] = self.openai_project
                     client = OpenAI(**client_kwargs)
                 except (ImportError, AttributeError, TypeError):
                     mode = "legacy"
@@ -361,12 +369,15 @@ class TranslationEngine:
                 client_kwargs = {"api_key": self.openai_api_key}
                 if self.openai_base_url:
                     client_kwargs["base_url"] = self.openai_base_url
+                if self.openai_project:
+                    client_kwargs["project"] = self.openai_project
                 try:
                     fallback_client = module.OpenAI(**client_kwargs)  # type: ignore[attr-defined]
                 except TypeError:
                     fallback_client = None
                     try:
                         client_kwargs.pop("base_url", None)
+                        client_kwargs.pop("project", None)
                         fallback_client = module.OpenAI(**client_kwargs)  # type: ignore[attr-defined]
                         if self.openai_base_url and fallback_client is not None:
                             with_options = getattr(fallback_client, "with_options", None)
@@ -544,6 +555,7 @@ class TranslationEngine:
                         time.sleep(OPENAI_RETRY_DELAY)
                 if completion is None:
                     continue
+                self._log_openai_response(completion)
 
                 message = extract_message(completion) or "{}"
                 translated_text = part_text
@@ -571,18 +583,27 @@ class TranslationEngine:
                     {"role": "system", "content": system_content},
                     {"role": "user", "content": user_content},
                 ]
+                responses_input = self._as_responses_input(messages_payload)
+                text_config = self._openai_responses_text_config(model)
+                reasoning_config = self._openai_responses_reasoning(model)
 
                 completion = None
                 for attempt in range(OPENAI_RETRY_ATTEMPTS):
                     try:
-                        modern_kwargs = {
+                        modern_kwargs: Dict[str, Any] = {
                             "model": model,
-                            "messages": list(messages_payload),
-                            "response_format": {"type": "json_object"},
+                            "input": responses_input,
                             "store": True,
                         }
-                        modern_kwargs.update(self._openai_generation_kwargs(model))
-                        completion = client.chat.completions.create(  # type: ignore[attr-defined]
+                        if text_config:
+                            modern_kwargs["text"] = text_config
+                        if reasoning_config:
+                            modern_kwargs["reasoning"] = reasoning_config
+                        metadata = self._openai_metadata()
+                        if metadata:
+                            modern_kwargs["metadata"] = metadata
+                        modern_kwargs.update(self._openai_generation_kwargs(model, for_responses=True))
+                        completion = client.responses.create(  # type: ignore[attr-defined]
                             **modern_kwargs
                         )
                         break
@@ -592,8 +613,11 @@ class TranslationEngine:
                         time.sleep(OPENAI_RETRY_DELAY)
                 if completion is None:
                     continue
+                self._log_openai_response(completion)
 
-                message = extract_message(completion) or "{}"
+                message = self._response_text(completion)
+                if not message:
+                    raise RuntimeError("ChatGPT не вернул данных ответа")
                 try:
                     data = json.loads(message or "{}")
                 except json.JSONDecodeError as exc:
@@ -630,17 +654,22 @@ class TranslationEngine:
 
         return results
 
-    def _openai_generation_kwargs(self, model: Optional[str]) -> Dict[str, Any]:
+    def _openai_generation_kwargs(self, model: Optional[str], *, for_responses: bool = False) -> Dict[str, Any]:
         model_key = (model or "").lower()
         if model_key in OPENAI_REASONING_MODELS:
+            if self.openai_strict_mode == "effort":
+                effort = self._reasoning_effort_value()
+                if effort and not for_responses:
+                    return {"reasoning_effort": effort}
             return {}
         return {"temperature": self.openai_temperature}
 
     def _should_retry_openai(self, exc: Exception) -> bool:
-        if isinstance(exc, ReadTimeout):
+        if isinstance(exc, (ReadTimeout, RemoteDisconnected)):
             return True
         message = str(exc).lower()
-        return "timed out" in message or "timeout" in message
+        retry_markers = ("timed out", "timeout", "remote end closed connection", "connection aborted")
+        return any(marker in message for marker in retry_markers)
 
     def _split_openai_payload(self, text: str, limit: int = OPENAI_SAFE_TEXT) -> List[str]:
         if len(text) <= limit or limit <= 0:
@@ -674,6 +703,82 @@ class TranslationEngine:
             segments.append(piece)
             start = split_pos
         return segments if segments else [text]
+
+    def _as_responses_input(self, messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        formatted: List[Dict[str, Any]] = []
+        for message in messages:
+            role = str(message.get("role") or "user")
+            content = message.get("content", "")
+            if isinstance(content, list):
+                formatted.append({"role": role, "content": content})
+                continue
+            formatted.append(
+                {
+                    "role": role,
+                    "content": [{"type": "text", "text": str(content)}],
+                }
+            )
+        return formatted
+
+    def _openai_responses_text_config(self, model: Optional[str]) -> Dict[str, Any]:
+        config: Dict[str, Any] = {"format": {"type": "json_object"}}
+        model_key = (model or "").lower()
+        if model_key in OPENAI_REASONING_MODELS and self.openai_strict_mode == "verbosity":
+            config["verbosity"] = self._strict_descriptor()
+        return config
+
+    def _openai_responses_reasoning(self, model: Optional[str]) -> Optional[Dict[str, str]]:
+        model_key = (model or "").lower()
+        if model_key not in OPENAI_REASONING_MODELS:
+            return None
+        if self.openai_strict_mode != "effort":
+            return None
+        effort = self._reasoning_effort_value()
+        return {"effort": effort} if effort else None
+
+    def _openai_metadata(self) -> Dict[str, str]:
+        meta: Dict[str, str] = {
+            "app": "daru-translator",
+            "source_lang": (self.source_lang or "auto")[:32],
+            "target_lang": (self.target_lang or "ru")[:32],
+        }
+        provider = (self.provider or "").strip()
+        if provider:
+            meta["provider"] = provider[:32]
+        if self.openai_project:
+            meta["project"] = self.openai_project[:64]
+        return meta
+
+    def _log_openai_response(self, response_obj: object) -> None:
+        response_id = getattr(response_obj, "id", None)
+        if not response_id and isinstance(response_obj, dict):
+            response_id = response_obj.get("id")
+        if response_id:
+            print(f"[OpenAI] response stored: {response_id}")
+
+    def _reasoning_effort_value(self) -> Optional[str]:
+        descriptor = self._strict_descriptor()
+        mapping = {
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+        }
+        return mapping.get(descriptor)
+
+    def _response_text(self, response_obj: object) -> str:
+        text_value = getattr(response_obj, "output_text", None)
+        if isinstance(text_value, str) and text_value.strip():
+            return text_value
+        fragments: List[str] = []
+        output = getattr(response_obj, "output", None)
+        if output:
+            for item in output:
+                contents = getattr(item, "content", None) or []
+                for content in contents:
+                    value = getattr(content, "text", None)
+                    if isinstance(value, str):
+                        fragments.append(value)
+        return "".join(fragments)
 
     def _openai_reasoning_note(self, model: Optional[str]) -> str:
         model_key = (model or "").lower()
@@ -749,6 +854,7 @@ def auto_translate(
     openai_api_key: Optional[str] = None,
     openai_model: Optional[str] = None,
     openai_base_url: Optional[str] = None,
+    openai_project: Optional[str] = None,
     openai_temperature: float = 0.2,
     openai_strict_mode: Optional[str] = None,
     openai_strict_value: Optional[float] = None,
@@ -761,6 +867,7 @@ def auto_translate(
         openai_api_key=openai_api_key,
         openai_model=openai_model,
         openai_base_url=openai_base_url,
+        openai_project=openai_project,
         openai_temperature=openai_temperature,
         openai_strict_mode=openai_strict_mode,
         openai_strict_value=openai_strict_value,

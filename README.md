@@ -9,6 +9,7 @@
 - Движки перевода: `google`, `deep_google`, `googletrans`, `deepl`, `chatgpt` (OpenAI) и `noop`.
 - OpenAI GPT-5 модели с управлением строгостью через `verbosity`/`effort` вместо температуры.
 - Сохранение карты соответствий в CSV и TXT-файлы с оригиналами/переводами.
+- Перевод PDF накладывается поверх оригинальных страниц в виде редактируемых FreeText-слоёв; дополнительно сохраняется JSON с координатами и стилями каждого блока для ручной правки.
 - Графический интерфейс с полосатым логом, поддержкой drag & drop и настройками API.
 
 ## Требования
@@ -16,6 +17,9 @@
 - Python 3.9+
 - Зависимости из `requirements-gui.txt`:
   - PySide6, pyinstaller, ezdxf, deep-translator, googletrans==4.0.0-rc1, deepl, openai
+- Для перевода PDF/сканов понадобятся дополнительные Python-библиотеки (`pymupdf`, `pdf2image`, `pytesseract`, `PyPDF2`) и нативные утилиты OCR:
+  - Установите библиотеки через `pip install -r requirements-gui.txt` (именно pip, macOS Homebrew не добавляет их в Python окружение приложения).
+  - Установите Poppler и Tesseract для macOS: `brew install poppler tesseract`. Затем при необходимости укажите путь к Poppler в переменной окружения `POPPLER_PATH`.
 - [ODA File Converter](https://www.opendesign.com/guestfiles/oda_file_converter) в `PATH` — именно он обеспечивает конверсию DWG ↔ DXF через `ezdxf.addons.odafc`. Можно также задать переменные среды `ODA_FILE_CONVERTER` или `ODAFC_PATH`, указывающие на `ODAFileConverter.exe`.
 
 Установка зависимостей (рекомендуется виртуальное окружение):
@@ -29,7 +33,9 @@ pip install -r requirements-gui.txt
 ## Настройка API
 
 - **OpenAI**: задайте `OPENAI_API_KEY` (и при необходимости `OPENAI_BASE_URL`) в настройках GUI или через переменные окружения. Для GPT-5 доступны параметры `verbosity` или `effort` с уровнем 0–100.
+- Если ваш API-ключ привязан к конкретному проекту OpenAI, укажите его идентификатор через `OPENAI_PROJECT` (или в настройках GUI / флагом CLI). Это гарантирует, что запросы появятся в разделе [https://platform.openai.com/logs](https://platform.openai.com/logs).
 - **DeepL**: укажите `DEEPL_AUTH_KEY`/`DEEPL_API_KEY` в настройках или окружении.
+- Все запросы к OpenAI выполняются через Responses API с флагом `store=True`, поэтому они автоматически попадают в раздел [https://platform.openai.com/logs](https://platform.openai.com/logs). Если используется кастомный `OPENAI_BASE_URL`, проверяйте логи в соответствующем окружении или прокси.
 
 ## Запуск GUI
 
@@ -58,6 +64,7 @@ python3 auto_translate_dxf.py INPUT.dwg OUTPUT_ru.dwg \
 
 - `--translator` — выбор движка перевода.
 - `--output-format` — целевой формат (`dwg` по умолчанию, можно указать `dxf`).
+- `--openai-project` — передача идентификатора проекта OpenAI, чтобы запросы попадали в нужный раздел логов.
 - `--no-map`, `--skip-txt` — отключают генерацию CSV и TXT.
 - `--openai-strict-mode` / `--openai-strict-value` — контроль strictness для GPT-5.
 

@@ -202,6 +202,7 @@ def translate_dxf(
     openai_key: Optional[str] = None,
     openai_model: Optional[str] = None,
     openai_base_url: Optional[str] = None,
+    openai_project: Optional[str] = None,
     openai_temperature: float = 0.2,
     openai_strict_mode: Optional[str] = None,
     openai_strict_value: Optional[float] = None,
@@ -240,18 +241,19 @@ def translate_dxf(
     if translation_cache and cache_lookup_path:
         logger(f"Loaded {len(translation_cache)} cached translations from {cache_lookup_path}")
 
-    translator = TranslationEngine(
-        provider=translator_name,
-        source_lang=source_lang,
-        target_lang=target_lang,
-        deepl_auth_key=deepl_key,
-        openai_api_key=openai_key,
-        openai_model=openai_model,
-        openai_base_url=openai_base_url,
-        openai_temperature=openai_temperature,
-        openai_strict_mode=openai_strict_mode,
-        openai_strict_value=openai_strict_value,
-    )
+        translator = TranslationEngine(
+            provider=translator_name,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            deepl_auth_key=deepl_key,
+            openai_api_key=openai_key,
+            openai_model=openai_model,
+            openai_base_url=openai_base_url,
+            openai_project=openai_project,
+            openai_temperature=openai_temperature,
+            openai_strict_mode=openai_strict_mode,
+            openai_strict_value=openai_strict_value,
+        )
     logger(f"Инициализирован движок перевода: {translator.backend_name()}")
 
     context_factory = translation_context_factory or (lambda _msg: nullcontext())
@@ -378,6 +380,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             openai_key=getattr(args, "openai_key", None),
             openai_model=getattr(args, "openai_model", None),
             openai_base_url=getattr(args, "openai_base_url", None),
+            openai_project=getattr(args, "openai_project", None),
             openai_temperature=getattr(args, "openai_temperature", 0.2),
             openai_strict_mode=getattr(args, "openai_strict_mode", None),
             openai_strict_value=getattr(args, "openai_strict_value", None),
@@ -423,6 +426,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openai-key", help="Ключ OpenAI совместимого API (или переменная OPENAI_API_KEY)")
     parser.add_argument("--openai-model", help="Модель OpenAI (default: gpt-4o-mini)")
     parser.add_argument("--openai-base-url", help="Базовый URL для OpenAI-совместимого API")
+    parser.add_argument("--openai-project", help="Идентификатор проекта OpenAI для логов (опционально)")
     parser.add_argument(
         "--openai-temperature",
         type=float,

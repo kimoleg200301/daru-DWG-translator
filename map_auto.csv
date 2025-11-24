@@ -1056,3 +1056,328 @@ Supply protected against the effect of fire,"ПИТАНИЕ, ЗАЩИЩЁННО�
 
 <ЧАСТЬ ШАХТЫ С ЛЕСТНИЦЕЙ>
 \~\~\~\~ НЕПОДВИЖНЫЕ ЛЕСТНИЦЫ В СООТВЕТСТВИИ С 5.2.2.5 B), C) И E) СТАНДАРТА EN 81-20:2014, РАСПОЛОЖЕННЫЕ В 0,75 М ОТ ПОРОГА ВХОДА НА ЭТАЖ СВЕРХУ."
+"Thedimensionsinthelayoutdrawingsare notdrawn ina 1:1 ratio,andtheuseofascale bar formeasurementisprohibited.","Размеры на компоновочных чертежах не выполнены в масштабе 1:1, и использование шкалы для измерений запрещено."
+LOD ELNO.,LOD № ЛИФТА.
+"L001,L002","L001,L002"
+=,=
+HOISTWAY WIDTH 2800,ШИРИНА ШАХТЫ 2800
+PLATFORM 2150,ПЛАТФОРМА 2150
+_ 160,_ 160
+|,|
+CARWIDTH 2100,ШИРИНА КАБИНЫ 2100
+__/ TWOHOOKS,__/ ДВА КРЮКА
+(BYOTHERS},"{""translations"":[{""id"":""10:0"",""text"":""(ВЫПОЛНЯЕТСЯ ДРУГИМИ}""]}"
+WALLFINISHED,ОТДЕЛКА СТЕНЫ
+(BYOTHERS),(ВЫПОЛНЯЕТСЯ ДРУГИМИ)
+100 CLEAROPENING 1100,100 ЧИСТЫЙПРОЕМ 1100
+100_,100_
+CONCRETEOPENING 1300,ПРОЕМ В БЕТОНЕ 1300
+1490,1490
+OTHERFLOOR,ДРУГОЙ ЭТАЖ
+be,be
+CARDEPTH1300,ГЛУБИНАКАБИНЫ1300
+@,@
+PLATFORM1449,ПЛАТФОРМА1449
+HOISTWAYDEPTH1900,Глубина шахты 1900
+FIREDOOR,ПРОТИВОПОЖАРНАЯ ДВЕРЬ
+:El60(GOST},:Эл60(ГОСТ}
+1.Themaximumlengthofwireis60m.,1. Максимальная длина провода — 60 м.
+2.Temperatureshouldbemaintainedbelow40°Cwithventilating,2. Температура должна поддерживаться ниже 40°C при вентиляции
+fanand,вентилятор и
+"(or}airconditioner, ifnecessary,andhumiditybelow90%.","(или}кондиционер, если необходимо, и влажность ниже 90%."
+"3,Earthwireshouldbeusedonlyforelevator, andtheresistanceshouldbe","3,Заземляющий провод должен использоваться только для лифта, и сопротивление должно быть"
+lessthan40.,меньше 40.
+"4, Installtherecevingboxaroundthe3Mareaofcontrolpanel(BYOTHERS),","4, Установить приемную коробку вокруг 3M зоны блока управления (BYOTHERS),"
+themainpowerswitchcannotbewiththeleakageprotectiondevice.,Главный выключатель питания не может устанавливаться вместе с устройством защитного отключения.
+5.Interphonecableis Twisted-pair shielded cable.,5. Кабель домофона — экранированный кабель витой пары.
+The cablespecification,Спецификация кабеля
+from machineroomtomonitoringroomisRWS0.75*(2*2)P(BYOTHERS},от машинного помещения до комнаты мониторинга составляет RWS0.75*(2*2)P(устанавливается другими}
+TOPFLOOR,ВЕРХНИЙ ЭТАЖ
+PROJ.,ПРОЕКТ.
+2025.09.18,2025.09.18
+2025-09-08,2025-09-08
+NAME,НАИМЕНОВАНИЕ
+| RESDBY,| ЗАРЕЗЕРВИРОВАНО
+Swissapartment,Швейцарская квартира
+ELNO.,ЛИФТ №
+L001002,L001002
+CAPACITY(kg),ГРУЗОПОДЪЕМНОСТЬ(кг)
+2.0,2.0
+VWF,VWF
+18/18/18,18/18/18
+"P2,P1,L,4~18","P2,P1,L,4~18"
+TRAVEL(mm),ХОД(mm)
+70800,70800
+CAR INTERNALSIZE (mm),Внутренний размер кабины (мм)
+2100X1300,2100х1300
+DOOROPENING SIZE (mm),РАЗМЕР ДВЕРНОГО ПРОЁМА (мм)
+1100X2300,1100X2300
+DOOROPENTYPE,ТИП ОТКРЫВАНИЯ ДВЕРИ
+2-PANELCENTER OPENING,2-панельное центральное открывание
+ROPESRATIO,Коэффициент канатов
+TM MOTOR(kw),TM ДВИГАТЕЛЬ(кВт)
+14.1,14.1
+ELECTRICAL REQUIREMENTS/UNIT(BYOTHERS),ЭЛЕКТРИЧЕСКИЕ ТРЕБОВАНИЯ/БЛОК(ПРЕДОСТАВЛЯЕТСЯ ДРУГИМИ)
+A.C3PH-380-50,А.С3Ф-380-50
+A.C1PH-220-50,А.С1Ф-220-50
+CAPACITYOF MAIN,ГРУЗОПОДЪЁМНОСТЬ ГЛАВНОГО
+POWERC.B.(A),ПИТАНИЕАВ.(A)
+MAINPOWERFEEDER,ГЛАВНЫЙ ПИТАЮЩИЙ КАБЕЛЬ
+(mm’),(мм’)
+EARTH WIRE (mm/),Провод заземления (mm/)
+CAPACITYOFLIGHTING,МОЩНОСТЬ ОСВЕЩЕНИЯ
+C.B.(A),Автоматический выключатель (A)
+APPDBY,УТВЕРЖДЕНО
+EH/BBC,EH/BBC
+APPD BY.,УТВЕРЖДЕНО.
+FEEDER (mm”),ПИТАТЕЛЬ (мм”)
+-CAR RAIL,-НАПРАВЛЯЮЩАЯ КАБИНЫ
+-CWTRAIL,-РЕЛЬСА ПРОТИВОВЕСА
+-CODE: EN81-20/50+EN81-72,-КОД: EN81-20/50+EN81-72
+THEAREADOESNOTCOMPLYWITH EN CODE,ЭТА ЗОНА НЕ СООТВЕТСТВУЕТ СТАНДАРТУ EN
+ELFBZX/DEVIATION-20250911039,ELFBZX/ОТКЛОНЕНИЕ-20250911039
+EL NO. (L001002),№ ЛИФТА (L001002)
+HOISTWAYPLAN,ПЛАН ШАХТЫ
+(KZ2025090116)A5090215B-L001002-01,(KZ2025090116)A5090215B-L001002-01
+HYUNDAI | seve,HYUNDAI | seve
+"ELEVATORCo.,LTD.","ООО ""ELEVATOR""."
+"Thedimensionsin the layoutdrawingsare notdrawn in a 1:1 ratio,and the useofa scale barformeasurementis prohibited.","Размеры на компоновочных чертежах не нанесены в масштабе 1:1, и использование масштабной линейки для измерений запрещено."
+a,a
+;,;
+14,14
+],]
+*ONLYBOTTOM FLOOR,*ТОЛЬКО НИЖНИЙ ЭТАЖ
+MAINFLOORONLY.,ТОЛЬКО ОСНОВНОЙ ЭТАЖ.
+','
+|},|}
+PP,PP
+r,r
+i,i
+bt,bt
+s,s
+| si,| si
+!,!
+",",","
+Pe),Pe)
+my fe,мой fe
+x,x
+am,am
+o,o
+s2 \\/,s2 \\/
+pi,pi
+Bd,Bd
+32 \\/,32 \\/
+—,—
+1S,1S
+om,om
+\!,\!
+©,©
+s\=,s\=
+NY,NY
+==,==
+\v,\v
+S,S
+22 W,22 Ш
+Ww,Ww
+=zS,=zS
+k,k
+on,on
+So,So
+=o,=o
+nN,nN
+| 2,| 2
+zo,zo
+on ©,вкл. ©
+Fea,Особенность
+aad,aad
+oe mS,oe mS
+= 2,= 2
+-,-
+a) =,a) =
+o mo,о мо
+_,_
+es /\\,есть /\\
+io} 6B | UES /\\,io} 6B | UES /\\
+ote ®,примечание ®
+23/\\,23/\\
+1B,1B
+"a fas ,","а фас ,"
+\,\
+/,/
+‘\,‘\
+% &,% &
+‘,‘
+ro),ро)
+e,e
+aS’,aS’
+ren},ren}
+18,18
+ze,ze
+| S,| S
+yy,yy
+et,et
+nn,nn
+},}
+- nH,- нГн
++,+
+vy,vy
+“,“
+ot,ot
+l,l
+Ly,Ly
+CONCRETEOPENING,ПРОЕМ В БЕТОНЕ
+CONCRETE OPENING,ПРОЕМ В БЕТОНЕ
+1300,1300
+Ls,Ls
+~|,~|
+aa,aa
+1310,1310
+JL,JL
+LL,LL
+l=,l=
+Xl=,Xl=
+P2FLOOR,P2ЭТАЖ
+TOP_FLOOR,ВЕРХНИЙ_ЭТАЖ
+XL-X1,XL-X1
+PITRESETBOX,Ящик сброса приямка
+:,:
+hal,холл
+SWITCH,ПЕРЕКЛЮЧАТЕЛЬ
+t,t
+isTES,является TES
+an,an
+——,——
+—_,—_
+——_,——_
+_—,_—
+1m,1m
+iT,iT
+FIRE SERVICE ACCESS LEVEL,УРОВЕНЬ ДОСТУПА ПОЖАРНОЙ СЛУЖБЫ
+BUILT-INMICROPHONE,ВСТРОЕННЫЙ МИКРОФОН
+SILLBRACKET &ANCHORBOLT,КРОНШТЕЙН ПОРОГА &АНКЕРНЫЙ БОЛТ
+(BYHYUNDAIELEVATOR),(ОТ HYUNDAI ELEVATOR)
+as,as
+Ag,Ag
+{,{
+"DETAIL ""A","ДЕТАЛЬ ""A"
+—$———_—_<—,—$———_—_<—
+THICKNESS,ТОЛЩИНА
+<75,<75
+ENTRANCEHEIGHT2300,ВЫСОТА_ВХОДА2300
+ENTRANCEHEIGHT2100,ВЫСОТАВХОДА2100
+c/P,c/P
+"""IFFLOORTHICKNESSISGREATERTHAN75MM,PLEASE","""ЕСЛИ ТОЛЩИНА ПОЛА БОЛЕЕ 75MM, ПОЖАЛУЙСТА"
+INFORMUSINTIME.WEWILLREPLACETHEOTHERTYPEOF,Уведомьте нас вовремя. Мы заменим другой тип.
+SILLSUPPORT.,ОПОРА ПОРОГА.
+=),=)
+CLEAROPENING,ЧИСТЫЙ ПРОЁМ
+~,~
+-_,-_
+"IFTHERESCUEMETHOD5.4.3b)ISUSED,","ЕСЛИ ИСПОЛЬЗУЕТСЯ СПОСОБ СПАСЕНИЯ 5.4.3b),"
+THERESCUETOOLISFIXED,СПАСАТЕЛЬНЫЙ ИНСТРУМЕНТ ЗАФИКСИРОВАН
+EL NO. (L001002,Номер лифта (L001002
+ave,среднее
+Swissapartment5,Швейцарскаяквартира5
+(,(
+),)
+HOLE OFENTRANCE,ВХОДНОЕ ОТВЕРСТИЕ
+/ PLAN OF ENTRANCE,/ ПЛАН ВХОДА
+EHH/BBC,EHH/BBC
+| LOCATION |,| РАСПОЛОЖЕНИЕ |
+REV.NO,РЕВ. №
+(KZ2025090116)A5090215B-L001002-02 |,(KZ2025090116)A5090215B-L001002-02 |
+"Thedimensions inthe layoutdrawingsare notdrawn in a 1:1 ratio, andthe useofascale bar formeasurementis prohibited.","Размеры на плановых чертежах не приведены в масштабе 1:1, и использование шкалы для измерений запрещено."
+OVERHEAD 6750,Верхнее пространство 6750
+TOTALHEIGHT 78900,ОБЩАЯ ВЫСОТА 78900
+TRAVEL 70800,ХОД 70800
+PIT 1350,Приямок 1350
+-——,-——
+oS,oS
+21100,21100
+SS,SS
+"""",""""
+co,co
+———,———
+lS,lS
+ee,ee
+>,>
+SSS,SSS
+1},1}
+——————,——————
+rn,rn
+FETT,ЖИРНЫЙ
+TT Ettb,TT Ettb
+~N],~N]
+ff,ff
+ia),ia)
+TOP,TOP
+OF CWT RAIL F= 4240,ОТ РЕЛЬСА ПРОТИВОВЕСА F= 4240
+3490,3490
+TOOFCARRAIL(CWTSIDE) G= 4240,Верхняя направляющая кабины (со стороны противовеса) G= 4240
+3890,3890
+520,520
+350 | 360 |,350 | 360 |
+-_—,-_—
+TOPOFCARRAIL(CARHITCHSIDE) H= 4540,ВЕРХ НАПРАВЛЯЮЩЕЙ КАБИНЫ (СТОРОНА ПРИЦЕПНОГО КРЮКА) H= 4540
+4190,4190
+350 |,350 |
+660,660
+FLOORNAME,НАЗВАНИЕ ЭТАЖА
+P2 FL,P2 этаж
+Pl FL,Пл. ур. пола
+Po a,По а
+FLOORHEIGHT,ВЫСОТА ЭТАЖА
+Top =,Верх =
+(CWT)RAILC,(ПРОТИВОВЕС)НАПРАВЛЯЮЩАЯC
+(CWT)RAILD,(контргруз) НАПРАВЛЯЮЩАЯ D
+"(CARJRAILA,B","(CARJRAILA,B"
+CARBUFFER,КАБИННЫЙ БУФЕР
+CWTRAILPITCH(FROMTOPTOBOTTOM)5000X14=70000,ШАГ НАПРАВЛЯЮЩЕЙ CW(СВЕРХУ ВНИЗ)5000X14=70000
+aL,aL
+CARRAILPITCH(CWTSIDE) FROMTOPTOBOTTOM)5000X14=70000,ШАГ НАПРАВЛЯЮЩЕЙ КАБИНЫ (СТОРОНА ПРОТИВОВЕСА) СВЕРХУ ВНИЗ)5000X14=70000
+CARANDCWTCOMMON RAILBRACKET(FROMTOPTOBOTTOM)L500X7+1000+1500X6+1000+1500X6+1000+1500X6+1000+150046+1000+1500X6+1000+1500X6#950+1500X2=74450,ОБЩИЙ КРОНШТЕЙН НАПРАВЛЯЮЩЕЙ ДЛЯ КАБИНЫ И ПРОТИВОВЕСА (СВЕРХУ ВНИЗ) L500X7+1000+1500X6+1000+1500X6+1000+1500X6+1000+150046+1000+1500X6+1000+1500X6#950+1500X2=74450
+CARRAIL(CARHITCHSIDE)(FROMTOPTOBOTTOM)5000X14=70000,НАПРАВЛЯЮЩАЯ КАБИНЫ(СТОРОНА ПРИЦЕПА КАБИНЫ)(СВЕРХУ ВНИЗ)5000X14=70000
+CARRAILBRACKET(CARHITCHSIDE](FROMTOPTOBOTTOM)1500X7+1000+1500X6+1000+1500X6+1000+1500X6+1000+1500X6+1000+1500X6+1000+1500X6+950+1500X2=74450,КРОНШТЕЙННАПРАВЛЯЮЩЕЙКАБИНЫ(СТОРОНАСЦЕПЛЕНИЯКАБИНЫ](СВЕРХУВНИЗ)1500X7+1000+1500X6+1000+1500X6+1000+1500X6+1000+1500X6+1000+1500X6+1000+1500X6+950+1500X2=74450
+"LAMPOFHOISTWAY(I,0MABOVECARROOFORPITFLOOR250LUX,OTHERLOCATIONS220LUX)","СВЕТИЛЬНИК ШАХТЫ (I,0M НАД КРОВЛЕЙ КАБИНЫ ИЛИ ПОЛОМ ПРИЯМКА 250LUX, ОСТАЛЬНЫЕ МЕСТА 220LUX)"
+BRACKETIBYOTHERS.,КРОНШТЕЙН ПРЕДОСТАВЛЯЕТСЯ ДРУГИМИ.
+CHKQ.BY,CHKQ.BY
+CWTBUFFER,БУФЕР ПРОТИВОВЕСА
+"NOTE: IFTHEHOISTWAYISNOTCONCRETESTRUCTURE,PLEASESET","ПРИМЕЧАНИЕ: ЕСЛИ ШАХТА НЕ ЯВЛЯЕТСЯ БЕТОННОЙ КОНСТРУКЦИЕЙ, ПОЖАЛУЙСТА, УСТАНОВИТЕ"
+THERINGBEAMORSTEELBEAMACCORDDINGTOTHESPANOFRAIL,Кольцевая балка или стальная балка в зависимости от пролёта рельсов
+HOISTING,ПОДЪЕМ
+HOOK 35KN,КРЮК 35КН
+025 STEELBAR,025 СТАЛЬНЫЙ ПРУТОК
+700 150700,700 150700
+fae],fae]
+"DETAIL""A""","ДЕТАЛЬ""A"""
+|”,|”
+VAN,VAN
+5 |e,5 |e
+@) ale,@) эль
+2222),2222)
+Ze,Ze
+HAS,HAS
+Z|,Z|
+faa =,faa =
+= |<t,= |<t
+—7,—7
+Ole,Оле
+ee ),ee )
+wjO Ww,wjO Ww
+ao im oO,ao im oO
+KIS >,KIS >
+ama,ама
+—6,—6
+—5,—5
+1.TWOSUSPENSIONHOCK(REINFORCINGBAR},1. ДВА ПОДВЕСНЫХ КРЮКА (АРМАТУРНЫЙ СТЕРЖЕНЬ}
+2.INSPECTIONPLUG(BYOTHERS),2.РЕВИЗИОННАЯ ПРОБКА (ПОСТАВЛЯЕТСЯ ДРУГИМИ)
+REACTION(KN),РЕАКЦИЯ(кН)
+"3,INSPECTION LADDER (BYHDEL}","3,ЛЕСТНИЦА ДЛЯ ОСМОТРА (BYHDEL}"
+4.LAMPOFHOISTWAY (BYHDEL),4.ЛАМПА ШАХТЫ (BYHDEL)
+"EEO, (ED0L002)","EEO, (ED0L002)"
+HOISTWAYSECTION,РАЗРЕЗ ШАХТЫ
+=38/BB,=38/BB
+74,74
+“REVISION,“РЕВИЗИЯ
+HY INDA,HY INDA
+(KZ2025090116)A5090215B-L001002-03,(KZ2025090116)A5090215B-L001002-03

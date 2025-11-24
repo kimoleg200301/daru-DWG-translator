@@ -5,8 +5,7 @@ deep-translator
 googletrans==4.0.0-rc1
 deepl
 openai
-pdfplumber
 pdf2image
 pytesseract
 PyPDF2
-reportlab
+pymupdf

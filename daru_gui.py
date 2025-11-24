@@ -134,10 +134,13 @@ class AppSettings:
     source_lang: str = "en"
     target_lang: str = "ru"
     style_font: str = ""
+    save_pdf_layer: bool = True
+    pdf_layer_path: str = ""
     deepl_key: str = ""
     openai_key: str = ""
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str = ""
+    openai_project: str = ""
     openai_temperature: float = 0.2
     openai_strict_mode: str = "verbosity"
     openai_strict_value: float = 0.5
@@ -204,6 +207,7 @@ class SettingsDialog(QDialog):
         populate_combo(self.openai_model_combo, OPENAI_MODEL_CHOICES, settings.openai_model)
         self.openai_url_combo = QComboBox()
         populate_combo(self.openai_url_combo, OPENAI_BASE_URL_CHOICES, settings.openai_base_url, allow_empty=True)
+        self.openai_project_edit = QLineEdit(settings.openai_project)
         self.openai_temp_spin = QSpinBox()
         self.openai_temp_spin.setRange(0, 100)
         self.openai_temp_spin.setValue(int(settings.openai_temperature * 100))
@@ -224,6 +228,7 @@ class SettingsDialog(QDialog):
         form.addRow("OpenAI API Key", self.openai_key_edit)
         form.addRow("OpenAI Model", self.openai_model_combo)
         form.addRow("OpenAI Base URL", self.openai_url_combo)
+        form.addRow("OpenAI Project ID", self.openai_project_edit)
         form.addRow("OpenAI Temperature (x100)", self.openai_temp_spin)
         form.addRow("OpenAI Strict Parameter", self.openai_strict_mode_combo)
         form.addRow("OpenAI Strict Value (x100)", self.openai_strict_value_spin)
@@ -243,6 +248,7 @@ class SettingsDialog(QDialog):
             "openai_key": self.openai_key_edit.text().strip(),
             "openai_model": self.openai_model_combo.currentText().strip() or "gpt-4o-mini",
             "openai_base_url": self.openai_url_combo.currentText().strip(),
+            "openai_project": self.openai_project_edit.text().strip(),
             "openai_temperature": self.openai_temp_spin.value() / 100.0,
             "openai_strict_mode": self.openai_strict_mode_combo.currentText().strip() or "verbosity",
             "openai_strict_value": self.openai_strict_value_spin.value() / 100.0,
@@ -310,6 +316,19 @@ class MainWindow(QWidget):
         pdf_type_layout.addWidget(self.pdf_type_combo)
         pdf_type_layout.addStretch()
         self.pdf_type_widget.setVisible(False)
+
+        self.pdf_layer_widget = QWidget()
+        pdf_layer_layout = QHBoxLayout(self.pdf_layer_widget)
+        pdf_layer_layout.setContentsMargins(0, 0, 0, 0)
+        self.pdf_layer_checkbox = QCheckBox("Сохранить JSON слой перевода")
+        self.pdf_layer_checkbox.toggled.connect(self.update_aux_controls)
+        self.pdf_layer_path_edit = QLineEdit()
+        self.pdf_layer_browse = QPushButton("...")
+        self.pdf_layer_browse.clicked.connect(lambda: self.browse_aux_file(self.pdf_layer_path_edit))
+        pdf_layer_layout.addWidget(self.pdf_layer_checkbox)
+        pdf_layer_layout.addWidget(self.pdf_layer_path_edit)
+        pdf_layer_layout.addWidget(self.pdf_layer_browse)
+        self.pdf_layer_widget.setVisible(False)
 
         self.output_edit = QLineEdit()
         self.output_browse = QPushButton("Сохранить как...")
@@ -390,6 +409,7 @@ class MainWindow(QWidget):
         main_layout.addWidget(self.status_label)
         main_layout.addLayout(input_row)
         main_layout.addWidget(self.pdf_type_widget)
+        main_layout.addWidget(self.pdf_layer_widget)
         main_layout.addLayout(output_row)
 
         options_layout = QFormLayout()
@@ -442,6 +462,8 @@ class MainWindow(QWidget):
         self.source_lang_combo.setCurrentText(data.source_lang)
         self.target_lang_combo.setCurrentText(data.target_lang)
         self.style_font_combo.setCurrentText(data.style_font)
+        self.pdf_layer_checkbox.setChecked(data.save_pdf_layer)
+        self.pdf_layer_path_edit.setText(data.pdf_layer_path)
         self.map_checkbox.setChecked(data.save_map)
         self.txt_checkbox.setChecked(data.save_txt)
         self.output_format_combo.setCurrentText(data.output_format or "dwg")
@@ -483,10 +505,19 @@ class MainWindow(QWidget):
         txt_active = self.txt_checkbox.isChecked() and not pdf_mode
         self.map_checkbox.setEnabled(not pdf_mode)
         self.txt_checkbox.setEnabled(not pdf_mode)
+        self.source_lang_combo.setEnabled(not pdf_mode)
+        # self.style_font_combo.setEnabled(not pdf_mode)
         self.map_path_edit.setEnabled(map_active)
         self.map_browse.setEnabled(map_active)
         for widget in (self.extracted_path_edit, self.extracted_browse, self.translated_path_edit, self.translated_browse):
             widget.setEnabled(txt_active)
+        self.pdf_layer_widget.setVisible(pdf_mode)
+        self.pdf_layer_checkbox.setEnabled(pdf_mode)
+        pdf_layer_active = pdf_mode and self.pdf_layer_checkbox.isChecked()
+        self.pdf_layer_path_edit.setEnabled(pdf_layer_active)
+        self.pdf_layer_browse.setEnabled(pdf_layer_active)
+        if pdf_layer_active:
+            self._ensure_pdf_layer_path()
 
     def _reset_auxiliary_for_pdf(self) -> None:
         for checkbox in (self.map_checkbox, self.txt_checkbox):
@@ -537,6 +568,8 @@ class MainWindow(QWidget):
         self.map_path_edit.setText(str(defaults["map"]))
         self.extracted_path_edit.setText(str(defaults["extracted"]))
         self.translated_path_edit.setText(str(defaults["translated"]))
+        if self._pdf_input_active:
+            self.pdf_layer_path_edit.setText(str(defaults.get("pdf_layer", path.with_suffix(".translation.json"))))
         self.settings_manager.update(last_directory=str(path.parent))
         self.update_aux_controls()
 
@@ -549,11 +582,13 @@ class MainWindow(QWidget):
             out_suffix = ".pdf"
         else:
             out_suffix = ".dwg" if (self.output_format_combo.currentText() or "dwg").lower() == "dwg" else ".dxf"
+        pdf_layer = parent / f"{stem}_translation.json"
         return {
             "output": parent / f"{stem}_ru{out_suffix}",
             "map": parent / f"{stem}_map.csv",
             "extracted": parent / f"{stem}_texts.txt",
             "translated": parent / f"{stem}_texts_ru.txt",
+            "pdf_layer": pdf_layer,
         }
 
     def sync_output_suffix(self) -> None:
@@ -568,11 +603,29 @@ class MainWindow(QWidget):
             if path.suffix.lower() != suffix:
                 path = path.with_suffix(suffix)
                 self.output_edit.setText(str(path))
+        if self.is_pdf_input():
+            self._ensure_pdf_layer_path()
+
+    def _ensure_pdf_layer_path(self) -> None:
+        if not self.is_pdf_input():
+            return
+        current = self.pdf_layer_path_edit.text().strip()
+        if current:
+            return
+        output = self.output_edit.text().strip()
+        if not output:
+            return
+        default = Path(output).with_suffix(".translation.json")
+        self.pdf_layer_path_edit.setText(str(default))
 
     def append_log(self, message: str) -> None:
         item = QListWidgetItem(message)
         if message.startswith("Готово. Результат"):
             item.setForeground(QColor("#1E8F40"))
+        if message.startswith("Ошибка") or message.startswith("PDF: FreeText недоступен, рисуем текст прямо на странице"):
+            item.setForeground(QColor("#8F1E1E"))
+        if message.startswith("PDF: шрифт"):
+            item.setForeground(QColor("#8F8B1E"))
         self.log_view.addItem(item)
         self.log_view.scrollToBottom()
 
@@ -595,12 +648,20 @@ class MainWindow(QWidget):
             if output_path_obj.suffix.lower() != ".pdf":
                 output_path_obj = output_path_obj.with_suffix(".pdf")
                 self.output_edit.setText(str(output_path_obj))
+            layer_json_path: Optional[Path] = None
+            if self.pdf_layer_checkbox.isChecked():
+                json_path_text = self.pdf_layer_path_edit.text().strip()
+                if not json_path_text:
+                    json_path_text = str(output_path_obj.with_suffix(".translation.json"))
+                    self.pdf_layer_path_edit.setText(json_path_text)
+                layer_json_path = Path(json_path_text)
         else:
             format_choice = (self.output_format_combo.currentText() or "dwg").lower()
             expected_suffix = ".dwg" if format_choice == "dwg" else ".dxf"
             if output_path_obj.suffix.lower() != expected_suffix:
                 output_path_obj = output_path_obj.with_suffix(expected_suffix)
                 self.output_edit.setText(str(output_path_obj))
+            layer_json_path = None
         params: Dict[str, Any] = {
             "input_path": input_obj,
             "output_path": output_path_obj,
@@ -612,6 +673,7 @@ class MainWindow(QWidget):
             "openai_key": self.settings_manager.data.openai_key or None,
             "openai_model": self.settings_manager.data.openai_model or None,
             "openai_base_url": self.settings_manager.data.openai_base_url or None,
+            "openai_project": self.settings_manager.data.openai_project or None,
             "openai_temperature": self.settings_manager.data.openai_temperature,
             "openai_strict_mode": self.settings_manager.data.openai_strict_mode or None,
             "openai_strict_value": self.settings_manager.data.openai_strict_value,
@@ -620,6 +682,7 @@ class MainWindow(QWidget):
             params.update(
                 {
                     "pdf_type": self.pdf_type_combo.currentData() or PDF_TYPE_SCANNED,
+                    "layer_json_path": layer_json_path,
                     "job_type": "pdf",
                 }
             )
@@ -666,6 +729,8 @@ class MainWindow(QWidget):
             "style_font": self.style_font_combo.currentText().strip(),
             "save_map": self.map_checkbox.isChecked(),
             "save_txt": self.txt_checkbox.isChecked(),
+            "save_pdf_layer": self.pdf_layer_checkbox.isChecked(),
+            "pdf_layer_path": self.pdf_layer_path_edit.text().strip(),
         }
         if job_type != "pdf":
             format_choice = (self.output_format_combo.currentText() or "dwg").lower()
