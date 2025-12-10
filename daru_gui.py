@@ -33,7 +33,7 @@ except ImportError as exc:  # pragma: no cover - GUI dependency guard
     raise SystemExit(1) from exc
 
 from auto_translate_dxf import translate_dxf
-from pdf_translation import PDF_TYPE_NATIVE, PDF_TYPE_SCANNED, translate_pdf
+from pdf_translation import PDF_TYPE_NATIVE, PDF_TYPE_SCANNED, translate_pdf, _CACHE_DIR
 
 SETTINGS_PATH = Path.home() / ".daru_gui_settings.json"
 
@@ -136,6 +136,11 @@ class AppSettings:
     style_font: str = ""
     save_pdf_layer: bool = True
     pdf_layer_path: str = ""
+    pdf_dpi: int = 400
+    pdf_min_confidence: int = 60
+    pdf_blur_kernel: int = 23
+    pdf_dilation_kernel: int = 3
+    pdf_ocr_languages: str = "eng"
     deepl_key: str = ""
     openai_key: str = ""
     openai_model: str = "gpt-4o-mini"
@@ -259,6 +264,52 @@ class SettingsDialog(QDialog):
         self.openai_temp_spin.setEnabled(not is_reasoning)
         self.openai_strict_mode_combo.setEnabled(is_reasoning)
         self.openai_strict_value_spin.setEnabled(is_reasoning)
+
+
+class PdfProcessingDialog(QDialog):
+    def __init__(self, settings: AppSettings, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Обработка PDF: размытие и OCR")
+        layout = QFormLayout(self)
+
+        self.dpi_spin = QSpinBox()
+        self.dpi_spin.setRange(150, 800)
+        self.dpi_spin.setValue(int(settings.pdf_dpi or 400))
+
+        self.confidence_spin = QSpinBox()
+        self.confidence_spin.setRange(0, 100)
+        self.confidence_spin.setValue(int(settings.pdf_min_confidence or 60))
+
+        self.blur_spin = QSpinBox()
+        self.blur_spin.setRange(3, 99)
+        self.blur_spin.setSingleStep(2)
+        self.blur_spin.setValue(int(settings.pdf_blur_kernel or 23))
+
+        self.dilation_spin = QSpinBox()
+        self.dilation_spin.setRange(1, 15)
+        self.dilation_spin.setValue(int(settings.pdf_dilation_kernel or 3))
+
+        self.lang_edit = QLineEdit(settings.pdf_ocr_languages or "eng")
+
+        layout.addRow("DPI", self.dpi_spin)
+        layout.addRow("Мин. доверие OCR", self.confidence_spin)
+        layout.addRow("Размер ядра размытия (нечётный)", self.blur_spin)
+        layout.addRow("Дилатация маски", self.dilation_spin)
+        layout.addRow("Языки OCR (например, eng+rus)", self.lang_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_values(self) -> Dict[str, object]:
+        return {
+            "dpi": self.dpi_spin.value(),
+            "min_confidence": self.confidence_spin.value(),
+            "blur_kernel_size": self.blur_spin.value(),
+            "dilation_kernel_size": self.dilation_spin.value(),
+            "ocr_languages": self.lang_edit.text().strip() or "eng",
+        }
 
 
 class TranslateWorker(QThread):
@@ -391,6 +442,8 @@ class MainWindow(QWidget):
 
         self.start_button = QPushButton("Запустить перевод")
         self.start_button.clicked.connect(self.start_translation)
+        self.pdf_prepare_button = QPushButton("Размыть и подготовить PDF")
+        self.pdf_prepare_button.clicked.connect(self.start_pdf_processing)
         self.settings_button = QPushButton("Настройки API")
         self.settings_button.clicked.connect(self.open_settings)
         self.clear_log_button = QPushButton("Очистить лог")
@@ -444,6 +497,7 @@ class MainWindow(QWidget):
 
         buttons_row = QHBoxLayout()
         buttons_row.addWidget(self.start_button)
+        buttons_row.addWidget(self.pdf_prepare_button)
         buttons_row.addWidget(self.settings_button)
         buttons_row.addWidget(self.clear_log_button)
         buttons_row.addStretch()
@@ -518,6 +572,8 @@ class MainWindow(QWidget):
         self.pdf_layer_browse.setEnabled(pdf_layer_active)
         if pdf_layer_active:
             self._ensure_pdf_layer_path()
+        if hasattr(self, "pdf_prepare_button"):
+            self.pdf_prepare_button.setEnabled(pdf_mode and self.worker is None)
 
     def _reset_auxiliary_for_pdf(self) -> None:
         for checkbox in (self.map_checkbox, self.txt_checkbox):
@@ -591,6 +647,35 @@ class MainWindow(QWidget):
             "pdf_layer": pdf_layer,
         }
 
+    def _pdf_processing_options(self) -> Dict[str, object]:
+        data = self.settings_manager.data
+        return {
+            "dpi": data.pdf_dpi,
+            "min_confidence": data.pdf_min_confidence,
+            "blur_kernel_size": data.pdf_blur_kernel,
+            "dilation_kernel_size": data.pdf_dilation_kernel,
+            "ocr_languages": data.pdf_ocr_languages,
+        }
+
+    def _base_translation_params(self, input_obj: Path, output_obj: Path) -> Dict[str, Any]:
+        data = self.settings_manager.data
+        return {
+            "input_path": input_obj,
+            "output_path": output_obj,
+            "translator_name": self.translator_combo.currentText(),
+            "source_lang": self.source_lang_combo.currentText().strip() or "en",
+            "target_lang": self.target_lang_combo.currentText().strip() or "ru",
+            "style_font": self.style_font_combo.currentText().strip() or None,
+            "deepl_key": data.deepl_key or None,
+            "openai_key": data.openai_key or None,
+            "openai_model": data.openai_model or None,
+            "openai_base_url": data.openai_base_url or None,
+            "openai_project": data.openai_project or None,
+            "openai_temperature": data.openai_temperature,
+            "openai_strict_mode": data.openai_strict_mode or None,
+            "openai_strict_value": data.openai_strict_value,
+        }
+
     def sync_output_suffix(self) -> None:
         if self.is_pdf_input():
             suffix = ".pdf"
@@ -632,6 +717,21 @@ class MainWindow(QWidget):
     def clear_log(self) -> None:
         self.log_view.clear()
 
+    def _launch_worker(self, params: Dict[str, Any], start_message: str, status_text: str) -> None:
+        if self.worker is not None:
+            QMessageBox.warning(self, "Выполнение", "Подождите завершения текущей операции")
+            return
+        self.append_log(start_message)
+        self.start_button.setEnabled(False)
+        self.pdf_prepare_button.setEnabled(False)
+        self.worker = TranslateWorker(params)
+        self.worker.log_signal.connect(self.append_log)
+        self.worker.error_signal.connect(self.handle_error)
+        self.worker.finished_signal.connect(self.handle_finished)
+        self.worker.finished.connect(self.reset_worker)
+        self.worker.start()
+        self.status_label.setText(status_text)
+
     def start_translation(self) -> None:
         input_path = self.input_edit.text().strip()
         output_path = self.output_edit.text().strip()
@@ -652,7 +752,7 @@ class MainWindow(QWidget):
             if self.pdf_layer_checkbox.isChecked():
                 json_path_text = self.pdf_layer_path_edit.text().strip()
                 if not json_path_text:
-                    json_path_text = str(output_path_obj.with_suffix(".translation.json"))
+                    json_path_text = str((_CACHE_DIR / f"{input_obj.stem}.translation.json").resolve())
                     self.pdf_layer_path_edit.setText(json_path_text)
                 layer_json_path = Path(json_path_text)
         else:
@@ -662,27 +762,13 @@ class MainWindow(QWidget):
                 output_path_obj = output_path_obj.with_suffix(expected_suffix)
                 self.output_edit.setText(str(output_path_obj))
             layer_json_path = None
-        params: Dict[str, Any] = {
-            "input_path": input_obj,
-            "output_path": output_path_obj,
-            "translator_name": self.translator_combo.currentText(),
-            "source_lang": self.source_lang_combo.currentText().strip() or "en",
-            "target_lang": self.target_lang_combo.currentText().strip() or "ru",
-            "style_font": self.style_font_combo.currentText().strip() or None,
-            "deepl_key": self.settings_manager.data.deepl_key or None,
-            "openai_key": self.settings_manager.data.openai_key or None,
-            "openai_model": self.settings_manager.data.openai_model or None,
-            "openai_base_url": self.settings_manager.data.openai_base_url or None,
-            "openai_project": self.settings_manager.data.openai_project or None,
-            "openai_temperature": self.settings_manager.data.openai_temperature,
-            "openai_strict_mode": self.settings_manager.data.openai_strict_mode or None,
-            "openai_strict_value": self.settings_manager.data.openai_strict_value,
-        }
+        params: Dict[str, Any] = self._base_translation_params(input_obj, output_path_obj)
         if is_pdf:
             params.update(
                 {
                     "pdf_type": self.pdf_type_combo.currentData() or PDF_TYPE_SCANNED,
                     "layer_json_path": layer_json_path,
+                    "processing_options": self._pdf_processing_options(),
                     "job_type": "pdf",
                 }
             )
@@ -699,20 +785,65 @@ class MainWindow(QWidget):
                     "job_type": "cad",
                 }
             )
-        self.append_log("Запуск процесса перевода...")
-        self.start_button.setEnabled(False)
-        self.worker = TranslateWorker(params)
-        self.worker.log_signal.connect(self.append_log)
-        self.worker.error_signal.connect(self.handle_error)
-        self.worker.finished_signal.connect(self.handle_finished)
-        self.worker.finished.connect(self.reset_worker)
-        self.worker.start()
-        self.status_label.setText("Перевод выполняется...")
+        self._launch_worker(params, "Запуск процесса перевода...", "Перевод выполняется...")
+
+    def start_pdf_processing(self) -> None:
+        if not self.is_pdf_input():
+            QMessageBox.warning(self, "Ошибка", "Эта функция доступна только для PDF")
+            return
+        input_path = self.input_edit.text().strip()
+        if not input_path:
+            QMessageBox.warning(self, "Ошибка", "Выберите PDF файл")
+            return
+        input_obj = Path(input_path)
+        if not input_obj.exists():
+            QMessageBox.warning(self, "Ошибка", "Указанный файл не найден")
+            return
+        output_text = self.output_edit.text().strip()
+        if not output_text:
+            defaults = self.derive_default_paths(input_obj)
+            output_text = str(defaults["output"])
+            self.output_edit.setText(output_text)
+        output_obj = Path(output_text)
+        if output_obj.suffix.lower() != ".pdf":
+            output_obj = output_obj.with_suffix(".pdf")
+            self.output_edit.setText(str(output_obj))
+        layer_json_path: Optional[Path] = None
+        if self.pdf_layer_checkbox.isChecked():
+            json_path_text = self.pdf_layer_path_edit.text().strip()
+            if not json_path_text:
+                json_path_text = str((_CACHE_DIR / f"{input_obj.stem}.translation.json").resolve())
+                self.pdf_layer_path_edit.setText(json_path_text)
+            layer_json_path = Path(json_path_text)
+
+        dialog = PdfProcessingDialog(self.settings_manager.data, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        processing_options = dialog.get_values()
+        self.settings_manager.update(
+            pdf_dpi=processing_options["dpi"],
+            pdf_min_confidence=processing_options["min_confidence"],
+            pdf_blur_kernel=processing_options["blur_kernel_size"],
+            pdf_dilation_kernel=processing_options["dilation_kernel_size"],
+            pdf_ocr_languages=processing_options["ocr_languages"],
+        )
+
+        params: Dict[str, Any] = self._base_translation_params(input_obj, output_obj)
+        params.update(
+            {
+                "pdf_type": self.pdf_type_combo.currentData() or PDF_TYPE_SCANNED,
+                "layer_json_path": layer_json_path,
+                "processing_options": processing_options,
+                "job_type": "pdf",
+            }
+        )
+        self._launch_worker(params, "Запуск размытия PDF и подготовки к переводу...", "Обработка PDF...")
 
     def handle_error(self, message: str) -> None:
         self.append_log(f"Ошибка: {message}")
         QMessageBox.critical(self, "Ошибка", message)
         self.start_button.setEnabled(True)
+        self.pdf_prepare_button.setEnabled(self.is_pdf_input())
         self.status_label.setText("Ошибка при переводе")
 
     def handle_finished(self, payload: Dict[str, Any]) -> None:
@@ -720,6 +851,7 @@ class MainWindow(QWidget):
         self.append_log(f"Движок перевода: {payload['backend']}")
         QMessageBox.information(self, "Готово", f"Файл сохранён: {payload['output_path']}")
         self.start_button.setEnabled(True)
+        self.pdf_prepare_button.setEnabled(self.is_pdf_input())
         self.status_label.setText("Перевод завершён")
         job_type = payload.get("job_type", "cad")
         update_payload: Dict[str, Any] = {
@@ -732,13 +864,28 @@ class MainWindow(QWidget):
             "save_pdf_layer": self.pdf_layer_checkbox.isChecked(),
             "pdf_layer_path": self.pdf_layer_path_edit.text().strip(),
         }
-        if job_type != "pdf":
+        if job_type == "pdf":
+            processing_options = None
+            if self.worker and hasattr(self.worker, "_params"):
+                processing_options = self.worker._params.get("processing_options")  # type: ignore[attr-defined]
+            if isinstance(processing_options, dict):
+                update_payload.update(
+                    {
+                        "pdf_dpi": processing_options.get("dpi", self.settings_manager.data.pdf_dpi),
+                        "pdf_min_confidence": processing_options.get("min_confidence", self.settings_manager.data.pdf_min_confidence),
+                        "pdf_blur_kernel": processing_options.get("blur_kernel_size", self.settings_manager.data.pdf_blur_kernel),
+                        "pdf_dilation_kernel": processing_options.get("dilation_kernel_size", self.settings_manager.data.pdf_dilation_kernel),
+                        "pdf_ocr_languages": processing_options.get("ocr_languages", self.settings_manager.data.pdf_ocr_languages),
+                    }
+                )
+        else:
             format_choice = (self.output_format_combo.currentText() or "dwg").lower()
             update_payload["output_format"] = format_choice
         self.settings_manager.update(**update_payload)
 
     def reset_worker(self) -> None:
         self.worker = None
+        self.update_aux_controls()
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings_manager.data, self)

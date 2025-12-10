@@ -72,6 +72,7 @@ class TranslationEngine:
         openai_temperature: float = 0.2,
         openai_strict_mode: Optional[str] = None,
         openai_strict_value: Optional[float] = None,
+        system_prompt_template: Optional[str] = None,
     ):
         self.provider = (provider or "google").lower()
         self.source_lang = source_lang or "auto"
@@ -96,6 +97,7 @@ class TranslationEngine:
         if value_candidate is None:
             value_candidate = 0.5
         self.openai_strict_value = max(0.0, min(1.0, value_candidate))
+        self.system_prompt_template = system_prompt_template
         self._translator = None
         self._backend = None
         self._translate_batch = None
@@ -507,12 +509,18 @@ class TranslationEngine:
             return results
 
         reasoning_note = self._openai_reasoning_note(model)
-        system_content = (
-            "You are a professional technical translator of elevator drawing manuals. Translate the provided values from "
-            f"{self.source_lang or 'auto-detected'} to {self.target_lang}. Preserve numbers, "
-            "placeholders like '__DXF_DIM__', and DXF control sequences such as \"\n\". Respond "
-            "with strict JSON: {\"translations\": [{\"id\": \"<id>\", \"text\": \"<translated>\"}, ...]}"
-        )
+        if self.system_prompt_template:
+            system_content = self.system_prompt_template
+            system_content = system_content.replace(
+                "{source_lang}", self.source_lang or "auto-detected"
+            ).replace("{target_lang}", self.target_lang)
+        else:
+            system_content = (
+                "You are a professional technical translator of elevator drawing manuals. Translate the provided values from "
+                f"{self.source_lang or 'auto-detected'} to {self.target_lang}. Preserve numbers, "
+                "placeholders like '__DXF_DIM__', and DXF control sequences such as \"\\P\". Respond "
+                "with strict JSON: {\"translations\": [{\"id\": \"<id>\", \"text\": \"<translated>\"}, ...]}"
+            )
         if reasoning_note:
             system_content = f"{system_content} {reasoning_note}"
 

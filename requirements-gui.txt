@@ -9,3 +9,6 @@ pdf2image
 pytesseract
 PyPDF2
 pymupdf
+Pillow
+opencv-python
+easyocr
