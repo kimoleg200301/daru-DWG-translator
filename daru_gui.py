@@ -133,7 +133,7 @@ class AppSettings:
     translator_name: str = "google"
     source_lang: str = "en"
     target_lang: str = "ru"
-    style_font: str = ""
+    style_font: str = "DejaVuSans.ttf"
     save_pdf_layer: bool = True
     pdf_layer_path: str = ""
     pdf_dpi: int = 400
@@ -141,6 +141,11 @@ class AppSettings:
     pdf_blur_kernel: int = 23
     pdf_dilation_kernel: int = 3
     pdf_ocr_languages: str = "eng"
+    pdf_processing_mode: str = "textract"
+    textract_region: str = "us-east-1"
+    textract_access_key: str = ""
+    textract_secret_key: str = ""
+    textract_session_token: str = ""
     deepl_key: str = ""
     openai_key: str = ""
     openai_model: str = "gpt-4o-mini"
@@ -204,6 +209,13 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Настройки API")
         layout = QVBoxLayout(self)
+        self._pdf_mode_values: Dict[str, Any] = {
+            "pdf_processing_mode": settings.pdf_processing_mode or "textract",
+            "textract_region": settings.textract_region or "",
+            "textract_access_key": settings.textract_access_key or "",
+            "textract_secret_key": settings.textract_secret_key or "",
+            "textract_session_token": settings.textract_session_token or "",
+        }
 
         form = QFormLayout()
         self.deepl_edit = QLineEdit(settings.deepl_key)
@@ -239,6 +251,10 @@ class SettingsDialog(QDialog):
         form.addRow("OpenAI Strict Value (x100)", self.openai_strict_value_spin)
         layout.addLayout(form)
 
+        self.pdf_settings_btn = QPushButton("Настройки обработки PDF")
+        self.pdf_settings_btn.clicked.connect(self._open_pdf_settings)
+        layout.addWidget(self.pdf_settings_btn)
+
         self.openai_model_combo.currentTextChanged.connect(self._update_openai_param_visibility)
         self._update_openai_param_visibility(self.openai_model_combo.currentText())
 
@@ -257,6 +273,7 @@ class SettingsDialog(QDialog):
             "openai_temperature": self.openai_temp_spin.value() / 100.0,
             "openai_strict_mode": self.openai_strict_mode_combo.currentText().strip() or "verbosity",
             "openai_strict_value": self.openai_strict_value_spin.value() / 100.0,
+            **self._pdf_mode_values,
         }
 
     def _update_openai_param_visibility(self, model: str) -> None:
@@ -264,6 +281,60 @@ class SettingsDialog(QDialog):
         self.openai_temp_spin.setEnabled(not is_reasoning)
         self.openai_strict_mode_combo.setEnabled(is_reasoning)
         self.openai_strict_value_spin.setEnabled(is_reasoning)
+
+    def _open_pdf_settings(self) -> None:
+        dialog = PdfTextractSettingsDialog(self._pdf_mode_values, self)
+        if dialog.exec() == QDialog.Accepted:
+            self._pdf_mode_values = dialog.get_values()
+
+
+class PdfTextractSettingsDialog(QDialog):
+    def __init__(self, values: Dict[str, Any], parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Настройки обработки PDF")
+        layout = QFormLayout(self)
+
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Локальная обработка", "Textract"])
+        current_mode = values.get("pdf_processing_mode", "textract").lower()
+        self.mode_combo.setCurrentText("Textract" if current_mode == "textract" else "Локальная обработка")
+
+        self.region_edit = QLineEdit(values.get("textract_region", "us-east-1"))
+        self.access_key_edit = QLineEdit(values.get("textract_access_key", ""))
+        self.secret_key_edit = QLineEdit(values.get("textract_secret_key", ""))
+        self.secret_key_edit.setEchoMode(QLineEdit.Password)
+        self.session_token_edit = QLineEdit(values.get("textract_session_token", ""))
+        self.session_token_edit.setEchoMode(QLineEdit.Password)
+
+        layout.addRow("Режим обработки PDF", self.mode_combo)
+        layout.addRow("AWS Region", self.region_edit)
+        layout.addRow("AWS Access Key ID", self.access_key_edit)
+        layout.addRow("AWS Secret Access Key", self.secret_key_edit)
+        layout.addRow("AWS Session Token", self.session_token_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.mode_combo.currentTextChanged.connect(self._update_textract_enabled)
+        self._update_textract_enabled(self.mode_combo.currentText())
+
+    def _update_textract_enabled(self, mode_text: str) -> None:
+        enabled = (mode_text or "").lower().startswith("textract")
+        for widget in (self.region_edit, self.access_key_edit, self.secret_key_edit, self.session_token_edit):
+            widget.setEnabled(enabled)
+
+    def get_values(self) -> Dict[str, Any]:
+        mode_text = self.mode_combo.currentText()
+        mode_value = "textract" if (mode_text or "").lower().startswith("textract") else "local"
+        return {
+            "pdf_processing_mode": mode_value,
+            "textract_region": self.region_edit.text().strip(),
+            "textract_access_key": self.access_key_edit.text().strip(),
+            "textract_secret_key": self.secret_key_edit.text().strip(),
+            "textract_session_token": self.session_token_edit.text().strip(),
+        }
 
 
 class PdfProcessingDialog(QDialog):
@@ -421,7 +492,7 @@ class MainWindow(QWidget):
             self.style_font_combo,
             STYLE_FONT_CHOICES,
             settings_manager.data.style_font,
-            allow_empty=True,
+            allow_empty=False,
             editable=False,
         )
 
@@ -442,8 +513,6 @@ class MainWindow(QWidget):
 
         self.start_button = QPushButton("Запустить перевод")
         self.start_button.clicked.connect(self.start_translation)
-        self.pdf_prepare_button = QPushButton("Размыть и подготовить PDF")
-        self.pdf_prepare_button.clicked.connect(self.start_pdf_processing)
         self.settings_button = QPushButton("Настройки API")
         self.settings_button.clicked.connect(self.open_settings)
         self.clear_log_button = QPushButton("Очистить лог")
@@ -497,7 +566,6 @@ class MainWindow(QWidget):
 
         buttons_row = QHBoxLayout()
         buttons_row.addWidget(self.start_button)
-        buttons_row.addWidget(self.pdf_prepare_button)
         buttons_row.addWidget(self.settings_button)
         buttons_row.addWidget(self.clear_log_button)
         buttons_row.addStretch()
@@ -515,7 +583,9 @@ class MainWindow(QWidget):
         self.translator_combo.setCurrentText(data.translator_name)
         self.source_lang_combo.setCurrentText(data.source_lang)
         self.target_lang_combo.setCurrentText(data.target_lang)
-        self.style_font_combo.setCurrentText(data.style_font)
+        self.style_font_combo.setCurrentText(data.style_font or STYLE_FONT_CHOICES[0])
+        if not self.style_font_combo.currentText().strip():
+            self.style_font_combo.setCurrentText(STYLE_FONT_CHOICES[0])
         self.pdf_layer_checkbox.setChecked(data.save_pdf_layer)
         self.pdf_layer_path_edit.setText(data.pdf_layer_path)
         self.map_checkbox.setChecked(data.save_map)
@@ -572,8 +642,6 @@ class MainWindow(QWidget):
         self.pdf_layer_browse.setEnabled(pdf_layer_active)
         if pdf_layer_active:
             self._ensure_pdf_layer_path()
-        if hasattr(self, "pdf_prepare_button"):
-            self.pdf_prepare_button.setEnabled(pdf_mode and self.worker is None)
 
     def _reset_auxiliary_for_pdf(self) -> None:
         for checkbox in (self.map_checkbox, self.txt_checkbox):
@@ -655,6 +723,11 @@ class MainWindow(QWidget):
             "blur_kernel_size": data.pdf_blur_kernel,
             "dilation_kernel_size": data.pdf_dilation_kernel,
             "ocr_languages": data.pdf_ocr_languages,
+            "pdf_processing_mode": data.pdf_processing_mode,
+            "textract_region": data.textract_region,
+            "textract_access_key": data.textract_access_key,
+            "textract_secret_key": data.textract_secret_key,
+            "textract_session_token": data.textract_session_token,
         }
 
     def _base_translation_params(self, input_obj: Path, output_obj: Path) -> Dict[str, Any]:
@@ -665,7 +738,7 @@ class MainWindow(QWidget):
             "translator_name": self.translator_combo.currentText(),
             "source_lang": self.source_lang_combo.currentText().strip() or "en",
             "target_lang": self.target_lang_combo.currentText().strip() or "ru",
-            "style_font": self.style_font_combo.currentText().strip() or None,
+            "style_font": self.style_font_combo.currentText().strip() or STYLE_FONT_CHOICES[0],
             "deepl_key": data.deepl_key or None,
             "openai_key": data.openai_key or None,
             "openai_model": data.openai_model or None,
@@ -723,7 +796,6 @@ class MainWindow(QWidget):
             return
         self.append_log(start_message)
         self.start_button.setEnabled(False)
-        self.pdf_prepare_button.setEnabled(False)
         self.worker = TranslateWorker(params)
         self.worker.log_signal.connect(self.append_log)
         self.worker.error_signal.connect(self.handle_error)
@@ -738,13 +810,14 @@ class MainWindow(QWidget):
         if not input_path:
             QMessageBox.warning(self, "Ошибка", "Выберите входной файл")
             return
-        if not output_path:
-            QMessageBox.warning(self, "Ошибка", "Укажите путь для сохранения файла")
-            return
         input_obj = Path(input_path)
-        output_path_obj = Path(output_path)
+        output_path_obj = Path(output_path) if output_path else None
         is_pdf = input_obj.suffix.lower() == ".pdf"
         if is_pdf:
+            if output_path_obj is None:
+                defaults = self.derive_default_paths(input_obj)
+                output_path_obj = defaults["output"]
+                self.output_edit.setText(str(output_path_obj))
             if output_path_obj.suffix.lower() != ".pdf":
                 output_path_obj = output_path_obj.with_suffix(".pdf")
                 self.output_edit.setText(str(output_path_obj))
@@ -755,20 +828,37 @@ class MainWindow(QWidget):
                     json_path_text = str((_CACHE_DIR / f"{input_obj.stem}.translation.json").resolve())
                     self.pdf_layer_path_edit.setText(json_path_text)
                 layer_json_path = Path(json_path_text)
+            processing_options = self._pdf_processing_options()
+            dialog = PdfProcessingDialog(self.settings_manager.data, self)
+            if dialog.exec() != QDialog.Accepted:
+                return
+            processing_dialog_values = dialog.get_values()
+            processing_options.update(processing_dialog_values)
+            self.settings_manager.update(
+                pdf_dpi=processing_dialog_values["dpi"],
+                pdf_min_confidence=processing_dialog_values["min_confidence"],
+                pdf_blur_kernel=processing_dialog_values["blur_kernel_size"],
+                pdf_dilation_kernel=processing_dialog_values["dilation_kernel_size"],
+                pdf_ocr_languages=processing_dialog_values["ocr_languages"],
+            )
         else:
+            if output_path_obj is None:
+                QMessageBox.warning(self, "Ошибка", "Укажите путь для сохранения файла")
+                return
             format_choice = (self.output_format_combo.currentText() or "dwg").lower()
             expected_suffix = ".dwg" if format_choice == "dwg" else ".dxf"
             if output_path_obj.suffix.lower() != expected_suffix:
                 output_path_obj = output_path_obj.with_suffix(expected_suffix)
                 self.output_edit.setText(str(output_path_obj))
             layer_json_path = None
+            processing_options = None
         params: Dict[str, Any] = self._base_translation_params(input_obj, output_path_obj)
         if is_pdf:
             params.update(
                 {
                     "pdf_type": self.pdf_type_combo.currentData() or PDF_TYPE_SCANNED,
                     "layer_json_path": layer_json_path,
-                    "processing_options": self._pdf_processing_options(),
+                    "processing_options": processing_options,
                     "job_type": "pdf",
                 }
             )
@@ -787,63 +877,10 @@ class MainWindow(QWidget):
             )
         self._launch_worker(params, "Запуск процесса перевода...", "Перевод выполняется...")
 
-    def start_pdf_processing(self) -> None:
-        if not self.is_pdf_input():
-            QMessageBox.warning(self, "Ошибка", "Эта функция доступна только для PDF")
-            return
-        input_path = self.input_edit.text().strip()
-        if not input_path:
-            QMessageBox.warning(self, "Ошибка", "Выберите PDF файл")
-            return
-        input_obj = Path(input_path)
-        if not input_obj.exists():
-            QMessageBox.warning(self, "Ошибка", "Указанный файл не найден")
-            return
-        output_text = self.output_edit.text().strip()
-        if not output_text:
-            defaults = self.derive_default_paths(input_obj)
-            output_text = str(defaults["output"])
-            self.output_edit.setText(output_text)
-        output_obj = Path(output_text)
-        if output_obj.suffix.lower() != ".pdf":
-            output_obj = output_obj.with_suffix(".pdf")
-            self.output_edit.setText(str(output_obj))
-        layer_json_path: Optional[Path] = None
-        if self.pdf_layer_checkbox.isChecked():
-            json_path_text = self.pdf_layer_path_edit.text().strip()
-            if not json_path_text:
-                json_path_text = str((_CACHE_DIR / f"{input_obj.stem}.translation.json").resolve())
-                self.pdf_layer_path_edit.setText(json_path_text)
-            layer_json_path = Path(json_path_text)
-
-        dialog = PdfProcessingDialog(self.settings_manager.data, self)
-        if dialog.exec() != QDialog.Accepted:
-            return
-        processing_options = dialog.get_values()
-        self.settings_manager.update(
-            pdf_dpi=processing_options["dpi"],
-            pdf_min_confidence=processing_options["min_confidence"],
-            pdf_blur_kernel=processing_options["blur_kernel_size"],
-            pdf_dilation_kernel=processing_options["dilation_kernel_size"],
-            pdf_ocr_languages=processing_options["ocr_languages"],
-        )
-
-        params: Dict[str, Any] = self._base_translation_params(input_obj, output_obj)
-        params.update(
-            {
-                "pdf_type": self.pdf_type_combo.currentData() or PDF_TYPE_SCANNED,
-                "layer_json_path": layer_json_path,
-                "processing_options": processing_options,
-                "job_type": "pdf",
-            }
-        )
-        self._launch_worker(params, "Запуск размытия PDF и подготовки к переводу...", "Обработка PDF...")
-
     def handle_error(self, message: str) -> None:
         self.append_log(f"Ошибка: {message}")
         QMessageBox.critical(self, "Ошибка", message)
         self.start_button.setEnabled(True)
-        self.pdf_prepare_button.setEnabled(self.is_pdf_input())
         self.status_label.setText("Ошибка при переводе")
 
     def handle_finished(self, payload: Dict[str, Any]) -> None:
@@ -851,7 +888,6 @@ class MainWindow(QWidget):
         self.append_log(f"Движок перевода: {payload['backend']}")
         QMessageBox.information(self, "Готово", f"Файл сохранён: {payload['output_path']}")
         self.start_button.setEnabled(True)
-        self.pdf_prepare_button.setEnabled(self.is_pdf_input())
         self.status_label.setText("Перевод завершён")
         job_type = payload.get("job_type", "cad")
         update_payload: Dict[str, Any] = {

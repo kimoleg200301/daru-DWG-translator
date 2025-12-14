@@ -2160,11 +2160,31 @@ def translate_pdf(
         layer_json_path = _CACHE_DIR / f"{input_path.stem}.translation.json"
 
     file_hash = _compute_file_sha256(input_path)
+    pdf_processing_mode = (processing_options.get("pdf_processing_mode", "textract") if processing_options else "textract") or "textract"
+    textract_client_override: Optional[object] = None
+    if str(pdf_processing_mode).lower() == "textract":
+        region_name = processing_options.get("textract_region") if processing_options else None
+        access_key = processing_options.get("textract_access_key") if processing_options else None
+        secret_key = processing_options.get("textract_secret_key") if processing_options else None
+        session_token = processing_options.get("textract_session_token") if processing_options else None
+        if access_key and secret_key:
+            _require_dependency(boto3, "Установите boto3 (pip install boto3) для Textract")
+            try:
+                textract_client_override = boto3.client(
+                    "textract",
+                    region_name=region_name or None,
+                    aws_access_key_id=access_key,
+                    aws_secret_access_key=secret_key,
+                    aws_session_token=session_token or None,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Textract: не удалось создать клиент с заданными ключами: {exc}") from exc
+
     loader = PageLoader(config, log)
     renderer = Renderer(config, log, style_font=style_font)
     exporter = Exporter(log)
     textract = TextractLayoutExtractor(
-        None,
+        textract_client_override,
         log,
         config=config,
         log_path=TEXTRACT_LOG_PATH,
