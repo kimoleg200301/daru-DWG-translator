@@ -2236,7 +2236,10 @@ def translate_pdf(
     pdf_prompt_template = (
         "You are a professional translator for elevator manuals and catalogs (non-technical marketing/guide tone). "
         "Translate the provided values from {source_lang} to {target_lang}. "
-        "Keep company names, brand names, product/model names, part codes, and addresses exactly as in the source. "
+        "Ignore OCR artifacts such as random mixed casing, stray spaces inside words, and line-break hyphenation. "
+        "Only remove a hyphen when it clearly indicates a line-break split (hyphen followed by whitespace/newline); "
+        "keep true compound-word hyphens. Use natural casing and spacing in the target language, but keep company "
+        "names, brand names, product/model names, part codes, and addresses exactly as in the source. "
         "Preserve numbers, placeholders like '__DXF_DIM__', and DXF control sequences such as \"\\P\". Respond "
         "with strict JSON: {\"translations\": [{\"id\": \"<id>\", \"text\": \"<translated>\"}, ...]}"
     )

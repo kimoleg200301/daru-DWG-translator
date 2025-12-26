@@ -509,15 +509,23 @@ class TranslationEngine:
             return results
 
         reasoning_note = self._openai_reasoning_note(model)
+        def _prompt_lang(value: Optional[str], default: str, *, allow_auto: bool) -> str:
+            cleaned = (value or "").strip()
+            if not cleaned:
+                return default
+            if cleaned.lower() == "auto":
+                return "auto-detected" if allow_auto else default
+            return cleaned
+
+        source_label = _prompt_lang(self.source_lang, "auto-detected", allow_auto=True)
+        target_label = _prompt_lang(self.target_lang, "ru", allow_auto=False)
         if self.system_prompt_template:
             system_content = self.system_prompt_template
-            system_content = system_content.replace(
-                "{source_lang}", self.source_lang or "auto-detected"
-            ).replace("{target_lang}", self.target_lang)
+            system_content = system_content.replace("{source_lang}", source_label).replace("{target_lang}", target_label)
         else:
             system_content = (
                 "You are a professional technical translator of elevator drawing manuals. Translate the provided values from "
-                f"{self.source_lang or 'auto-detected'} to {self.target_lang}. Preserve numbers, "
+                f"{source_label} to {target_label}. Preserve numbers, "
                 "placeholders like '__DXF_DIM__', and DXF control sequences such as \"\\P\". Respond "
                 "with strict JSON: {\"translations\": [{\"id\": \"<id>\", \"text\": \"<translated>\"}, ...]}"
             )

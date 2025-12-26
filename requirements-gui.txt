@@ -1,5 +1,6 @@
 PySide6
 pyinstaller
+boto3
 ezdxf
 deep-translator
 googletrans==4.0.0-rc1

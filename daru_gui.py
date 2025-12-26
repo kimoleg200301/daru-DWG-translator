@@ -629,7 +629,7 @@ class MainWindow(QWidget):
         txt_active = self.txt_checkbox.isChecked() and not pdf_mode
         self.map_checkbox.setEnabled(not pdf_mode)
         self.txt_checkbox.setEnabled(not pdf_mode)
-        self.source_lang_combo.setEnabled(not pdf_mode)
+        self.source_lang_combo.setEnabled(True)
         # self.style_font_combo.setEnabled(not pdf_mode)
         self.map_path_edit.setEnabled(map_active)
         self.map_browse.setEnabled(map_active)
