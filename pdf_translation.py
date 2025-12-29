@@ -169,7 +169,7 @@ class PdfProcessingConfig:
     merge_x_gap_ratio: float = 1.0
     textract_split_lines: bool = True
     textract_vertical_aspect_ratio: float = 2.2
-    textract_vertical_top_margin_ratio: float = 0.2 # добавляет больше рабочую область переведенного вертикального текста
+    textract_vertical_top_margin_ratio: float = 0.15 # добавляет больше рабочую область переведенного вертикального текста
     text_bold_fill_ratio: float = 0.45
     merge_allow_horizontal_gap: bool = False
     blur_kernel_size: int = 23
@@ -178,7 +178,7 @@ class PdfProcessingConfig:
     region_margin_scale_y: float = 0.25
     min_region_margin_px: int = 3
     max_region_margin_ratio: float = 0.2
-    textract_bbox_height_boost: float = 0.25 # добавляет больше рабочую область переведенного текста
+    textract_bbox_height_boost: float = 0.15 # добавляет больше рабочую область переведенного текста
     textract_bbox_width_boost: float = 0.1
 
     def normalized(self) -> "PdfProcessingConfig":
@@ -298,6 +298,7 @@ class RegionInfo:
     font_size_estimate: int = 12
     is_vertical: bool = False
     is_bold: bool = False
+    is_table_cell: bool = False
 
 
 @dataclass
@@ -316,6 +317,7 @@ class LineRegion:
     bbox: Tuple[int, int, int, int]  # (x0, y0, x1, y1)
     source_text: str
     translated_text: Optional[str] = None
+    word_boxes: List[BBoxWH] = field(default_factory=list)
 
 
 @dataclass
@@ -332,6 +334,8 @@ class BlockRegion:
     source_text: str = ""
     translated_text: Optional[str] = None
     render_id: Optional[int] = None
+    word_boxes: List[BBoxWH] = field(default_factory=list)
+    is_table: bool = False
 
 
 @dataclass
@@ -478,6 +482,7 @@ class TextractLayoutExtractor:
                     "file_hash": entry.get("file_hash") or req.get("file_hash"),
                     "image_bytes": req.get("image_bytes"),
                     "image_sha256": req.get("image_sha256"),
+                    "feature_types": tuple(entry.get("feature_types") or req.get("feature_types") or []),
                     "response": data,
                 }
             )
@@ -491,6 +496,9 @@ class TextractLayoutExtractor:
             hash_filtered = [item for item in candidates if item.get("file_hash") == self.file_hash]
             if hash_filtered:
                 candidates = hash_filtered
+        desired_feature_types = meta.get("feature_types")
+        if desired_feature_types:
+            candidates = [item for item in candidates if item.get("feature_types") == desired_feature_types]
         sha = meta.get("image_sha256")
         if sha:
             for item in reversed(candidates):
@@ -507,7 +515,8 @@ class TextractLayoutExtractor:
         """Run Textract analyze_document on the given page image."""
         img_bytes, img_meta = self._encode_image_for_textract(page.image, page.page_index, render_dpi=page.dpi)
         width, height = page.image.size
-        feature_types = ["LAYOUT", "SIGNATURES"]
+        feature_types = ["LAYOUT", "SIGNATURES", "TABLES"]
+        img_meta["feature_types"] = tuple(feature_types)
         cached = self._find_cached_response(page.page_index, img_meta)
         if cached is not None:
             resp = cached
@@ -627,7 +636,32 @@ class TextractLayoutExtractor:
             bbox = self._bbox_from_geometry(block.get("Geometry"), page_width, page_height)
             if not bbox:
                 continue
-            lines.append(LineRegion(page_index=page_index, line_id=str(block["Id"]), bbox=bbox, source_text=text))
+            word_boxes: List[BBoxWH] = []
+            for rel in block.get("Relationships", []) or []:
+                if str(rel.get("Type", "")).upper() != "CHILD":
+                    continue
+                for child_id in rel.get("Ids", []) or []:
+                    child = blocks_by_id.get(child_id)
+                    if not child:
+                        continue
+                    if str(child.get("BlockType", "")).upper() != "WORD":
+                        continue
+                    word_bbox = self._bbox_from_geometry(child.get("Geometry"), page_width, page_height)
+                    if not word_bbox:
+                        continue
+                    wx0, wy0, wx1, wy1 = word_bbox
+                    if wx1 <= wx0 or wy1 <= wy0:
+                        continue
+                    word_boxes.append((wx0, wy0, wx1 - wx0, wy1 - wy0))
+            lines.append(
+                LineRegion(
+                    page_index=page_index,
+                    line_id=str(block["Id"]),
+                    bbox=bbox,
+                    source_text=text,
+                    word_boxes=word_boxes,
+                )
+            )
         lines.sort(key=lambda ln: (ln.bbox[1], ln.bbox[0]))
         return {line.line_id: line for line in lines}
 
@@ -646,6 +680,34 @@ class TextractLayoutExtractor:
         blocks: List[BlockRegion] = []
         figure_blocks: List[Dict[str, object]] = []
         figure_line_ids: Set[str] = set()
+        has_table_cells = any(
+            str(block.get("BlockType", "")).upper() in {"CELL", "MERGED_CELL"} for block in blocks_by_id.values()
+        )
+        cell_bboxes: List[Tuple[int, int, int, int]] = []
+        merged_children_map: Dict[str, List[str]] = {}
+        skip_cell_ids: Set[str] = set()
+        if has_table_cells:
+            for block in blocks_by_id.values():
+                block_type = str(block.get("BlockType", "")).upper()
+                if block_type not in {"CELL", "MERGED_CELL"}:
+                    continue
+                block_id = str(block.get("Id", ""))
+                bbox = self._bbox_from_geometry(block.get("Geometry"), page_width, page_height)
+                if bbox:
+                    cell_bboxes.append(bbox)
+                if block_type == "MERGED_CELL":
+                    child_cells: List[str] = []
+                    for rel in block.get("Relationships", []) or []:
+                        if str(rel.get("Type", "")).upper() != "CHILD":
+                            continue
+                        for child_id in rel.get("Ids", []) or []:
+                            child = blocks_by_id.get(child_id)
+                            if not child:
+                                continue
+                            if str(child.get("BlockType", "")).upper() == "CELL":
+                                child_cells.append(str(child_id))
+                                skip_cell_ids.add(str(child_id))
+                    merged_children_map[block_id] = child_cells
         for block in blocks_by_id.values():
             block_type_raw = str(block.get("BlockType", "")).upper()
             if block_type_raw in FIGURE_BLOCK_TYPES and allow_figures and page_image is not None:
@@ -654,16 +716,44 @@ class TextractLayoutExtractor:
                 if block_id:
                     figure_line_ids.update(self._collect_line_ids_from_block(block_id, blocks_by_id, set()))
                 continue
-            if block_type_raw == "CELL":
-                cell_region = self._build_cell_block(
-                    block,
-                    blocks_by_id,
-                    lines_by_id,
-                    used_line_ids,
-                    page_index=page_index,
-                    page_width=page_width,
-                    page_height=page_height,
+            if has_table_cells and block_type_raw in {"TABLE", "LAYOUT_TABLE"}:
+                blocks.extend(
+                    self._build_layout_table_lines(
+                        block,
+                        lines_by_id,
+                        used_line_ids,
+                        cell_bboxes,
+                        page_index=page_index,
+                    )
                 )
+                continue
+            if block_type_raw in {"CELL", "MERGED_CELL"}:
+                if block_type_raw == "CELL":
+                    block_id = str(block.get("Id", ""))
+                    if block_id in skip_cell_ids:
+                        continue
+                    cell_region = self._build_cell_block(
+                        block,
+                        blocks_by_id,
+                        lines_by_id,
+                        used_line_ids,
+                        page_index=page_index,
+                        page_width=page_width,
+                        page_height=page_height,
+                    )
+                else:
+                    block_id = str(block.get("Id", ""))
+                    child_cells = merged_children_map.get(block_id, [])
+                    cell_region = self._build_merged_cell_block(
+                        block,
+                        blocks_by_id,
+                        lines_by_id,
+                        used_line_ids,
+                        child_cells,
+                        page_index=page_index,
+                        page_width=page_width,
+                        page_height=page_height,
+                    )
                 if cell_region:
                     blocks.append(cell_region)
                 continue
@@ -799,6 +889,111 @@ class TextractLayoutExtractor:
         )
         return blocks_out
 
+    def _line_center_in_any_bbox(self, line: LineRegion, bboxes: Sequence[Tuple[int, int, int, int]]) -> bool:
+        if not bboxes:
+            return False
+        x0, y0, x1, y1 = line.bbox
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        for bx0, by0, bx1, by1 in bboxes:
+            if bx0 <= cx <= bx1 and by0 <= cy <= by1:
+                return True
+        return False
+
+    def _bbox_intersection_ratio(
+        self, inner: Tuple[int, int, int, int], outer: Tuple[int, int, int, int]
+    ) -> float:
+        ix0 = max(inner[0], outer[0])
+        iy0 = max(inner[1], outer[1])
+        ix1 = min(inner[2], outer[2])
+        iy1 = min(inner[3], outer[3])
+        if ix1 <= ix0 or iy1 <= iy0:
+            return 0.0
+        inter_area = float((ix1 - ix0) * (iy1 - iy0))
+        inner_area = float(max(1, (inner[2] - inner[0]) * (inner[3] - inner[1])))
+        return inter_area / inner_area
+
+    def _build_layout_table_lines(
+        self,
+        block: Dict[str, object],
+        lines_by_id: Dict[str, LineRegion],
+        used_line_ids: Set[str],
+        cell_bboxes: Sequence[Tuple[int, int, int, int]],
+        *,
+        page_index: int,
+    ) -> List[BlockRegion]:
+        line_regions: List[LineRegion] = []
+        for rel in block.get("Relationships", []) or []:
+            if str(rel.get("Type", "")).upper() != "CHILD":
+                continue
+            for child_id in rel.get("Ids", []) or []:
+                if child_id in used_line_ids:
+                    continue
+                line = lines_by_id.get(child_id)
+                if line:
+                    line_regions.append(line)
+        line_regions = self._dedup_and_sort_lines(line_regions)
+        if cell_bboxes:
+            line_regions = [ln for ln in line_regions if not self._line_center_in_any_bbox(ln, cell_bboxes)]
+        if not line_regions:
+            return []
+        grouped = self._group_layout_table_lines(line_regions)
+        blocks_out: List[BlockRegion] = []
+        base_id = str(block.get("Id", ""))
+        for idx, group in enumerate(grouped):
+            for ln in group:
+                used_line_ids.add(ln.line_id)
+            bbox = _union_bbox([ln.bbox for ln in group]) or group[0].bbox
+            source_text = " ".join(ln.source_text.strip() for ln in group if ln.source_text.strip())
+            word_boxes: List[BBoxWH] = []
+            for ln in group:
+                if ln.word_boxes:
+                    word_boxes.extend(ln.word_boxes)
+            block_id = f"{base_id}:para:{idx}" if base_id else f"layout_table:para:{idx}"
+            blocks_out.append(
+                BlockRegion(
+                    page_index=page_index,
+                    block_id=block_id,
+                    block_type="TEXT",
+                    bbox=bbox,
+                    lines=group,
+                    cells=[],
+                    source_text=source_text,
+                    word_boxes=word_boxes,
+                    is_table=True,
+                )
+            )
+        return blocks_out
+
+    def _group_layout_table_lines(self, lines: Sequence[LineRegion]) -> List[List[LineRegion]]:
+        if not lines:
+            return []
+        ordered = sorted(lines, key=lambda ln: (ln.bbox[1], ln.bbox[0]))
+        heights = [max(1, ln.bbox[3] - ln.bbox[1]) for ln in ordered]
+        median_h = float(np.median(heights)) if heights else 1.0
+        gap_threshold = max(2.0, 0.6 * median_h)
+        align_threshold = max(6.0, 0.6 * median_h)
+        groups: List[List[LineRegion]] = []
+        current: List[LineRegion] = [ordered[0]]
+        for ln in ordered[1:]:
+            prev = current[-1]
+            gap = float(ln.bbox[1] - prev.bbox[3])
+            if gap < 0:
+                gap = 0.0
+            overlap = min(prev.bbox[2], ln.bbox[2]) - max(prev.bbox[0], ln.bbox[0])
+            min_w = float(
+                max(1, min(prev.bbox[2] - prev.bbox[0], ln.bbox[2] - ln.bbox[0]))
+            )
+            overlap_ratio = max(0.0, overlap / min_w)
+            left_delta = abs(ln.bbox[0] - prev.bbox[0])
+            if gap <= gap_threshold and (overlap_ratio >= 0.3 or left_delta <= align_threshold):
+                current.append(ln)
+            else:
+                groups.append(current)
+                current = [ln]
+        groups.append(current)
+        return groups
+
     def _should_split_lines_by_horizontal_gap(self, lines: Sequence[LineRegion]) -> bool:
         """Detect a significant horizontal gap between lines on the same row."""
         if len(lines) < 2:
@@ -853,6 +1048,7 @@ class TextractLayoutExtractor:
         text, lines = self._collect_text(cell_block, blocks_by_id, lines_by_id, used_line_ids)
         if any(ln.line_id in used_line_ids for ln in lines):
             return None
+        word_boxes = self._collect_word_boxes(cell_block, blocks_by_id, page_width, page_height)
         for ln in lines:
             used_line_ids.add(ln.line_id)
         return BlockRegion(
@@ -863,6 +1059,59 @@ class TextractLayoutExtractor:
             lines=lines,
             cells=[],
             source_text=text.strip(),
+            word_boxes=word_boxes,
+            is_table=True,
+        )
+
+    def _build_merged_cell_block(
+        self,
+        merged_block: Dict[str, object],
+        blocks_by_id: Dict[str, Dict[str, object]],
+        lines_by_id: Dict[str, LineRegion],
+        used_line_ids: Set[str],
+        child_cell_ids: Sequence[str],
+        *,
+        page_index: int,
+        page_width: int,
+        page_height: int,
+    ) -> Optional[BlockRegion]:
+        bbox = self._bbox_from_geometry(merged_block.get("Geometry"), page_width, page_height)
+        if not bbox:
+            return None
+        ordered_texts: List[Tuple[int, int, str]] = []
+        word_boxes: List[BBoxWH] = []
+        for child_id in child_cell_ids:
+            child = blocks_by_id.get(child_id)
+            if not child:
+                continue
+            if str(child.get("BlockType", "")).upper() != "CELL":
+                continue
+            text, _ = self._collect_text(child, blocks_by_id, lines_by_id, None)
+            text = text.strip()
+            if text:
+                row_idx = int(child.get("RowIndex") or 0)
+                col_idx = int(child.get("ColumnIndex") or 0)
+                ordered_texts.append((row_idx, col_idx, text))
+            word_boxes.extend(self._collect_word_boxes(child, blocks_by_id, page_width, page_height))
+        source_text = ""
+        if ordered_texts:
+            ordered_texts.sort(key=lambda t: (t[0], t[1]))
+            source_text = " ".join(text for _, _, text in ordered_texts if text)
+        if not source_text:
+            fallback_text, lines = self._collect_text(merged_block, blocks_by_id, lines_by_id, used_line_ids)
+            source_text = fallback_text.strip()
+        if not source_text:
+            return None
+        return BlockRegion(
+            page_index=page_index,
+            block_id=str(merged_block.get("Id", "")),
+            block_type="CELL",
+            bbox=bbox,
+            lines=[],
+            cells=[],
+            source_text=source_text,
+            word_boxes=word_boxes,
+            is_table=True,
         )
 
     def _build_figure_block(
@@ -925,6 +1174,7 @@ class TextractLayoutExtractor:
         crop = page.image.crop((x0, y0, x1, y1)).convert("RGB")
         img_bytes, img_meta = self._encode_image_for_textract(crop, page.page_index, render_dpi=page.dpi)
         feature_types = ["LAYOUT", "SIGNATURES"]
+        img_meta["feature_types"] = tuple(feature_types)
         cached = self._find_cached_response(page.page_index, img_meta)
         if cached is not None:
             resp = cached
@@ -966,12 +1216,16 @@ class TextractLayoutExtractor:
         for line in lines.values():
             lx0, ly0, lx1, ly1 = line.bbox
             shifted_bbox = (lx0 + x0, ly0 + y0, lx1 + x0, ly1 + y0)
+            shifted_word_boxes: List[BBoxWH] = []
+            for wx, wy, ww, wh in line.word_boxes:
+                shifted_word_boxes.append((wx + x0, wy + y0, ww, wh))
             shifted_line = LineRegion(
                 page_index=line.page_index,
                 line_id=line.line_id,
                 bbox=shifted_bbox,
                 source_text=line.source_text,
                 translated_text=line.translated_text,
+                word_boxes=shifted_word_boxes,
             )
             shifted_blocks.append(
                 BlockRegion(
@@ -1015,8 +1269,35 @@ class TextractLayoutExtractor:
                         words.append(word_text)
         line_regions = self._dedup_and_sort_lines(line_regions)
         if line_regions:
-            return "\n".join(line.source_text for line in line_regions), line_regions
+            joined = " ".join(line.source_text.strip() for line in line_regions if line.source_text.strip())
+            return joined, line_regions
         return " ".join(words).strip(), []
+
+    def _collect_word_boxes(
+        self,
+        block: Dict[str, object],
+        blocks_by_id: Dict[str, Dict[str, object]],
+        page_width: int,
+        page_height: int,
+    ) -> List[BBoxWH]:
+        word_boxes: List[BBoxWH] = []
+        for rel in block.get("Relationships", []) or []:
+            if str(rel.get("Type", "")).upper() != "CHILD":
+                continue
+            for child_id in rel.get("Ids", []) or []:
+                child = blocks_by_id.get(child_id)
+                if not child:
+                    continue
+                if str(child.get("BlockType", "")).upper() != "WORD":
+                    continue
+                word_bbox = self._bbox_from_geometry(child.get("Geometry"), page_width, page_height)
+                if not word_bbox:
+                    continue
+                wx0, wy0, wx1, wy1 = word_bbox
+                if wx1 <= wx0 or wy1 <= wy0:
+                    continue
+                word_boxes.append((wx0, wy0, wx1 - wx0, wy1 - wy0))
+        return word_boxes
 
     def _normalize_text_block_type(self, block_type_raw: str) -> Optional[str]:
         if block_type_raw in FIGURE_BLOCK_TYPES:
@@ -1679,9 +1960,14 @@ class Renderer:
             if roi.size == 0:
                 continue
             mask = region.mask
-            if mask is None:
+            if region.is_table_cell:
+                if mask is None:
+                    continue
+            elif mask is None:
                 mask = build_text_mask(roi, dilation_kernel=self.config.dilation_kernel_size)
             if mask is None:
+                continue
+            if region.is_table_cell and np.count_nonzero(mask) == 0:
                 continue
             # Defensive: ensure mask matches ROI size and type.
             if mask.shape[:2] != roi.shape[:2]:
@@ -1690,16 +1976,23 @@ class Renderer:
                 mask = mask.astype(np.uint8)
             if mask.shape[:2] != roi.shape[:2]:
                 continue
+            if region.is_table_cell:
+                pad = max(1, int(roi.shape[0] * 0.01))
+                if pad > 0 and pad < roi.shape[0]:
+                    shifted = np.zeros_like(mask)
+                    shifted[pad:, :] = mask[:-pad, :]
+                    mask = cv2.bitwise_or(mask, shifted)
             bg_color = region.background_color
             fill = np.full_like(roi, bg_color, dtype=np.uint8)
             text_region = cv2.bitwise_and(fill, fill, mask=mask)
             background_region = cv2.bitwise_and(roi, roi, mask=cv2.bitwise_not(mask))
             cleaned = cv2.add(background_region, text_region)
-            cleaned = cv2.GaussianBlur(
-                cleaned,
-                (max(3, self.config.blur_kernel_size | 1), max(3, self.config.blur_kernel_size | 1)),
-                0,
-            )
+            if not region.is_table_cell:
+                cleaned = cv2.GaussianBlur(
+                    cleaned,
+                    (max(3, self.config.blur_kernel_size | 1), max(3, self.config.blur_kernel_size | 1)),
+                    0,
+                )
             bgr[y:y1, x:x1] = cleaned
 
         cleaned_pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
@@ -1722,7 +2015,8 @@ class Renderer:
         text = str(region.translated_text or region.source_text or "").strip()
         if not text:
             return
-        padding = max(1, int(min(w, h) * 0.06))
+        padding_ratio = 0.04 if region.is_table_cell else 0.06
+        padding = max(1, int(min(w, h) * padding_ratio))
         max_text_width = max(1, w - 2 * padding)
         max_text_height = max(1, h - 2 * padding)
 
@@ -1901,6 +2195,17 @@ def _estimate_font_size_from_block(block: BlockRegion) -> int:
         heights.sort()
         median = heights[len(heights) // 2]
         return max(8, min(96, median))
+    word_heights: List[int] = []
+    if block.word_boxes:
+        word_heights = [int(h) for _, _, _, h in block.word_boxes if h > 0]
+    elif block.lines:
+        for line in block.lines:
+            if line.word_boxes:
+                word_heights.extend([int(h) for _, _, _, h in line.word_boxes if h > 0])
+    if word_heights:
+        word_heights.sort()
+        median = word_heights[len(word_heights) // 2]
+        return max(8, min(96, median))
     block_height = max(1, block.bbox[3] - block.bbox[1])
     return max(8, min(96, int(block_height * 0.6)))
 
@@ -1929,8 +2234,9 @@ def _block_to_region_info(
     if not clamped:
         return None
     x0, y0, x1, y1 = clamped
+    is_table = bool(block.is_table)
     # Add a small vertical margin so descenders are not clipped after rendering.
-    height_boost = max(0.0, min(0.5, config.textract_bbox_height_boost))
+    height_boost = 0.0 if is_table else max(0.0, min(0.5, config.textract_bbox_height_boost))
     if height_boost > 0:
         extra = int((y1 - y0) * height_boost)
         if extra > 0:
@@ -1939,7 +2245,7 @@ def _block_to_region_info(
             y1 = min(page_height, y1 + grow_down)
             y0 = max(0, y0 - grow_up)
     # Add a small horizontal margin to avoid clipping long translated words.
-    width_boost = max(0.0, min(0.5, config.textract_bbox_width_boost))
+    width_boost = 0.0 if is_table else max(0.0, min(0.5, config.textract_bbox_width_boost))
     if width_boost > 0:
         extra = int((x1 - x0) * width_boost)
         if extra > 0:
@@ -1950,11 +2256,43 @@ def _block_to_region_info(
     roi = bgr_page[y0:y1, x0:x1].copy()
     if roi.size == 0:
         return None
-    mask = build_text_mask(roi, dilation_kernel=config.dilation_kernel_size)
-    if mask is None:
-        mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-    bg_color = _estimate_background_color(roi, mask)
-    raw_text_color = _estimate_text_color(roi, mask if mask is not None else np.ones(roi.shape[:2], dtype=np.uint8))
+    mask_for_cleaning: Optional["np.ndarray"] = None
+    mask_for_color: Optional["np.ndarray"] = None
+    if is_table:
+        word_boxes: List[BBoxWH] = []
+        if block.word_boxes:
+            word_boxes.extend(block.word_boxes)
+        if block.lines:
+            for line in block.lines:
+                if line.word_boxes:
+                    word_boxes.extend(line.word_boxes)
+        mask_for_cleaning = build_text_mask_from_word_boxes(
+            roi,
+            word_boxes,
+            offset_x=x0,
+            offset_y=y0,
+            dilation_kernel=config.dilation_kernel_size,
+        )
+        mask_for_color = build_text_mask_from_word_boxes(
+            roi,
+            word_boxes,
+            offset_x=x0,
+            offset_y=y0,
+            dilation_kernel=1,
+        )
+        if mask_for_color is None:
+            mask_for_color = mask_for_cleaning
+        if mask_for_color is None:
+            mask_for_color = build_text_mask(roi, dilation_kernel=1)
+    else:
+        mask_for_cleaning = build_text_mask(roi, dilation_kernel=config.dilation_kernel_size)
+        mask_for_color = mask_for_cleaning
+    if mask_for_color is None:
+        mask_for_color = np.zeros(roi.shape[:2], dtype=np.uint8)
+    bg_color = _estimate_background_color(roi, mask_for_color)
+    raw_text_color = _estimate_text_color(
+        roi, mask_for_color if mask_for_color is not None else np.ones(roi.shape[:2], dtype=np.uint8)
+    )
     is_vertical = False
     is_bold = False
     width = max(1, x1 - x0)
@@ -1965,11 +2303,14 @@ def _block_to_region_info(
         top_extra = int(height * max(0.0, min(0.5, config.textract_vertical_top_margin_ratio)))
         if top_extra > 0:
             y0 = max(0, y0 - top_extra)
-    if mask is not None and mask.size >= 400:
-        fill_ratio = float(np.count_nonzero(mask)) / float(mask.size)
+    if mask_for_color is not None and mask_for_color.size >= 400:
+        fill_ratio = float(np.count_nonzero(mask_for_color)) / float(mask_for_color.size)
         if fill_ratio >= max(0.05, min(0.9, config.text_bold_fill_ratio)):
             is_bold = True
     boosted_text_color = _boost_text_contrast(raw_text_color, bg_color)
+    font_size = _estimate_font_size_from_block(block)
+    if is_table:
+        font_size = max(8, int(font_size * 0.9))
     return RegionInfo(
         page_index=block.page_index,
         region_id=int(block.render_id if block.render_id is not None else 0),
@@ -1979,10 +2320,11 @@ def _block_to_region_info(
         background_color=bg_color,
         source_text=block.source_text,
         translated_text=block.translated_text or block.source_text,
-        mask=mask,
-        font_size_estimate=_estimate_font_size_from_block(block),
+        mask=mask_for_cleaning,
+        font_size_estimate=font_size,
         is_vertical=is_vertical,
         is_bold=is_bold,
+        is_table_cell=is_table,
     )
 
 
@@ -1994,6 +2336,7 @@ def _build_regions_from_blocks(
     regions: List[RegionInfo] = []
     seen_render_ids: Set[int] = set()
     seen_by_text: Dict[str, List[RegionInfo]] = {}
+    last_text_color: Optional[Tuple[int, int, int]] = None
     for block in _iter_translatable_blocks(blocks):
         if block.render_id is None:
             continue
@@ -2007,6 +2350,10 @@ def _build_regions_from_blocks(
             continue
         region = _block_to_region_info(block, bgr_page, config, page.width, page.height)
         if region:
+            if region.is_table_cell and last_text_color:
+                region.text_color = last_text_color
+            elif region.text_color:
+                last_text_color = region.text_color
             canonical = _canonicalize_text_for_dedup(region.translated_text or region.source_text)
             overlaps = False
             for prev in seen_by_text.get(canonical, []):
@@ -2499,6 +2846,35 @@ def _remove_block_text_background_aware(image: "np.ndarray", block: TextBlock, c
     image[y0:y1, x0:x1] = cleaned
 
 
+def build_text_mask_from_word_boxes(
+    roi: "np.ndarray",
+    word_boxes: Sequence[BBoxWH],
+    *,
+    offset_x: int,
+    offset_y: int,
+    dilation_kernel: int,
+) -> Optional["np.ndarray"]:
+    """Construct a mask from known word boxes, keeping only detected text."""
+    _require_dependency(cv2, "opencv-python (pip install opencv-python)")
+    if roi.size == 0 or not word_boxes:
+        return None
+    mask = np.zeros(roi.shape[:2], dtype=np.uint8)
+    for wx, wy, ww, wh in word_boxes:
+        rx0 = max(0, min(roi.shape[1], int(wx - offset_x)))
+        ry0 = max(0, min(roi.shape[0], int(wy - offset_y)))
+        rx1 = max(0, min(roi.shape[1], int(wx + ww - offset_x)))
+        ry1 = max(0, min(roi.shape[0], int(wy + wh - offset_y)))
+        if rx1 > rx0 and ry1 > ry0:
+            cv2.rectangle(mask, (rx0, ry0), (rx1, ry1), color=255, thickness=-1)
+    if np.count_nonzero(mask) == 0:
+        return None
+    kernel_size = max(1, int(dilation_kernel))
+    if kernel_size > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask
+
+
 def build_text_mask(roi: "np.ndarray", *, dilation_kernel: int) -> Optional["np.ndarray"]:
     """Construct a binary mask highlighting text pixels inside ROI."""
     _require_dependency(cv2, "Установите opencv-python (pip install opencv-python)")
@@ -2618,6 +2994,7 @@ class _FontLoader:
     def __init__(self, font_value: Optional[str]) -> None:
         self.font_value = font_value or ""
         self._cache: Dict[int, "ImageFont.FreeTypeFont"] = {}
+        self._windows_fonts_dir = self._resolve_windows_fonts_dir()
         self._preferred_font_path = self._resolve_font_path()
 
     def get(self, size: int) -> "ImageFont.FreeTypeFont":
@@ -2627,7 +3004,12 @@ class _FontLoader:
             return cached
         font_paths = []
         if self.font_value:
-            font_paths.append(Path(self.font_value).expanduser())
+            requested = Path(self.font_value).expanduser()
+            font_paths.append(requested)
+            if self._windows_fonts_dir and not requested.exists():
+                resolved = self._resolve_windows_font_name(requested.name)
+                if resolved is not None:
+                    font_paths.append(resolved)
         if self._preferred_font_path:
             font_paths.append(self._preferred_font_path)
         for candidate in font_paths:
@@ -2644,6 +3026,34 @@ class _FontLoader:
         except Exception:
             raise RuntimeError("Не удалось загрузить шрифт для наложения перевода")
 
+    def _resolve_windows_fonts_dir(self) -> Optional[Path]:
+        if os.name != "nt":
+            return None
+        windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot") or "C:\\Windows"
+        fonts_dir = Path(windir) / "Fonts"
+        return fonts_dir if fonts_dir.exists() else None
+
+    def _resolve_windows_font_name(self, name: str) -> Optional[Path]:
+        if not self._windows_fonts_dir or not name:
+            return None
+        candidate = self._windows_fonts_dir / name
+        if candidate.exists():
+            return candidate
+        alias_map = {
+            "arialunicode.ttf": "arialuni.ttf",
+            "arial unicode.ttf": "arialuni.ttf",
+            "arial unicode ms.ttf": "arialuni.ttf",
+            "arial.ttf": "arial.ttf",
+            "segoeui.ttf": "segoeui.ttf",
+            "calibri.ttf": "calibri.ttf",
+        }
+        alias = alias_map.get(name.lower())
+        if alias:
+            candidate = self._windows_fonts_dir / alias
+            if candidate.exists():
+                return candidate
+        return None
+
     def _resolve_font_path(self) -> Optional[Path]:
         """Pick a Unicode-capable font (Cyrillic-friendly) for stable rendering."""
         candidates: List[Path] = []
@@ -2658,15 +3068,25 @@ class _FontLoader:
                     candidates.append(candidate)
         except Exception:
             pass
-        # Common system fonts that typically include Cyrillic glyphs.
-        system_fonts = [
-            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-            Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
-            Path("/Library/Fonts/Arial Unicode.ttf"),
-            Path("/Library/Fonts/Arial Unicode MS.ttf"),
-            Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
-        ]
-        candidates.extend([p for p in system_fonts if p.exists()])
+        if os.name == "nt":
+            if self._windows_fonts_dir:
+                win_fonts = [
+                    self._windows_fonts_dir / "arialuni.ttf",
+                    self._windows_fonts_dir / "arial.ttf",
+                    self._windows_fonts_dir / "segoeui.ttf",
+                    self._windows_fonts_dir / "calibri.ttf",
+                ]
+                candidates.extend([p for p in win_fonts if p.exists()])
+        else:
+            # Common system fonts that typically include Cyrillic glyphs.
+            system_fonts = [
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+                Path("/Library/Fonts/Arial Unicode.ttf"),
+                Path("/Library/Fonts/Arial Unicode MS.ttf"),
+                Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+            ]
+            candidates.extend([p for p in system_fonts if p.exists()])
         return candidates[0] if candidates else None
 
 
