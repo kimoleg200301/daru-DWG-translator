@@ -1,56 +1,92 @@
 # Daru DWG Translator
 
-Приложение для автоматической локализации DWG/DXF-чертежей. Инструмент извлекает весь текст из исходного DWG (или DXF), переводит его выбранным движком и сохраняет результат в нужном формате (по умолчанию DWG). Доступны графический интерфейс на PySide6 и CLI-пайплайн, поддерживающие Google Translate, DeepL и OpenAI.
+Приложение для автоматической локализации DWG/DXF-чертежей и PDF-документов. Инструмент извлекает текст из исходного файла, переводит его выбранным движком и сохраняет результат в нужном формате. Доступны графический интерфейс на PySide6 и CLI-пайплайн.
 
 ## Возможности
 
-- Поддержка DWG и DXF: входной DWG автоматически конвертируется во временный DXF, а результат можно получить обратно в DWG или в DXF.
-- Извлечение всех текстовых сущностей и просмотр их частот.
-- Движки перевода: `google`, `deep_google`, `googletrans`, `deepl`, `chatgpt` (OpenAI) и `noop`.
-- OpenAI GPT-5 модели с управлением строгостью через `verbosity`/`effort` вместо температуры.
-- Сохранение карты соответствий в CSV и TXT-файлы с оригиналами/переводами.
-- Перевод PDF накладывается поверх оригинальных страниц в виде редактируемых FreeText-слоёв; дополнительно сохраняется JSON с координатами и стилями каждого блока для ручной правки.
-- Графический интерфейс с полосатым логом, поддержкой drag & drop и настройками API.
+- **DWG/DXF**: входной DWG автоматически конвертируется во временный DXF через ODA File Converter, а результат можно получить обратно в DWG или DXF.
+- **PDF**: перевод накладывается поверх оригинальных страниц в виде редактируемых FreeText-слоев; дополнительно сохраняется JSON с координатами и стилями каждого блока. Поддерживаются Tesseract, EasyOCR и AWS Textract.
+- **Движки перевода**: `google`, `deep_google`, `googletrans`, `deepl`, `chatgpt` (OpenAI) и `noop`.
+- **OpenAI GPT-5**: поддержка Responses API с управлением строгостью через `verbosity`/`effort`.
+- **Кэширование**: карта соответствий в CSV и TXT-файлы с оригиналами/переводами.
+- **GUI**: полосатый лог, drag & drop файлов, настройки API, диалоги обработки PDF.
+
+## Структура проекта
+
+```
+daru/
+├── src/daru/                   # Основной пакет
+│   ├── config.py               # AppSettings, SettingsManager, константы UI
+│   ├── __main__.py             # python -m daru
+│   ├── utils/
+│   │   ├── io.py               # CSV/TXT чтение/запись, работа с путями
+│   │   ├── odafc.py            # Интеграция с ODA File Converter
+│   │   └── spinner.py          # CLI-спиннер и цветной вывод
+│   ├── translation/
+│   │   ├── engine.py           # TranslationEngine (Google/DeepL/OpenAI)
+│   │   └── legacy.py           # LegacyTranslationEngine
+│   ├── dxf/
+│   │   ├── entities.py         # Общие хелперы для DXF-сущностей
+│   │   ├── extractor.py        # Извлечение текстов из DXF
+│   │   ├── applier.py          # Применение переводов к DXF
+│   │   └── pipeline.py         # translate_dxf(), CLI точка входа
+│   ├── pdf/
+│   │   ├── _core.py            # Основная логика обработки PDF
+│   │   ├── pipeline.py         # Re-exports из _core
+│   │   ├── config.py           # PdfProcessingConfig
+│   │   └── models.py           # Dataclasses (WordBox, TextBlock и др.)
+│   └── gui/
+│       ├── app.py              # main() — точка входа GUI
+│       ├── main_window.py      # MainWindow
+│       ├── settings_dialog.py  # Диалог настроек API
+│       ├── pdf_dialogs.py      # Диалоги обработки PDF
+│       └── worker.py           # TranslateWorker (QThread)
+├── tests/                      # Тесты (pytest)
+├── daru_gui.py                 # Обертка запуска GUI
+├── auto_translate_dxf.py       # Обертка запуска CLI
+├── pyproject.toml              # Метаданные проекта и entry points
+└── requirements-gui.txt        # Зависимости
+```
 
 ## Требования
 
-- Python 3.9+
-- Зависимости из `requirements-gui.txt`:
-  - PySide6, pyinstaller, ezdxf, deep-translator, googletrans==4.0.0-rc1, deepl, openai
-- Для перевода PDF/сканов понадобятся дополнительные Python-библиотеки (`pymupdf`, `pdf2image`, `pytesseract`, `PyPDF2`) и нативные утилиты OCR:
-  - Установите библиотеки через `pip install -r requirements-gui.txt` (именно pip, macOS Homebrew не добавляет их в Python окружение приложения).
-  - Установите Poppler и Tesseract для macOS: `brew install poppler tesseract`. Затем при необходимости укажите путь к Poppler в переменной окружения `POPPLER_PATH`.
-- [ODA File Converter](https://www.opendesign.com/guestfiles/oda_file_converter) в `PATH` — именно он обеспечивает конверсию DWG ↔ DXF через `ezdxf.addons.odafc`. Можно также задать переменные среды `ODA_FILE_CONVERTER` или `ODAFC_PATH`, указывающие на `ODAFileConverter.exe`.
+- Python 3.10+
+- Зависимости из `requirements-gui.txt`
+- [ODA File Converter](https://www.opendesign.com/guestfiles/oda_file_converter) в `PATH` для конверсии DWG <-> DXF. Можно задать переменные `ODA_FILE_CONVERTER` или `ODAFC_PATH`.
+- Для PDF: Poppler и Tesseract. На macOS: `brew install poppler tesseract`.
 
-Установка зависимостей (рекомендуется виртуальное окружение):
+## Установка
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements-gui.txt
 ```
 
-## Настройка API
-
-- **OpenAI**: задайте `OPENAI_API_KEY` (и при необходимости `OPENAI_BASE_URL`) в настройках GUI или через переменные окружения. Для GPT-5 доступны параметры `verbosity` или `effort` с уровнем 0–100.
-- Если ваш API-ключ привязан к конкретному проекту OpenAI, укажите его идентификатор через `OPENAI_PROJECT` (или в настройках GUI / флагом CLI). Это гарантирует, что запросы появятся в разделе [https://platform.openai.com/logs](https://platform.openai.com/logs).
-- **DeepL**: укажите `DEEPL_AUTH_KEY`/`DEEPL_API_KEY` в настройках или окружении.
-- Все запросы к OpenAI выполняются через Responses API с флагом `store=True`, поэтому они автоматически попадают в раздел [https://platform.openai.com/logs](https://platform.openai.com/logs). Если используется кастомный `OPENAI_BASE_URL`, проверяйте логи в соответствующем окружении или прокси.
-
-## Запуск GUI
+Или через pyproject.toml (editable install):
 
 ```bash
-python3 daru_gui.py
+pip install -e .
 ```
 
-В интерфейсе перетащите DWG/DXF, выберите формат результата (по умолчанию DWG), заполните опциональные пути для CSV/TXT и сохраните ключи API. Лог отображает ход обработки с обновлением статуса и цветовым выделением финальных сообщений.
+## Запуск
 
-## CLI-пайплайн
-
-Пример обработки с сохранением в DWG:
+### GUI
 
 ```bash
-python3 auto_translate_dxf.py INPUT.dwg OUTPUT_ru.dwg \
+python daru_gui.py
+# или
+python -m daru
+# или (после pip install -e .)
+daru-gui
+```
+
+В интерфейсе перетащите DWG/DXF/PDF, выберите формат результата, заполните ключи API в настройках.
+
+### CLI (DXF/DWG)
+
+```bash
+python auto_translate_dxf.py INPUT.dwg OUTPUT_ru.dwg \
     --translator chatgpt \
     --output-format dwg \
     --map-csv OUTPUT_map.csv \
@@ -60,31 +96,45 @@ python3 auto_translate_dxf.py INPUT.dwg OUTPUT_ru.dwg \
     --openai-strict-value 0.6
 ```
 
-Полезные флаги:
+Или после установки:
 
-- `--translator` — выбор движка перевода.
-- `--output-format` — целевой формат (`dwg` по умолчанию, можно указать `dxf`).
-- `--openai-project` — передача идентификатора проекта OpenAI, чтобы запросы попадали в нужный раздел логов.
-- `--no-map`, `--skip-txt` — отключают генерацию CSV и TXT.
-- `--openai-strict-mode` / `--openai-strict-value` — контроль strictness для GPT-5.
+```bash
+daru-translate INPUT.dwg OUTPUT_ru.dwg --translator google
+```
+
+### Флаги CLI
+
+| Флаг | Описание |
+|------|----------|
+| `--translator` | Движок перевода (`google`, `deepl`, `chatgpt`, `noop`) |
+| `--output-format` | Формат выхода: `dwg` (по умолчанию) или `dxf` |
+| `--source-lang` | Исходный язык (по умолчанию `en`) |
+| `--target-lang` | Целевой язык (по умолчанию `ru`) |
+| `--map-csv` | Путь для CSV карты переводов |
+| `--no-map` | Не создавать CSV |
+| `--skip-txt` | Не создавать TXT |
+| `--openai-project` | ID проекта OpenAI для логирования |
+| `--openai-strict-mode` | `verbosity` или `effort` для GPT-5 |
+| `--openai-strict-value` | Значение 0.0-1.0 |
+
+## Настройка API
+
+- **OpenAI**: задайте `OPENAI_API_KEY` (и при необходимости `OPENAI_BASE_URL`, `OPENAI_PROJECT`) в настройках GUI или через переменные окружения.
+- **DeepL**: укажите `DEEPL_AUTH_KEY` или `DEEPL_API_KEY`.
+- Все запросы к OpenAI выполняются через Responses API с `store=True` и попадают в [логи OpenAI](https://platform.openai.com/logs).
+
+## Тестирование
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
 
 ## Сборка standalone
 
-PyInstaller-спека уже настроена. Перед сборкой убедитесь, что ODA File Converter доступен в `PATH`, затем выполните:
-
 ```bash
+pip install pyinstaller
 pyinstaller daru_gui.spec
 ```
 
-Собранные артефакты появятся в папке `dist/`.
-
-## Полезные файлы
-
-- `auto_translation.py` — ядро движков перевода и нормализации текста.
-- `auto_translate_dxf.py` — пайплайн DWG/DXF → перевод → DWG/DXF.
-- `apply_dxf_translation.py` — применение перевода к DXF.
-- `extract_dxf_texts.py` — извлечение и сортировка текстов.
-
-## Обратная связь
-
-CLI и GUI выводят подробные сообщения об ошибках. При сбоях убедитесь, что ключи API заданы, ODA File Converter установлен и путь к нему доступен.
+Артефакты появятся в `dist/`.

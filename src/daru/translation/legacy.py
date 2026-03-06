@@ -1,10 +1,6 @@
-"""
-Legacy translation engine that keeps the previous behaviour of sending
-OpenAI payloads without chunking or retry logic. Use this as a fallback
-when the default engine becomes too defensive for specific jobs.
-"""
+"""Legacy translation engine without message splitting."""
 
-from auto_translation import TranslationEngine as _TranslationEngine
+from .engine import TranslationEngine as _TranslationEngine
 
 
 class LegacyTranslationEngine(_TranslationEngine):

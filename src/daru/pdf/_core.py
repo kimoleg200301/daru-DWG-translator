@@ -12,7 +12,7 @@ import re
 from io import BytesIO
 import numpy as np
 
-from auto_translation import TranslationEngine, chunked
+from daru.translation.engine import TranslationEngine, chunked
 
 try:  # pragma: no cover - optional dependency guards
     from pdf2image import convert_from_path  # type: ignore
@@ -2583,6 +2583,7 @@ def translate_pdf(
     pdf_prompt_template = (
         "You are a professional translator for elevator manuals and catalogs (non-technical marketing/guide tone). "
         "Translate the provided values from {source_lang} to {target_lang}. "
+        "All texts belong to the SAME document — maintain consistent terminology across all items. "
         "Ignore OCR artifacts such as random mixed casing, stray spaces inside words, and line-break hyphenation. "
         "Only remove a hyphen when it clearly indicates a line-break split (hyphen followed by whitespace/newline); "
         "keep true compound-word hyphens. Use natural casing and spacing in the target language, but keep company "
@@ -2606,6 +2607,12 @@ def translate_pdf(
             openai_strict_value=openai_strict_value,
             system_prompt_template=pdf_prompt_template,
         )
+        all_source_texts = [
+            str(b.source_text or "").strip()
+            for b in all_blocks
+            if b.block_type in TRANSLATABLE_BLOCK_TYPES and str(b.source_text or "").strip()
+        ]
+        translator.set_drawing_context(all_source_texts)
         backend_name = translator.backend_name()
         log(f"Инициализирован движок перевода: {backend_name}")
 

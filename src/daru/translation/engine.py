@@ -1,3 +1,5 @@
+"""Translation engine supporting Google, DeepL, ChatGPT and identity backends."""
+
 import json
 import os
 import re
@@ -8,13 +10,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 try:
     from requests.exceptions import ReadTimeout
-except Exception:  # pragma: no cover - optional dependency
-    class ReadTimeout(Exception):  # type: ignore
+except Exception:
+    class ReadTimeout(Exception):  # type: ignore[no-redef]
         pass
 
 DIM_PLACEHOLDER = "__DXF_DIM__"
-OPENAI_SAFE_TEXT = 4500
-OPENAI_RETRY_ATTEMPTS = 3
+OPENAI_SAFE_TEXT = 100000
+OPENAI_RETRY_ATTEMPTS = 5
 OPENAI_RETRY_DELAY = 3.0
 
 OPENAI_REASONING_MODELS = {
@@ -29,6 +31,33 @@ OPENAI_REASONING_MODELS = {
 def chunked(seq: Sequence[str], size: int) -> Iterable[Sequence[str]]:
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
+
+
+def _group_split_jobs_into_batches(
+    split_jobs: List[Tuple[str, int, int, str]],
+    part_counts: Dict[int, int],
+    batch_size: int,
+) -> List[List[Tuple[str, int, int, str]]]:
+    """Group split_jobs into batches ensuring all parts of one text stay together."""
+    by_orig: Dict[int, List[Tuple[str, int, int, str]]] = {}
+    seen_order: List[int] = []
+    for job in split_jobs:
+        orig_idx = job[1]
+        if orig_idx not in by_orig:
+            seen_order.append(orig_idx)
+        by_orig.setdefault(orig_idx, []).append(job)
+
+    batches: List[List[Tuple[str, int, int, str]]] = []
+    current: List[Tuple[str, int, int, str]] = []
+    for orig_idx in seen_order:
+        group = by_orig[orig_idx]
+        if current and len(current) + len(group) > batch_size:
+            batches.append(current)
+            current = []
+        current.extend(group)
+    if current:
+        batches.append(current)
+    return batches
 
 
 def restore_edge_whitespace(original: str, translated: str) -> str:
@@ -102,6 +131,9 @@ class TranslationEngine:
         self._backend = None
         self._translate_batch = None
         self._last_originals: Optional[Sequence[str]] = None
+        self._drawing_context: Optional[str] = None
+        self._entity_types: Optional[Dict[str, str]] = None
+        self._glossary: Dict[str, str] = {}
         self._init_translator()
 
     def _init_translator(self) -> None:
@@ -117,7 +149,7 @@ class TranslationEngine:
                 return
             except ImportError:
                 tried.append("pip install deep-translator")
-            except Exception as exc:  # pragma: no cover - network-related
+            except Exception as exc:
                 tried.append(f"deep-translator error: {exc}")
                 if self.provider != "auto":
                     raise
@@ -132,10 +164,9 @@ class TranslationEngine:
                 return
             except ImportError:
                 tried.append("pip install googletrans==4.0.0-rc1")
-            except Exception as exc:  # pragma: no cover - network-related
+            except Exception as exc:
                 tried.append(f"googletrans error: {exc}")
                 if self.provider != "auto":
-                    # try fallback implementation below
                     pass
 
         if self.provider in ("google", "auto", "googletrans", "google_free", "google-free"):
@@ -155,7 +186,7 @@ class TranslationEngine:
                     return
                 except ImportError:
                     tried.append("pip install deepl")
-                except Exception as exc:  # pragma: no cover - network-related
+                except Exception as exc:
                     tried.append(f"deepl error: {exc}")
                     if self.provider != "auto":
                         raise
@@ -187,7 +218,7 @@ class TranslationEngine:
                     client = OpenAI(**client_kwargs)
                 except (ImportError, AttributeError, TypeError):
                     mode = "legacy"
-                except Exception as exc:  # pragma: no cover - network-related
+                except Exception as exc:
                     tried.append(f"openai error: {exc}")
                     if self.provider != "auto":
                         raise
@@ -198,7 +229,7 @@ class TranslationEngine:
                         openai.api_key = self.openai_api_key
                         if self.openai_base_url:
                             openai.api_base = self.openai_base_url
-                    except Exception as exc:  # pragma: no cover - config errors
+                    except Exception as exc:
                         tried.append(f"openai error: {exc}")
                         if self.provider != "auto":
                             raise
@@ -230,6 +261,27 @@ class TranslationEngine:
     def backend_name(self) -> str:
         return self._backend or "unknown"
 
+    def set_drawing_context(
+        self,
+        all_texts: Sequence[str],
+        entity_types: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Provide full drawing context for better AI translation.
+
+        Args:
+            all_texts: All unique texts from the drawing (for summary).
+            entity_types: Optional mapping text -> DXF entity type (TEXT, MTEXT, TABLE, etc.).
+        """
+        self._entity_types = dict(entity_types) if entity_types else None
+        self._glossary = {}
+        summary_lines = all_texts[:200]
+        preview = "; ".join(
+            (t[:60] + "..." if len(t) > 60 else t) for t in summary_lines
+        )
+        if len(all_texts) > 200:
+            preview += f" ... (+{len(all_texts) - 200} more)"
+        self._drawing_context = preview
+
     def translate_many(self, texts: Sequence[str]) -> List[str]:
         if not texts:
             return []
@@ -255,12 +307,12 @@ class TranslationEngine:
     def _deep_translate_batch(self, texts: Sequence[str]) -> List[str]:
         try:
             return list(self._translator.translate_batch(list(texts)))  # type: ignore[attr-defined]
-        except AttributeError:  # pragma: no cover
+        except AttributeError:
             return [self._translator.translate(t) for t in texts]  # type: ignore[attr-defined]
 
-    def _googletrans_translate_batch(self, texts: Sequence[str]) -> List[str]:  # pragma: no cover - network
+    def _googletrans_translate_batch(self, texts: Sequence[str]) -> List[str]:
         results: List[str] = []
-        translator = self._translator  # type: ignore
+        translator = self._translator
 
         def _extract_texts(translation_result) -> List[str]:
             if isinstance(translation_result, list):
@@ -282,7 +334,7 @@ class TranslationEngine:
                     single = translator.translate(piece, src=self.source_lang, dest=self.target_lang)
                     text = getattr(single, "text", None)
                     chunk_results.append(text if text is not None else piece)
-                except Exception:  # pragma: no cover - network
+                except Exception:
                     chunk_results.append(piece)
             return chunk_results
 
@@ -292,13 +344,13 @@ class TranslationEngine:
                 chunk_results = _extract_texts(translated)
                 if len(chunk_results) != len(chunk):
                     raise ValueError("unexpected googletrans response length")
-            except Exception:  # pragma: no cover - network
+            except Exception:
                 chunk_results = _fallback_chunk(chunk)
             results.extend(chunk_results)
         return results
 
-    def _deepl_translate_batch(self, texts: Sequence[str]) -> List[str]:  # pragma: no cover - network
-        translator = self._translator  # type: ignore
+    def _deepl_translate_batch(self, texts: Sequence[str]) -> List[str]:
+        translator = self._translator
         results: List[str] = []
         source_lang = (self.source_lang or "").strip()
         source = None if not source_lang or source_lang.lower() == "auto" else source_lang.upper()
@@ -308,7 +360,7 @@ class TranslationEngine:
         for chunk in chunked(texts, 40):
             try:
                 translated = translator.translate_text(list(chunk), target_lang=target, source_lang=source)
-            except Exception:  # pragma: no cover - network
+            except Exception:
                 chunk_results: List[str] = []
                 for piece in chunk:
                     try:
@@ -334,7 +386,7 @@ class TranslationEngine:
 
         return results
 
-    def _chatgpt_translate_batch(self, texts: Sequence[str]) -> List[str]:  # pragma: no cover - network
+    def _chatgpt_translate_batch(self, texts: Sequence[str]) -> List[str]:
         originals = list(self._last_originals or [])
         translator = self._translator or {}
         mode = translator.get("mode", "new")
@@ -342,6 +394,10 @@ class TranslationEngine:
         module = translator.get("module")
         model = translator.get("model")
         batch_size = translator.get("batch_size", 12)
+        ADAPTIVE_SINGLE_REQUEST_CHARS = 50000
+        total_chars = sum(len(t) for t in texts)
+        if total_chars <= ADAPTIVE_SINGLE_REQUEST_CHARS:
+            batch_size = max(batch_size, len(texts))
 
         if self.openai_api_key:
             os.environ["OPENAI_API_KEY"] = self.openai_api_key
@@ -374,13 +430,13 @@ class TranslationEngine:
                 if self.openai_project:
                     client_kwargs["project"] = self.openai_project
                 try:
-                    fallback_client = module.OpenAI(**client_kwargs)  # type: ignore[attr-defined]
+                    fallback_client = module.OpenAI(**client_kwargs)
                 except TypeError:
                     fallback_client = None
                     try:
                         client_kwargs.pop("base_url", None)
                         client_kwargs.pop("project", None)
-                        fallback_client = module.OpenAI(**client_kwargs)  # type: ignore[attr-defined]
+                        fallback_client = module.OpenAI(**client_kwargs)
                         if self.openai_base_url and fallback_client is not None:
                             with_options = getattr(fallback_client, "with_options", None)
                             if callable(with_options):
@@ -476,7 +532,7 @@ class TranslationEngine:
             if callable(model_dump):
                 try:
                     dumped = model_dump()
-                except Exception:  # pragma: no cover - best effort
+                except Exception:
                     dumped = None
                 if isinstance(dumped, dict):
                     return extract_message(dumped)
@@ -524,20 +580,45 @@ class TranslationEngine:
             system_content = system_content.replace("{source_lang}", source_label).replace("{target_lang}", target_label)
         else:
             system_content = (
-                "You are a professional technical translator of elevator drawing manuals. Translate the provided values from "
-                f"{source_label} to {target_label}. Preserve numbers, "
-                "placeholders like '__DXF_DIM__', and DXF control sequences such as \"\\P\". Respond "
-                "with strict JSON: {\"translations\": [{\"id\": \"<id>\", \"text\": \"<translated>\"}, ...]}"
+                "You are a professional technical translator of elevator drawing manuals. "
+                f"Translate the provided values from {source_label} to {target_label}. "
+                "All texts belong to the SAME technical drawing — maintain consistent "
+                "terminology across all items. Preserve numbers, "
+                "placeholders like '__DXF_DIM__', and DXF control sequences such as \"\\P\". "
+                "Each item may include a \"type\" field indicating the DXF entity type "
+                "(TEXT, MTEXT, TABLE, DIMENSION, etc.) — use it to infer context. "
+                "Respond with strict JSON: "
+                "{\"translations\": [{\"id\": \"<id>\", \"text\": \"<translated>\"}, ...]}"
+            )
+        if self._drawing_context:
+            system_content += (
+                "\n\n[DRAWING CONTEXT — all texts from this drawing for reference]:\n"
+                + self._drawing_context
+            )
+        if self._glossary:
+            glossary_lines = [f'"{k}" → "{v}"' for k, v in list(self._glossary.items())[:100]]
+            system_content += (
+                "\n\n[GLOSSARY — previously translated terms, use consistently]:\n"
+                + "\n".join(glossary_lines)
             )
         if reasoning_note:
-            system_content = f"{system_content} {reasoning_note}"
+            system_content = f"{system_content}\n\n{reasoning_note}"
 
         assembled_parts: Dict[int, Dict[int, str]] = {}
+
+        def _build_item(job_id: str, orig_idx: int, text: str) -> Dict[str, str]:
+            item: Dict[str, str] = {"id": job_id, "text": text}
+            if self._entity_types:
+                original = originals[orig_idx] if orig_idx < len(originals) else text
+                etype = self._entity_types.get(original)
+                if etype:
+                    item["type"] = etype
+            return item
 
         if mode == "legacy":
             for job_id, orig_idx, part_idx, part_text in split_jobs:
                 single_payload = json.dumps(
-                    {"items": [{"id": job_id, "text": part_text}]},
+                    {"items": [_build_item(job_id, orig_idx, part_text)]},
                     ensure_ascii=False,
                 )
                 single_messages = [
@@ -557,15 +638,13 @@ class TranslationEngine:
                         if chat_completion_create:
                             modern_kwargs = dict(base_kwargs)
                             modern_kwargs["response_format"] = {"type": "json_object"}
-                            completion = chat_completion_create(**modern_kwargs)  # type: ignore[misc]
+                            completion = chat_completion_create(**modern_kwargs)
                         elif module is not None:
-                            completion = module.ChatCompletion.create(  # type: ignore[attr-defined]
-                                **base_kwargs
-                            )
-                        else:  # pragma: no cover - defensive
+                            completion = module.ChatCompletion.create(**base_kwargs)
+                        else:
                             raise RuntimeError("OpenAI legacy клиент недоступен")
                         break
-                    except Exception as exc:  # pragma: no cover - network
+                    except Exception as exc:
                         if (attempt + 1 == OPENAI_RETRY_ATTEMPTS) or not self._should_retry_openai(exc):
                             raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
                         time.sleep(OPENAI_RETRY_DELAY)
@@ -588,11 +667,15 @@ class TranslationEngine:
                     if cleaned:
                         translated_text = cleaned
                 assembled_parts.setdefault(orig_idx, {})[part_idx] = translated_text
+                if translated_text != part_text:
+                    original = originals[orig_idx] if orig_idx < len(originals) else part_text
+                    self._glossary[original.strip()] = translated_text.strip()
         else:
-            for chunk in chunked(split_jobs, batch_size):
+            split_jobs_grouped = _group_split_jobs_into_batches(split_jobs, part_counts, batch_size)
+            for chunk in split_jobs_grouped:
                 payload = [
-                    {"id": job_id, "text": text_part}
-                    for job_id, _, _, text_part in chunk
+                    _build_item(job_id, orig_idx, text_part)
+                    for job_id, orig_idx, _, text_part in chunk
                 ]
                 user_content = json.dumps({"items": payload}, ensure_ascii=False)
                 messages_payload = [
@@ -619,11 +702,9 @@ class TranslationEngine:
                         if metadata:
                             modern_kwargs["metadata"] = metadata
                         modern_kwargs.update(self._openai_generation_kwargs(model, for_responses=True))
-                        completion = client.responses.create(  # type: ignore[attr-defined]
-                            **modern_kwargs
-                        )
+                        completion = client.responses.create(**modern_kwargs)
                         break
-                    except Exception as exc:  # pragma: no cover - network
+                    except Exception as exc:
                         if (attempt + 1 == OPENAI_RETRY_ATTEMPTS) or not self._should_retry_openai(exc):
                             raise RuntimeError(f"ChatGPT translation failed: {exc}") from exc
                         time.sleep(OPENAI_RETRY_DELAY)
@@ -648,6 +729,9 @@ class TranslationEngine:
                 for job_id, orig_idx, part_idx, part_text in chunk:
                     translated = mapping.get(job_id)
                     assembled_parts.setdefault(orig_idx, {})[part_idx] = translated if translated else part_text
+                    if translated and translated != part_text:
+                        original = originals[orig_idx] if orig_idx < len(originals) else part_text
+                        self._glossary[original.strip()] = translated.strip()
 
         for idx in candidate_indices:
             total_parts = part_counts.get(idx, 0)
@@ -684,7 +768,7 @@ class TranslationEngine:
         if isinstance(exc, (ReadTimeout, RemoteDisconnected)):
             return True
         message = str(exc).lower()
-        retry_markers = ("timed out", "timeout", "remote end closed connection", "connection aborted")
+        retry_markers = ("timed out", "timeout", "remote end closed connection", "connection aborted", "rate limit", "rate_limit", "429")
         return any(marker in message for marker in retry_markers)
 
     def _split_openai_payload(self, text: str, limit: int = OPENAI_SAFE_TEXT) -> List[str]:
@@ -774,11 +858,7 @@ class TranslationEngine:
 
     def _reasoning_effort_value(self) -> Optional[str]:
         descriptor = self._strict_descriptor()
-        mapping = {
-            "low": "low",
-            "medium": "medium",
-            "high": "high",
-        }
+        mapping = {"low": "low", "medium": "medium", "high": "high"}
         return mapping.get(descriptor)
 
     def _response_text(self, response_obj: object) -> str:
@@ -824,7 +904,7 @@ class TranslationEngine:
             return "medium"
         return "high"
 
-    def _google_free_translate_batch(self, texts: Sequence[str]) -> List[str]:  # pragma: no cover - network
+    def _google_free_translate_batch(self, texts: Sequence[str]) -> List[str]:
         import json as _json
         import urllib.parse
         import urllib.request

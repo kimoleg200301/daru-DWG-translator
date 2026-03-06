@@ -1,49 +1,20 @@
-# extract_dxf_texts.py
-# pip install ezdxf
-import ezdxf, sys, json, csv, re
+"""Extract and count text entities from DXF documents."""
+
+import csv
+import json
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
-def is_meaningful(s: str) -> bool:
-    return bool((s or "").strip())
+import ezdxf
 
-def get_dim_override_text(dim):
-    try:
-        t = dim.get_text()
-        return t if t and t.strip() != "<>" else ""
-    except Exception:
-        return ""
+from .entities import (
+    ENTITY_TARGETS,
+    get_dim_override_text,
+    safe_mtext_text,
+    safe_table_cell_text,
+)
 
-def safe_mtext_text(e):
-    # Пытаемся взять видимый текст максимально совместимым способом
-    for attr in ("plain_text", "text"):
-        try:
-            v = getattr(e, attr)
-            v = v() if callable(v) else v
-            if isinstance(v, str) and v.strip():
-                return v
-        except Exception:
-            pass
-    # ezdxf старых версий: e.text
-    try:
-        v = e.text
-        if isinstance(v, str) and v.strip():
-            return v
-    except Exception:
-        pass
-    return ""
-
-def safe_table_cell_text(tbl, r, c):
-    # В разных версиях ezdxf разные API
-    for meth in ("text_cell_content", "get_cell_text", "get_text"):
-        try:
-            fn = getattr(tbl, meth)
-            v = fn(r, c)
-            if isinstance(v, str) and v.strip():
-                return v
-        except Exception:
-            pass
-    return ""
 
 def record_text(bag: List[Tuple[str, str, str]], kind: str, detail: str, text: str) -> None:
     if not isinstance(text, str):
@@ -100,10 +71,9 @@ def process_entity(e, bag: List[Tuple[str, str, str]], prefix: str = "") -> None
         return
 
     if dxft in ("INSERT", "MINSERT"):
-        insert_kind = prefix or dxft
         try:
             for attrib in getattr(e, "attribs", []):
-                record_text(bag, f"{insert_kind}:ATTRIB", getattr(attrib.dxf, "tag", ""), getattr(attrib.dxf, "text", ""))
+                record_text(bag, f"{kind}:ATTRIB", getattr(attrib.dxf, "tag", ""), getattr(attrib.dxf, "text", ""))
         except Exception:
             pass
         return
@@ -111,27 +81,25 @@ def process_entity(e, bag: List[Tuple[str, str, str]], prefix: str = "") -> None
 
 def walk_layout(layout, bag):
     for e in layout:
-        process_entity(e, bag)
+        if e.dxftype() in ENTITY_TARGETS or e.dxftype() in ("INSERT", "MINSERT"):
+            process_entity(e, bag)
 
 
 def walk_blocks(doc, bag):
-    # ВАЖНО: у BlocksSection НЕТ .items() — итерируемся напрямую
     for block in doc.blocks:
         name = block.name
         prefix = f"BLOCK:{name}" if name else "BLOCK"
         for e in block:
-            process_entity(e, bag, prefix)
+            if e.dxftype() in ENTITY_TARGETS or e.dxftype() in ("INSERT", "MINSERT"):
+                process_entity(e, bag, prefix)
+
 
 def collect_text_bag(doc) -> List[Tuple[str, str, str]]:
     bag: List[Tuple[str, str, str]] = []
-
-    # Model space
     walk_layout(doc.modelspace(), bag)
-    # Paper layouts
     for layout in doc.layouts:
         if layout.name != "Model":
             walk_layout(layout, bag)
-    # Blocks
     walk_blocks(doc, bag)
     return bag
 
@@ -169,8 +137,32 @@ def write_txt(freq: Dict[str, int], path: Path) -> None:
             f.write(f"[{count}] {text}\n")
 
 
+def build_entity_types(bag: Iterable[Tuple[str, str, str]]) -> Dict[str, str]:
+    """Map each unique text to its dominant DXF entity type (e.g. TEXT, MTEXT, TABLE)."""
+    type_counts: Dict[str, Dict[str, int]] = {}
+    for kind, _detail, txt in bag:
+        key = (txt or "").strip()
+        if not key:
+            continue
+        base_type = kind.split(":")[0] if ":" in kind else kind
+        if base_type.startswith("BLOCK"):
+            base_type = kind.split(":")[-1] if ":" in kind else "BLOCK"
+        bucket = type_counts.setdefault(key, {})
+        bucket[base_type] = bucket.get(base_type, 0) + 1
+    result: Dict[str, str] = {}
+    for text, counts in type_counts.items():
+        result[text] = max(counts, key=counts.get)  # type: ignore[arg-type]
+    return result
+
+
 def extract_text_counts(doc) -> Dict[str, int]:
     return build_frequency(collect_text_bag(doc))
+
+
+def extract_text_counts_and_types(doc) -> Tuple[Dict[str, int], Dict[str, str]]:
+    """Return (frequency_map, entity_type_map) for all texts in the document."""
+    bag = collect_text_bag(doc)
+    return build_frequency(bag), build_entity_types(bag)
 
 
 def extract_texts(inp: str) -> Dict[str, int]:
@@ -181,20 +173,14 @@ def extract_texts(inp: str) -> Dict[str, int]:
 def main(inp, out_csv="extracted_texts.csv", out_json="extracted_texts.json", out_txt="extracted_texts.txt"):
     doc = ezdxf.readfile(inp)
     freq = extract_text_counts(doc)
-
     write_csv(freq, Path(out_csv))
     write_json(freq, Path(out_json))
     write_txt(freq, Path(out_txt))
-
     print(f"OK: {out_csv}, {out_json}, {out_txt}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python extract_dxf_texts.py input.dxf [out_csv] [out_json] [out_txt]")
+        print("Usage: python -m daru.dxf.extractor input.dxf [out_csv] [out_json] [out_txt]")
         sys.exit(1)
-
-    inp = sys.argv[1]
-    out_csv = sys.argv[2] if len(sys.argv) > 2 else "extracted_texts.csv"
-    out_json = sys.argv[3] if len(sys.argv) > 3 else "extracted_texts.json"
-    out_txt = sys.argv[4] if len(sys.argv) > 4 else "extracted_texts.txt"
-    main(inp, out_csv, out_json, out_txt)
+    main(sys.argv[1], *sys.argv[2:5])

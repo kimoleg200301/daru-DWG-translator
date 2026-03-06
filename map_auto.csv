@@ -1,0 +1,406 @@
+text_en,text_ru
+(BY OTHERS),(ДРУГИМИ)
+M,M
+APPD BY,УТВЕРДИЛ
+DATE,ДАТА
+G,G
+6,6
+A,A
+C,C
+X1,X1
+1150,1150
+0,0
+1,1
+150,150
+2,2
+2025-09-18,2025-09-18
+3,3
+4,4
+5,5
+7,7
+700,700
+8,8
+9,9
+B,B
+Bagystan BI,Багыстан БИ
+D,D
+E,E
+F,F
+H,H
+I,I
+J,J
+K,K
+L,L
+N,N
+O,O
+P,P
+CHKD BY,ПРОВЕРЕНО
+DSND BY,ПОДГОТОВИЛ
+DWG. NO,Номер чертежа
+EL NO. (L001008),ЭЛ НОМ. (L001008)
+KZ,KZ
+LOCATION,МЕСТОПОЛОЖЕНИЕ
+MM,MM
+N.S,N.S
+"PROJ.
+NAME",НАЗВАНИЕ ПРОЕКТА
+RESD BY,УТВЕРДИЛ
+REV. NO,НОМЕР ИЗМЕНЕНИЯ
+REVISE NO,НОМЕР ИЗМЕНЕНИЯ
+REVISION,РЕВИЗИЯ
+SCALE,МАСШТАБ
+SIGNED,ПОДПИСАНО
+TITLE,НАЗВАНИЕ
+"The dimensions in the layout drawings are not drawn in a 1:1 ratio, and the use of a scale bar for measurement is prohibited.","Размеры на планах не отображены в масштабе 1:1, и использование шкалы для измерений запрещено."
+UNIT,ЕДИНИЦА
+王琪/傅鹰昊,王琪/傅鹰昊
+4500,4500
+JP050,JP050
+R1,R1
+R2,R2
+300,300
+400,400
+1 FLOOR,1 ЭТАЖ
+1080*170*10T,1080*170*10T
+11700,11700
+240,240
+33,33
+48,48
+"DETAIL ""A""","ДЕТАЛЬ ""A"""
+FILLING BY CONCRETE AFTER TM INSTALLED,ЗАПОЛНЕНИЕ БЕТОНОМ ПОСЛЕ УСТАНОВКИ ТМ
+HIP,HIP
+L001008,L001008
+LAMP,СВЕТИЛЬНИК
+MACHINE BEAMS,МАШИННЫЕ БАЛКИ
+MAIN FLOOR ONLY,ТОЛЬКО ОСНОВНОЙ ЭТАЖ
+MC. SUPPORT PLATE,ПЛИТА ПОДДЕРЖКИ М/К
+STEEL BAR FOR FIXING JAMBS,СТАЛЬНАЯ ПЛИТА ДЛЯ КРЕПЛЕНИЯ СТВОЛОВ
+X1-X1,X1-X1
+X2,X2
+ø9×6EA (BY OTHERS),ø9×6EA (ДРУГИМИ)
+1225,1225
+1375,1375
+225,225
+25,25
+2700,2700
+CONCRETE OPENING   2550,БЕТОННЫЙ ПРОЕМ   2550
+DRAWING,ЧЕРТЕЖ
+∅50,∅50
+(BY HDEL),(ДРУГИМИ)
+(BY HYUNDAI ELEVATOR),(ДРУГИМИ)
+(BY HYUNDAI),(ДРУГИМИ)
+"* IF FLOOR THICKNESS IS GREATER THAN 80MM, PLEASE INFORM US IN TIME. WE WILL REPLACE THE OTHER TYPE OF SILL SUPPORT.","* ЕСЛИ ТОЛЩИНА ПОЛА БОЛЬШЕ 80 ММ, ПОЖАЛУЙСТА, УВЕДОМЬТЕ НАС ЗАБЛАГОВРЕМЕННО. МЫ ЗАМЕНИМ ДРУГОЙ ТИП ПОДДЕРЖКИ ПОДОКОННИКА."
+"- CAR RAIL		:    T82/B
+- CWT RAIL		:    TD65_2.5
+- FLOORING                          :    20MM RECESS , BY OTHERS","- РЕЛЬС КАБИНЫ		:    T82/B
+- РЕЛЬС CWT		:    TD65_2.5
+- ПОЛ		:    УГЛУБЛЕНИЕ 20MM, ДРУГИМИ"
+1 - 100X200,1 - 100X200
+"1. The working environment requirements of the elevator are as follows: 
+1.1 The ambient temperature of the TCWA (working area of main equipment such as traction machine and control system) shall be kept between 5℃ and 40 ℃. 
+1.2 The ambient relative humidity shall not be greater than 85% (at 25 ℃). 
+1.3 The working environment of elevator shall be free of explosion, gas and conductive dust that can corrode metal and damage insulation. 
+1.4 The fluctuation of power supply voltage shall be within ± 7%. 
+2. TCWA: 
+2.1 The floor of TCWA shall be able to bear the load of equipment installation and operation. 
+2.2 The ground of TCWA shall be made of materials that are non slip and not easy to generate dust. 2.3 The supporting length of the traction machine beam shall exceed the wall thickness center by 20mm and shall not be less than 150mm. 
+2.4 The ground of TCWA should be flat, the doors and windows should be weatherproof, the passage shall be unblocked. The door of machine room with machine room elevator shall be locked. The outside of the door shall be provided with a notice including the following short words: ""Elevator traction machine - danger, no entry without permission"". 
+2.5 When the ground height of the machine room with machine room elevators is different and the difference is more than 0.5m, stairs or steps shall be set and guardrails shall be set. 
+2.6 Any pit or any groove on the machine room floor with a depth of more than 0.5m and a width of less than 0.5m shall be covered.The reserved holes in the machine room shall be effectively covered and protected to prevent sundries from falling into the hoistway or personnel from stepping into the hoistway. 
+2.7 In order to prevent objects from passing through the openings above the hoistway, including the danger of falling through the openings for cables, a ring frame must be used, which should protrude at least 50mm from the floor or the finished ground. 
+2.8 The machine room must be well ventilated. The stale air drawn from other parts of the building shall not be discharged into the machine room. 
+2.9 When the functions of buildings are required (such as hospitals, schools, libraries, residences, etc.), the walls, floors and roofs of TCWA should be able to absorb a large amount of noise generated during elevator operation. 
+2.10 The maximum allowable load shall be indicated on the bearing beam and hook. 
+2.11 Each elevator in TCWA shall be firmly installed with a switch that can cut off the main power supply of the elevator. Its capacity can cut off the maximum current of the elevator when it is in use, but the switch shall not cut off the following power supply circuits: 
+a. Car lighting and ventilation; 				b. Car roof power socket; 
+c. Lighting of elevator TCWA; 				d. Power socket in TCWA; 
+e. Elevator hoistway lighting; 				f. Alarm device. 
+2.12 The main power switch shall be installed on the wall 1.3~1.5m above the ground at the entrance of the machine room (elevator with machine room) or within 3m of the control cabinet (elevator without machine room). If several elevators share the same machine room, the operating mechanism of the main power switch of each elevator shall be easy to identify. The phase colors of the wires of the distribution board are arranged from left to right or from top to bottom. The specific order is A (yellow phase), B (green phase), C (red phase), N (light blue), PE (yellow green double color).
+2.13 TCWA shall be equipped with fixed electrical lighting, and the illumination on the floor surface shall not be less than 200 lx. A switch shall be set at an appropriate height near the entrance (or several entrances) in the machine room to control the lighting of the machine room when entering. The entrance of the machine room shall be equipped with permanent lighting devices. 
+2.14 One or more power sockets shall be set in TCWA. The power supply shall be taken from the lighting circuit described in 2.15. These sockets are 2P+PE 250V. 
+2.15 The power supply and lighting power supply shall be separated and sent to the wall beside the machine room door of the elevator with machine room or the control cabinet of the elevator without machine room, or the lighting power supply shall be obtained by connecting to the incoming side of the main power switch described in Article 2.11. 
+2.16 The distribution board shall be equipped with grounding bus (PE) and neutral bus (N). It is recommended to use resin board, laminate and other insulating materials for the distribution board, and the thickness should not be less than 8mm. The distribution board shall not adopt exposed wiring. 
+2.17 The earth wire (PE) and the neutral wire (N) shall always be separated. 
+3. Hoistway 
+3.1 The hoistway of each elevator is completely enclosed by a non porous wall, bottom plate and top plate. Only the following openings are allowed: 
+a. Landing door opening; 
+b. The opening of access door, safety door and maintenance trap door leading to the hoistway; 
+c. Exhaust vents for gas and smoke removal in case of fire; 
+d. Vents; 
+e. Permanent opening between hoistway and machine room. f. If the hoistway is partially closed, please contact to Hyundai Elevator Company. 
+3.2 The wall, bottom and top plate of the hoistway shall have sufficient mechanical strength, and shall be made of solid and non combustible materials, which shall not contribute to the generation of dust. It is recommended to use full reinforced concrete hoistway. 
+3.3 When the distance between two adjacent door sills exceeds 11m, an emergency door (provided by the customer) shall be set between them to ensure that the distance between adjacent sills does not exceed 11m. 
+3.4 The height and width of the emergency exit shall not be less than 1.8m and 0.6m respectively. The height of the access door shall not be less than 2m and the width shall not be less than 0.8m. The height and width of the maintenance trap door shall not be greater than 0.5m, and they shall not be opened towards the hoistway. 
+3.5 Access doors, safety doors and access trap doors shall be equipped with locks that can be opened with a key. When the door is opened, it can also be closed and locked without a key. Even if the access door and safety door are locked, they can be opened from the hoistway without a key. 3.6 The access door, safety door and access trap door shall be non porous and have the same mechanical strength as the landing door. 
+3.7 The specified horizontal dimension of elevator hoistway is the minimum clearance dimension measured by plumb. The allowable deviation value is: 0~+25mm when the hoistway height TH ≤ 30m; 0~+35mm for hoistways with a height of 30m ＜ TH ≤ 60m; 0~+50mm when the hoistway height  is 60m ＜TH ≤ 200m; 
+3.8 When multiple elevators are installed in the same hoistway, a guard fence shall be set between different elevator moving parts (car or counterweight) at the lower part of the hoistway, and the height shall extend from the lowest point of the car or counterweight travel to 2.5m above the pit floor. If the horizontal distance between moving parts is less than 0.5m, the guardrail shall run through the whole hoistway. 
+3.9 If the hoistway wall is a non full concrete structure, the 0.3m high concrete ring beam shall be set in the hoistway at intervals of guide rail brackets, and the 0.3m high concrete lintel (the same width as the hoistway) shall be set on the entrance wall of each landing floor station at+100mm above the horizontal opening height of the ground. It can also be replaced by steel beams with corresponding strength. If the hoistway wall is a solid concrete structure, no ring beam is required, and the minimum thickness of the hoistway wall is 0.15 m. 
+3.10 The elevator hoistway shall be used exclusively for elevators, and no equipment, cables, etc. irrelevant to elevators shall be installed in the hoistway. 
+3.11 The hoistway shall be equipped with permanent electrical lighting, which can be illuminated even when the doors are closed during maintenance and repair. Illumination requirements: ≥ 50lx at 1m above the car roof and pit floor, ≥ 20lx at other areas. The hoistway lighting wiring shall not be exposed with plastic sheathed wire. 
+4. Pit
+4.1 The lower part of the hoistway shall be provided with a pit and drainage device. The pit shall not leak or seep, and the bottom of the pit shall be smooth and flat. 
+4.2 The elevator hoistway should not be set on the space that people can reach. If there is space for people to reach under the lift car or counterweight, the bottom of the hoistway pit shall be designed with a minimum load of 5000 N/m2, and the counterweight buffer shall be installed on the solid pile pier extending to the firm ground. 
+4.3 In order to facilitate the maintenance personnel to enter the pit safely, a permanent vertical ladder device shall be set in the pit to enter the pit from the landing door. This device shall be fixed on the wall of the pit and shall not protrude into the space for elevator operation. 
+4.4 A power socket shall be set in the pit (the same as Article 2.14). 
+4.5 When the depth of the pit is greater than 2500mm, it is recommended that customers take by themself own maintenance platform for easy inspection and maintenance.
+5. Landing 
+5.1 Near the landing door, the illumination of the natural or artificial lighting of the landing station on the ground shall not be less than 50 lux. 
+5.2 The minimum floor spacing: when the door is opened by two split doors, it shall not be less than (opening height+560) mm; The side opening of two doors shall not be less than (opening height+620) mm. 
+6. After the installation of the elevator, necessary civil backfilling and decoration, such as: the perimeter of the door jamb, the traction machine steel beam (concrete pier), etc. 
+7. Definitions of layout drawing terms 
+a. Pit depth: The vertical distance between the decorative floor surface of the bottom landing station and the bottom surface of the hoistway 
+b. Floor height: The vertical distance between two adjacent decorative floors 
+c. Travel: The vertical distance from the decorative floor of the lowest floor parking station to the decorative floor of the top floor parking station 
+d. Overhead:  The minimum vertical distance between the decorative floor of the top floor parking station and the top of the hoistway (excluding hooks/beams, etc.) 
+e. Machine room height: The minimum vertical distance between the decorative floor and the top (excluding hooks/beams, etc.) in the machine room 
+8. This notice is a part of the elevator civil engineering layout of Hyundai (China) Elevator Co., Ltd.","1. Требования к рабочей среде лифта следующие: 
+1.1 Температура окружающей среды в TCWA (рабочая зона основного оборудования, такого как тяговая машина и система управления) должна поддерживаться в пределах от 5℃ до 40℃. 
+1.2 Относительная влажность окружающей среды не должна превышать 85% (при 25℃). 
+1.3 Рабочая среда лифта должна быть свободна от взрывчатых веществ, газов и проводящей пыли, которые могут корродировать металл и повредить изоляцию. 
+1.4 Колебания напряжения электропитания должны находиться в пределах ± 7%. 
+2. TCWA: 
+2.1 Пол TCWA должен выдерживать нагрузку от установки и эксплуатации оборудования. 
+2.2 Пол TCWA должен быть выполнен из материалов, которые не скользят и не создают пыль. 
+2.3 Длина опоры балки тяговой машины должна превышать центр толщины стены на 20 мм и не должна быть меньше 150 мм. 
+2.4 Пол TCWA должен быть ровным, двери и окна должны быть защищены от погодных условий, проход должен быть свободным. Дверь машинного помещения с лифтом должна быть заперта. Снаружи двери должно быть размещено уведомление, содержащее следующие короткие слова: ""Тяговая машина лифта - опасность, вход без разрешения запрещен"". 
+2.5 Когда высота пола машинного помещения с лифтами различна и разница превышает 0.5 м, должны быть установлены лестницы или ступени, а также ограждения. 
+2.6 Любая яма или любой желоб на полу машинного помещения глубиной более 0.5 м и шириной менее 0.5 м должны быть закрыты. Зарезервированные отверстия в машинном помещении должны быть эффективно закрыты и защищены, чтобы предотвратить падение посторонних предметов в шахту или попадание людей в шахту. 
+2.7 Для предотвращения прохода предметов через отверстия над шахтой, включая опасность падения через отверстия для кабелей, необходимо использовать кольцевую раму, которая должна выступать не менее чем на 50 мм от пола или готового основания. 
+2.8 Машинное помещение должно быть хорошо вентилируемым. Затхлый воздух, вытягиваемый из других частей здания, не должен сбрасываться в машинное помещение. 
+2.9 Когда требуются функции зданий (таких как больницы, школы, библиотеки, жилые дома и т. д.), стены, полы и крыши TCWA должны быть способны поглощать большое количество шума, создаваемого во время работы лифта. 
+2.10 Максимально допустимая нагрузка должна быть указана на несущей балке и крюке. 
+2.11 Каждый лифт в TCWA должен быть надежно установлен с выключателем, который может отключить основное электропитание лифта. Его мощность должна быть способна отключить максимальный ток лифта во время его работы, но выключатель не должен отключать следующие цепи электропитания: 
+a. Освещение и вентиляция кабины; 				b. Электрическая розетка на крыше кабины; 
+c. Освещение TCWA лифта; 				d. Электрическая розетка в TCWA; 
+e. Освещение шахты лифта; 				f. Сигнальное устройство. 
+2.12 Главный выключатель питания должен быть установлен на стене на высоте 1.3~1.5 м над полом у входа в машинное помещение (лифт с машинным помещением) или в пределах 3 м от контрольного шкафа (лифт без машинного помещения). Если несколько лифтов используют одно машинное помещение, механизм управления главным выключателем питания каждого лифта должен быть легко идентифицируемым. Цвета фаз проводов распределительного щита располагаются слева направо или сверху вниз. Конкретный порядок: A (желтая фаза), B (зеленая фаза), C (красная фаза), N (светло-голубая), PE (желто-зеленый двойной цвет). 
+2.13 TCWA должно быть оборудовано фиксированным электрическим освещением, а уровень освещенности на поверхности пола не должен быть менее 200 lx. Выключатель должен быть установлен на подходящей высоте рядом с входом (или несколькими входами) в машинное помещение для управления освещением машинного помещения при входе. Вход в машинное помещение должен быть оборудован постоянными осветительными устройствами. 
+2.14 В TCWA должно быть установлено одно или несколько электрических розеток. Электропитание должно быть взято из цепи освещения, описанной в пункте 2.15. Эти розетки 2P+PE 250V. 
+2.15 Электропитание и освещение должны быть разделены и поданы на стену рядом с дверью машинного помещения лифта с машинным помещением или в контрольный шкаф лифта без машинного помещения, или электропитание освещения должно быть получено путем подключения к входной стороне главного выключателя питания, описанного в пункте 2.11. 
+2.16 Распределительный щит должен быть оборудован заземляющим шиной (PE) и нейтральной шиной (N). Рекомендуется использовать смоляные панели, ламинированные и другие изоляционные материалы для распределительного щита, а толщина не должна быть менее 8 мм. Распределительный щит не должен использовать открытое проводку. 
+2.17 Заземляющий провод (PE) и нейтральный провод (N) всегда должны быть разделены. 
+3. Шахта 
+3.1 Шахта каждого лифта полностью ограждена непроницаемой стеной, нижней и верхней плитами. Разрешены только следующие отверстия: 
+a. Отверстие двери выхода; 
+b. Отверстие доступа, безопасности и обслуживания, ведущее в шахту; 
+c. Вытяжные вентиляционные отверстия для удаления газа и дыма в случае пожара; 
+d. Вентиляционные отверстия; 
+e. Постоянное отверстие между шахтой и машинным помещением. f. Если шахта частично закрыта, пожалуйста, свяжитесь с компанией Hyundai Elevator. 
+3.2 Стена, нижняя и верхняя плиты шахты должны иметь достаточную механическую прочность и быть выполнены из твердых и несгораемых материалов, которые не способствуют образованию пыли. Рекомендуется использовать полностью армированную бетонную шахту. 
+3.3 Когда расстояние между двумя соседними порогами дверей превышает 11 м, между ними должно быть установлено аварийное дверь (предоставляется заказчиком), чтобы обеспечить, чтобы расстояние между соседними порогами не превышало 11 м. 
+3.4 Высота и ширина аварийного выхода не должны быть менее 1.8 м и 0.6 м соответственно. Высота двери доступа не должна быть менее 2 м, а ширина не должна быть менее 0.8 м. Высота и ширина люка для обслуживания не должны превышать 0.5 м, и они не должны открываться в сторону шахты. 
+3.5 Двери доступа, безопасности и люки доступа должны быть оборудованы замками, которые можно открыть ключом. Когда дверь открыта, ее также можно закрыть и заблокировать без ключа. Даже если дверь доступа и дверь безопасности заперты, их можно открыть из шахты без ключа. 
+3.6 Дверь доступа, дверь безопасности и люк доступа должны быть непроницаемыми и иметь такую же механическую прочность, как и дверь выхода. 
+3.7 Указанный горизонтальный размер шахты лифта является минимальным размером зазора, измеренным по отвесу. Допустимое отклонение: 0~+25 мм, когда высота шахты TH ≤ 30 м; 0~+35 мм для шахт с высотой 30 м < TH ≤ 60 м; 0~+50 мм, когда высота шахты 60 м < TH ≤ 200 м; 
+3.8 Когда несколько лифтов установлены в одной шахте, между различными движущими частями лифта (кабина или противовес) в нижней части шахты должно быть установлено защитное ограждение, высота которого должна простираться от самой низкой точки движения кабины или противовеса до 2.5 м над полом ямы. Если горизонтальное расстояние между движущими частями менее 0.5 м, ограждение должно проходить через всю шахту. 
+3.9 Если стена шахты не является полностью бетонной конструкцией, в шахте на расстоянии от опор направляющих рельсов должно быть установлено бетонное кольцевое перекрытие высотой 0.3 м, а на стене входа каждой станции этажа должно быть установлено бетонное перемычка высотой 0.3 м (такой же ширины, как и шахта) на 100 мм выше горизонтальной высоты открывания пола. Это также может быть заменено стальными балками с соответствующей прочностью. Если стена шахты является сплошной бетонной конструкцией, кольцевое перекрытие не требуется, а минимальная толщина стены шахты составляет 0.15 м. 
+3.10 Шахта лифта должна использоваться исключительно для лифтов, и в шахте не должно устанавливаться оборудование, кабели и т. д., не относящиеся к лифтам. 
+3.11 Шахта должна быть оборудована постоянным электрическим освещением, которое может быть включено даже когда двери закрыты во время обслуживания и ремонта. Требования к освещению: ≥ 50lx на высоте 1 м над крышей кабины и полом ямы, ≥ 20lx в других областях. Проводка освещения шахты не должна быть открытой с пластиковыми изолированными проводами. 
+4. Яма 
+4.1 Нижняя часть шахты должна быть оборудована ямой и дренажным устройством. Яма не должна протекать или просачиваться, а дно ямы должно быть гладким и ровным. 
+4.2 Шахта лифта не должна располагаться в пространстве, до которого могут дотянуться люди. Если есть пространство, до которого могут дотянуться люди под лифтом или противовесом, дно ямы шахты должно быть спроектировано с минимальной нагрузкой 5000 N/m2, а буфер противовеса должен быть установлен на прочном свайном основании, простирающемся до твердой земли. 
+4.3 Для обеспечения безопасного доступа обслуживающего персонала в яму, в яме должно быть установлено постоянное вертикальное лестничное устройство для доступа в яму через дверь выхода. Это устройство должно быть закреплено на стене ямы и не должно выступать в пространство для работы лифта. 
+4.4 В яме должна быть установлена электрическая розетка (так же, как в пункте 2.14). 
+4.5 Когда глубина ямы превышает 2500 мм, рекомендуется, чтобы заказчики сами обеспечили платформу для обслуживания для удобства осмотра и обслуживания. 
+5. Выход 
+5.1 У входной двери освещение естественного или искусственного света на уровне земли не должно быть менее 50 люкс. 
+5.2 Минимальное расстояние между полами: когда дверь открывается двумя раздельными дверями, оно не должно быть менее (высота открытия + 560) мм; Боковое открытие двух дверей не должно быть менее (высота открытия + 620) мм. 
+6. После установки лифта необходимо провести необходимые гражданские работы по засыпке и отделке, такие как: периметр дверной коробки, стальная балка тяговой машины (бетонный пьедестал) и т. д. 
+7. Определения терминов планировки чертежа 
+a. Глубина ямы: вертикальное расстояние между декоративной поверхностью пола нижней станции и нижней поверхностью шахты 
+b. Высота пола: вертикальное расстояние между двумя соседними декоративными полами 
+c. Ход: вертикальное расстояние от декоративного пола станции парковки нижнего этажа до декоративного пола станции парковки верхнего этажа 
+d. Над головой: минимальное вертикальное расстояние между декоративным полом станции парковки верхнего этажа и верхней частью шахты (исключая крюки/балки и т. д.) 
+e. Высота машинного помещения: минимальное вертикальное расстояние между декоративным полом и верхом (исключая крюки/балки и т. д.) в машинном помещении 
+8. Это уведомление является частью гражданского проектирования лифта компании Hyundai (Китай) Elevator Co., Ltd."
+1.0,1.0
+100,100
+1000,1000
+1000 X 2400,1000 X 2400
+1000(W)*2000(H),1000(Ш)*2000(В)
+102,102
+1050,1050
+1300 X 2100,1300 X 2100
+1500,1500
+170,170
+1725,1725
+17700,17700
+1C-2BC,1C-2BC
+1~4,1~4
+2 - ø80,2 - ø80
+2 ~ 3 FLOOR,2 ~ 3 ЭТАЖ
+2-PANEL CENTER OPENING,2-ПАНЕЛЬНОЕ ЦЕНТРАЛЬНОЕ ОТКРЫТИЕ
+2.5,2.5
+20,20
+2200,2200
+2:1(S),2:1(С)
+32,32
+3600,3600
+4 - 200X200,4 - 200X200
+4 / 4 / 4,4 / 4 / 4
+4 FLOOR / 4 ST,4 ЭТАЖ / 4 СТ
+41KN,41КН
+475,475
+50,50
+550,550
+7.1,7.1
+740,740
+75,75
+79,79
+80,80
+84KN,84КН
+925,925
+A.C 1PH-220-50,A.C 1ФАЗА-220-50
+A.C 3PH-380-50,A.C 3Ф-380-50
+A5090447A(KZ2025090216)-L001008-01,A5090447A(KZ2025090216)-L001008-01
+A5090447A(KZ2025090216)-L001008-02,A5090447A(KZ2025090216)-L001008-02
+A5090447A(KZ2025090216)-L001008-03,A5090447A(KZ2025090216)-L001008-03
+A5090447A(KZ2025090216)-L001008-04,A5090447A(KZ2025090216)-L001008-04
+ALL FLOOR,ВСЕ ЭТАЖИ
+BY OTHERS,(ДРУГИМИ)
+C / P,C / P
+CAPACITY (kg),ГРУЗОПОДЪЕМНОСТЬ (кг)
+"CAPACITY OF LIGHTING
+C.B.(A)","ЕМКОСТЬ ОСВЕЩЕНИЯ
+C.B.(A)"
+"CAPACITY OF MAIN
+POWER C.B.(A)","ЕМКОСТЬ ГЛАВНОГО
+ЭЛЕКТРИЧЕСКОГО ВЫКЛЮЧАТЕЛЯ (A)"
+CAR BUFFER,БУФЕР КАБИНЫ
+CAR INTERNAL SIZE (mm),ВНУТРЕННИЙ РАЗМЕР КАБИНЫ (мм)
+"CLEAR OPENING
+ 1000","ЧИСТЫЙ ПРОЕМ
+ 1000"
+"CONCRETE OPENING 
+ 1200","БЕТОННЫЙ ПРОЕМ 
+ 1200"
+CONTROL,УПРАВЛЕНИЕ
+CWT-BUFFER,БУФЕР CWT
+DOOR OPEN TYPE,ТИП ОТКРЫТИЯ ДВЕРИ
+DOOR OPENING SIZE (mm),РАЗМЕР ОТКРЫТИЯ ДВЕРИ (мм)
+EARTH WIRE (mm²),ЗАЗЕМЛЯЮЩИЙ ПРОВОД (мм²)
+EL NO.,ЭЛ НОМ.
+ELECTRICAL REQUIREMENTS/UNIT (BY OTHERS),ЭЛЕКТРИЧЕСКИЕ ТРЕБОВАНИЯ/ЕДИНИЦА (ДРУГИМИ)
+ENTRANCE HEIGHT   2400,ВЫСОТА ВХОДА   2400
+FERRULE,ФЕРУЛА
+FINISHED FLOOR,ЗАВЕРШЕННЫЙ ПОЛ
+FINISHING FLOOR(BY OTHERS),ОТДЕЛКА ПОЛА (ДРУГИМИ)
+FIRE DOOR : EI 60 GOST,ПОЖАРНАЯ ДВЕРЬ : EI 60 ГОСТ
+FIREMAN'S SWITCH,КЛЮЧ ОГНЕБОРЦА
+FL / ST,ЭТАЖ / СТ
+FLOOR HEIGHT,ВЫСОТА ПОЛА
+FLOOR NAME,НАЗВАНИЕ ЭТАЖА
+FLOOR/STOP/DOOR,ЭТАЖ/СТОП/ДВЕРЬ
+"HEAT EMISSION OF
+MACHINE ROOM (KCal/h)","ТЕПЛОВЫЕ ВЫПУСКИ
+МАШИННОГО ПОМЕЩЕНИЯ (Ккал/ч)"
+HOISTING HOOK 35KN,КРЮК ПОДЪЕМА 35КН
+HOISTING HOOK PROJECTION,ВЫДВИЖЕНИЕ КРЮКА ПОДЪЕМА
+HOISTWAY DEPTH   2600,ГЛУБИНА ШАХТЫ   2600
+HOISTWAY PLAN,ПЛАН ШАХТЫ
+HOISTWAY SECTION,СЕКЦИЯ ШАХТЫ
+HOISTWAY WIDTH   2300,ШИРИНА ШАХТЫ   2300
+HOLE OF ENTRANCE / PLAN OF ENTRANCE,ОТВЕРСТИЕ ВХОДА / ПЛАН ВХОДА
+HOLE OF MACHINE ROOM,ОТВЕРСТИЕ МАШИННОГО ПОМЕЩЕНИЯ
+HOLE SIZE,РАЗМЕР ОТВЕРСТИЯ
+INSPECTION LADDER,ЛЕСТНИЦА ДЛЯ ОСМОТРА
+INSPECTION PLUG,ПЛАСТИНА ДЛЯ ИНСПЕКЦИИ
+INSPECTION PLUG(BY OTHERS),ПЛАСТИНА ДЛЯ ИНСПЕКЦИИ (ДРУГИМИ)
+INSTALLATION OF ELEVATOR LAYOUT PLAN,УСТАНОВКА ПЛАНА РАСПОЛОЖЕНИЯ ЛИФТА
+"Interphone wiring requirements (BY OTHERS):
+Each elevator control cabinet is wired in series with each other, from one or more elevator control cabinets to the community or building monitoring room, the cable requires the use of RVVS 4*0.75mm2^ . When the wiring length is greater than 1000m, less than or equal to 2000m, it is required to use RVVS 4*1.0mm2^ . When the wiring length is greater than 2000m, less than or equal to 3000m, it is required to use RVVS 4*1.5mm2^  which cannot exceed 3000m.","Требования к проводке интеркома (ДРУГИМИ):
+Каждый шкаф управления лифтом соединен последовательно с другими, от одного или нескольких шкафов управления лифтом до комнаты мониторинга сообщества или здания, кабель должен использоваться RVVS 4*0.75мм². Когда длина проводки превышает 1000м, но меньше или равна 2000м, требуется использовать RVVS 4*1.0мм². Когда длина проводки превышает 2000м, но меньше или равна 3000м, требуется использовать RVVS 4*1.5мм², которая не может превышать 3000м."
+LIGHTING POWER,МОЩНОСТЬ ОСВЕЩЕНИЯ
+"LIGHTING POWER
+FEEDER (mm²)","ЕМКОСТЬ ОСВЕЩЕНИЯ
+ПИТАНИЕ (мм²)"
+LOD EL NO.,ЭЛ НОМ.
+M  HOLE FERRULE,ФЕРУЛА ДЛЯ ОТВЕРСТИЯ М
+M/C ROOM DEVICES HOISTED :,УСТРОЙСТВА М/К ПОДНЯТЫЕ :
+M/C ROOM ENTRANCE(BY OTHERS),ВХОД В М/К (ДРУГИМИ)
+M/C ROOM FLOOR,ЭТАЖ М/К
+M/C ROOM REACTION,РЕАКЦИЯ М/К ПОМЕЩЕНИЯ
+MAIN POWER,ГЛАВНОЕ ЭЛЕКТРИЧЕСКОЕ ПИТАНИЕ
+"MAIN POWER FEEDER
+(mm²)","ГЛАВНЫЙ ПИТАНИЕ
+(мм²)"
+"NOTE: IF THE HOISTWAY IS NOT CONCRETE STRUCTURE, PLEASE SET THE RING BEAM OR STEEL BEAM ACCORDDING TO THE SPAN OF RAIL BRACKET(BY OTHERS)。","ПРИМЕЧАНИЕ: ЕСЛИ ШАХТА НЕ ЯВЛЯЕТСЯ БЕТОННОЙ КОНСТРУКЦИЕЙ, ПОЖАЛУЙСТА, УСТАНОВИТЕ КОЛЬЦЕВОЕ ПЕРЕКРЫТИЕ ИЛИ СТАЛЬНУЮ БАЛКУ В СООТВЕТСТВИИ С ПРОТЯЖЕННОСТЬЮ КРЕПЛЕНИЯ РЕЛЬСА (ДРУГИМИ)."
+OH( 4 FLOOR ),OH( 4 ЭТАЖ )
+OPERATION,ЭКСПЛУАТАЦИЯ
+OTHER FLOOR,ДРУГОЙ ЭТАЖ
+PASSENGER,ПАССАЖИР
+PLAN OF MACHINE ROOM,ПЛАН МАШИННОГО ПОМЕЩЕНИЯ
+"PLAN OF MACHINE ROOM 
+ HOLE OF MACHINE ROOM","ПЛАН МАШИННОГО ПОМЕЩЕНИЯ 
+ ОТВЕРСТИЕ МАШИННОГО ПОМЕЩЕНИЯ"
+PLEASE SET UP THE FAN ACCORDING TO THE HEAT EMISSION,"ПОЖАЛУЙСТА, УСТАНОВИТЕ ВЕНТИЛЯТОР В СООТВЕТСТВИИ С ТЕПЛОВЫМИ ВЫПУСКАМИ"
+POWER SWITCH(BY OTHERS),ВЫКЛЮЧАТЕЛЬ ЭЛЕКТРОПИТАНИЯ (ДРУГИМИ)
+R1 CAR BUFFER,БУФЕР КАБИНЫ R1
+R2 CWT BUFFER,R2 БУФЕР CWT
+R3 CAR RAIL A,РЕЛЬС КАБИНЫ R3 A
+R4 CAR RAIL B,Р4 РЕЛЬС КАБИНЫ B
+R5 CWT RAIL C,R5 РЕЛЬС CWT C
+R6 CWT RAIL D,R6 РЕЛЬС CWT D
+REACTION (KN),РЕАКЦИЯ (КН)
+REMARK,ЗАМЕТКА
+ROPES RATIO,Коэффициент канатов
+SCM EL NO.,SCM ЭЛ НОМ.
+SEALING BY CONCRETE AFTER TM INSTALLED,ЗАКРЫТИЕ БЕТОНОМ ПОСЛЕ УСТАНОВКИ ТМ
+SILL BRACKET & ANCHOR BOLT,КРЕПЛЕНИЕ ПОДОКОННИКА И АНКЕРНЫЙ БОЛТ
+SPEC EL NO.,СПЕЦ ЭЛ НОМ.
+SPECIFICATION,ТЕХНИЧЕСКАЯ СПЕЦИФИКАЦИЯ
+SPEED (m/s),СКОРОСТЬ (м/с)
+STOP FLOORS' NAME,НАЗВАНИЕ ЭТАЖЕЙ ОСТАНОВКИ
+TECHNICAL CONDITIONS OF ELEVATOR LAYOUT DRAWING,ТЕХНИЧЕСКИЕ УСЛОВИЯ ЧЕРТЕЖА РАСПОЛОЖЕНИЯ ЛИФТА
+"THE CAR AREA DOES NOT 
+CONFORM TO  EN CODE",ПЛОЩАДЬ КАБИНЫ НЕ СООТВЕТСТВУЕТ НОРМЕ EN
+THE SIZE OF MACHINE ROOM WINDOW OR ENTRANCE SHOULD BE LARGER THAN 1200*1200 IF THE ELEVATOR DEVICES  BE TRANSPORTED THROUGH THOSE PASSAGE. (THE CRANE SUPPLIED BY OTHERS) THE OPENNING SIZE SHOULD BE LARGER THAN 1000*1400 IF THOSE DEVICES BE TRANSPORTED THROUGH THE MACHINE ROOM FLOOR VERTICALLY.(BY OTHERS),"РАЗМЕР ОКНА ИЛИ ВХОДА В МАШИННОЕ ПОМЕЩЕНИЕ ДОЛЖЕН БЫТЬ БОЛЬШЕ 1200*1200, ЕСЛИ ЛИФТОВОЕ ОБОРУДОВАНИЕ ДОЛЖНО БЫТЬ ТРАНСПОРТИРОВАНО ЧЕРЕЗ ЭТИ ПРОХОДЫ. (КРАН, ПРЕДОСТАВЛЕННЫЙ ДРУГИМИ) РАЗМЕР ОТКРЫТИЯ ДОЛЖЕН БЫТЬ БОЛЬШЕ 1000*1400, ЕСЛИ ЭТИ УСТРОЙСТВА ДОЛЖНЫ БЫТЬ ТРАНСПОРТИРОВАНЫ ЧЕРЕЗ ПОЛ МАШИННОГО ПОМЕЩЕНИЯ ВЕРТИКАЛЬНО. (ДРУГИМИ)"
+TM MOTOR (kw),ДВИГАТЕЛЬ ТМ (кВт)
+TM ROPE,ТЯГОВОЙ КАНАТ
+TRAVEL (mm),ХОД (мм)
+USE,USE
+VVVF,VVVF
+WALL FINISHED,ОТДЕЛАННАЯ СТЕНА
+X2-X2,X2-X2
+Ø400,Ø400
+ø25 STEEL BAR,ø25 СТАЛЬНАЯ ПЛИТА
+1080,1080
+1110,1110
+1139,1139
+115,115
+124,124
+180,180
+1800,1800
+1850,1850
+200,200
+2000,2000
+236,236
+250,250
+30,30
+390,390
+45≤H≤80,45≤H≤80
+535,535
+545,545
+600,600
+725,725
+790,790
+BG   1200,BG   1200
+BG   1400,BG   1400
+CAR DEPTH   2100,ГЛУБИНА КАБИНЫ   2100
+CAR WIDTH   1300,ШИРИНА КАБИНЫ   1300
+CH,CH
+CLEAR OPENING   1000,ЧИСТЫЙ ПРОЕМ   1000
+CONCRETE OPENING   1200,БЕТОННЫЙ ПРОЕМ   1200
+HOISTWAY DEPTH 2600,ГЛУБИНА ШАХТЫ 2600
+HOISTWAY WIDTH 2300,ШИРИНА ШАХТЫ 2300
+"LAMP OF HOISTWAY(1.0 M ABOVE CAR ROOF OR PIT FLOOR ≥ 50 LUX, OTHER LOCATIONS ≥ 20 LUX)","СВЕТИЛЬНИК ШАХТЫ (1.0 М НАД КРЫШКОЙ КАБИНЫ ИЛИ ПОЛОМ ЯМЫ ≥ 50 ЛК, В ДРУГИХ МЕСТАХ ≥ 20 ЛК)"
+M/C ROOM H ≥,М/К ПОМЕЩЕНИЕ H ≥
+OVERHEAD,НАД ГОЛОВОЙ
+PIT,PIT
+PLATFORM   1350,ПЛАТФОРМА   1350
+PLATFORM   2249,ПЛАТФОРМА   2249
+RAIL BRACKET PITCH(FROM TOP TO BOTTOM) 1200+1500+1200+1500X9=17400,РАССТОЯНИЕ МЕЖДУ КРЕПЛЕНИЯМИ РЕЛЬСА (СВЕРХУ ВНИЗ) 1200+1500+1200+1500X9=17400
+RAIL PITCH(FROM TOP TO BOTTOM) 5000 X 3 = 15000,ШАГ РЕЛЬСА (СВЕРХУ ВНИЗ) 5000 X 3 = 15000
+TOTAL HEIGHT,ОБЩАЯ ВЫСОТА
+TRAVEL,ХОД
+≥100,≥100
