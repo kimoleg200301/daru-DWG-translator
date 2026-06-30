@@ -8,6 +8,24 @@ from http.client import RemoteDisconnected
 from itertools import zip_longest
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ..config import (
+    OPENAI_DEFAULT_MODEL,
+    get_openai_model_profile,
+    normalize_openai_base_url,
+    normalize_translator_name,
+)
+from .codex_cli import (
+    CODEX_DEFAULT_ANALYSIS_MODEL,
+    CODEX_DEFAULT_ANALYSIS_REASONING_EFFORT,
+    CODEX_DEFAULT_MODEL,
+    CODEX_DEFAULT_REASONING_EFFORT,
+    CODEX_DEFAULT_TIMEOUT_SECONDS,
+    CODEX_REASONING_EFFORTS,
+    CodexCliError,
+    CodexCliTranslator,
+)
+from .analysis import CodexAnalysisReview, CodexAnalysisSession
+
 try:
     from requests.exceptions import ReadTimeout
 except Exception:
@@ -18,14 +36,20 @@ DIM_PLACEHOLDER = "__DXF_DIM__"
 OPENAI_SAFE_TEXT = 100000
 OPENAI_RETRY_ATTEMPTS = 5
 OPENAI_RETRY_DELAY = 3.0
+CODEX_MAX_ITEMS = 50
+CODEX_MAX_CHARS = 40000
+CODEX_ANALYSIS_MAX_ITEMS = 120
+CODEX_ANALYSIS_MAX_CHARS = 12000
 
-OPENAI_REASONING_MODELS = {
-    "gpt-5-chat-latest",
-    "gpt-5-mini",
-    "gpt-5-codex",
-    "gpt-5-pro",
-    "gpt-5",
-}
+
+def _extract_google_free_translation(payload: Any) -> Optional[str]:
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], list):
+        return None
+    parts: List[str] = []
+    for segment in payload[0]:
+        if isinstance(segment, list) and segment and isinstance(segment[0], str):
+            parts.append(segment[0])
+    return "".join(parts) or None
 
 
 def chunked(seq: Sequence[str], size: int) -> Iterable[Sequence[str]]:
@@ -99,17 +123,32 @@ class TranslationEngine:
         openai_base_url: Optional[str] = None,
         openai_project: Optional[str] = None,
         openai_temperature: float = 0.2,
+        openai_reasoning_effort: Optional[str] = None,
+        openai_verbosity: Optional[str] = None,
         openai_strict_mode: Optional[str] = None,
         openai_strict_value: Optional[float] = None,
+        codex_cli_path: Optional[str] = None,
+        codex_model: Optional[str] = None,
+        codex_reasoning_effort: Optional[str] = None,
+        codex_analysis_model: Optional[str] = None,
+        codex_analysis_reasoning_effort: Optional[str] = None,
+        codex_analysis_session: Optional[CodexAnalysisSession] = None,
+        codex_timeout_seconds: int = CODEX_DEFAULT_TIMEOUT_SECONDS,
         system_prompt_template: Optional[str] = None,
     ):
-        self.provider = (provider or "google").lower()
+        self.provider = normalize_translator_name(provider)
         self.source_lang = source_lang or "auto"
         self.target_lang = target_lang or "ru"
         self.deepl_auth_key = deepl_auth_key
-        self.openai_api_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
-        self.openai_model = openai_model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-        self.openai_base_url = openai_base_url or os.environ.get("OPENAI_BASE_URL")
+        self.openai_api_key = (
+            None
+            if self.provider == "codex"
+            else openai_api_key or os.environ.get("OPENAI_API_KEY")
+        )
+        self.openai_model = openai_model or os.environ.get("OPENAI_MODEL", OPENAI_DEFAULT_MODEL)
+        self.openai_base_url = normalize_openai_base_url(
+            openai_base_url or os.environ.get("OPENAI_BASE_URL", "")
+        )
         project_candidate = openai_project or os.environ.get("OPENAI_PROJECT")
         self.openai_project = project_candidate.strip() if project_candidate else None
         self.openai_temperature = openai_temperature
@@ -126,12 +165,56 @@ class TranslationEngine:
         if value_candidate is None:
             value_candidate = 0.5
         self.openai_strict_value = max(0.0, min(1.0, value_candidate))
+        legacy_level = self._strict_descriptor()
+        profile = get_openai_model_profile(self.openai_model)
+        supported_efforts = tuple(profile["reasoning_efforts"])
+        effort_candidate = (
+            openai_reasoning_effort
+            or os.environ.get("OPENAI_REASONING_EFFORT")
+            or (legacy_level if self.openai_strict_mode == "effort" else "")
+        ).strip().lower()
+        if effort_candidate not in supported_efforts:
+            effort_candidate = str(profile["default_reasoning_effort"])
+        self.openai_reasoning_effort = effort_candidate or None
+
+        verbosity_candidate = (
+            openai_verbosity
+            or os.environ.get("OPENAI_VERBOSITY")
+            or (legacy_level if self.openai_strict_mode == "verbosity" else "low")
+        ).strip().lower()
+        self.openai_verbosity = (
+            verbosity_candidate if verbosity_candidate in {"low", "medium", "high"} else "low"
+        )
+        self.codex_cli_path = (codex_cli_path or "").strip()
+        self.codex_model = (codex_model or CODEX_DEFAULT_MODEL).strip()
+        codex_effort = (
+            codex_reasoning_effort or CODEX_DEFAULT_REASONING_EFFORT
+        ).strip().lower()
+        self.codex_reasoning_effort = codex_effort or CODEX_DEFAULT_REASONING_EFFORT
+        self.codex_analysis_model = (
+            codex_analysis_model or CODEX_DEFAULT_ANALYSIS_MODEL
+        ).strip()
+        analysis_effort = (
+            codex_analysis_reasoning_effort
+            or CODEX_DEFAULT_ANALYSIS_REASONING_EFFORT
+        ).strip().lower()
+        self.codex_analysis_reasoning_effort = (
+            analysis_effort
+            if analysis_effort in CODEX_REASONING_EFFORTS
+            else CODEX_DEFAULT_ANALYSIS_REASONING_EFFORT
+        )
+        self.codex_analysis_session = codex_analysis_session or CodexAnalysisSession()
+        self.codex_timeout_seconds = max(10, int(codex_timeout_seconds))
         self.system_prompt_template = system_prompt_template
         self._translator = None
         self._backend = None
         self._translate_batch = None
         self._last_originals: Optional[Sequence[str]] = None
         self._drawing_context: Optional[str] = None
+        self._context_label = "DRAWING"
+        self._document_context_items: List[Dict[str, str]] = []
+        self._document_analysis: Optional[str] = None
+        self._document_analysis_attempted = False
         self._entity_types: Optional[Dict[str, str]] = None
         self._glossary: Dict[str, str] = {}
         self._init_translator()
@@ -139,7 +222,7 @@ class TranslationEngine:
     def _init_translator(self) -> None:
         tried = []
 
-        if self.provider in ("google", "auto", "deep_google"):
+        if self.provider in ("google", "auto"):
             try:
                 from deep_translator import GoogleTranslator  # type: ignore
 
@@ -151,25 +234,8 @@ class TranslationEngine:
                 tried.append("pip install deep-translator")
             except Exception as exc:
                 tried.append(f"deep-translator error: {exc}")
-                if self.provider != "auto":
-                    raise
 
-        if self.provider in ("google", "auto", "googletrans"):
-            try:
-                from googletrans import Translator  # type: ignore
-
-                self._translator = Translator()
-                self._backend = "googletrans"
-                self._translate_batch = self._googletrans_translate_batch
-                return
-            except ImportError:
-                tried.append("pip install googletrans==4.0.0-rc1")
-            except Exception as exc:
-                tried.append(f"googletrans error: {exc}")
-                if self.provider != "auto":
-                    pass
-
-        if self.provider in ("google", "auto", "googletrans", "google_free", "google-free"):
+        if self.provider in ("google", "auto", "google_free", "google-free"):
             self._backend = "google-free"
             self._translate_batch = self._google_free_translate_batch
             return
@@ -192,6 +258,17 @@ class TranslationEngine:
                         raise
             elif self.provider == "deepl":
                 raise RuntimeError("DEEPL_AUTH_KEY не задан")
+
+        if self.provider == "codex":
+            self._translator = CodexCliTranslator(
+                cli_path=self.codex_cli_path,
+                model=self.codex_model,
+                reasoning_effort=self.codex_reasoning_effort,
+                timeout_seconds=self.codex_timeout_seconds,
+            )
+            self._backend = "codex-cli"
+            self._translate_batch = self._codex_translate_batch
+            return
 
         if self.provider in ("chatgpt", "gpt", "openai"):
             if not self.openai_api_key:
@@ -216,6 +293,11 @@ class TranslationEngine:
                     if self.openai_project:
                         client_kwargs["project"] = self.openai_project
                     client = OpenAI(**client_kwargs)
+                    if not hasattr(client, "responses"):
+                        raise RuntimeError(
+                            "Установленный OpenAI SDK не поддерживает Responses API. "
+                            "Обновите пакет: pip install --upgrade \"openai>=2.41.1\""
+                        )
                 except (ImportError, AttributeError, TypeError):
                     mode = "legacy"
                 except Exception as exc:
@@ -225,6 +307,12 @@ class TranslationEngine:
                     mode = None
 
                 if mode == "legacy":
+                    profile = get_openai_model_profile(self.openai_model)
+                    if profile["reasoning_efforts"]:
+                        raise RuntimeError(
+                            "Для моделей GPT-5 требуется openai>=2.41.1 с поддержкой Responses API. "
+                            "Обновите пакет: pip install --upgrade \"openai>=2.41.1\""
+                        )
                     try:
                         openai.api_key = self.openai_api_key
                         if self.openai_base_url:
@@ -272,22 +360,178 @@ class TranslationEngine:
             all_texts: All unique texts from the drawing (for summary).
             entity_types: Optional mapping text -> DXF entity type (TEXT, MTEXT, TABLE, etc.).
         """
+        self.set_document_context(
+            all_texts,
+            context_label="DRAWING",
+            entity_types=entity_types,
+        )
+
+    def set_document_context(
+        self,
+        all_texts: Sequence[str],
+        *,
+        context_label: str = "DOCUMENT",
+        entity_types: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Provide shared context for consistent document translation."""
+
         self._entity_types = dict(entity_types) if entity_types else None
         self._glossary = {}
-        summary_lines = all_texts[:200]
-        preview = "; ".join(
-            (t[:60] + "..." if len(t) > 60 else t) for t in summary_lines
+        self._context_label = context_label.strip().upper() or "DOCUMENT"
+        self._document_analysis = None
+        self._document_analysis_attempted = False
+        self._document_context_items = self._sample_document_context(all_texts)
+        self._drawing_context = "\n".join(
+            (
+                f"[{item['type']}] {item['text']}"
+                if item.get("type")
+                else item["text"]
+            )
+            for item in self._document_context_items
         )
-        if len(all_texts) > 200:
-            preview += f" ... (+{len(all_texts) - 200} more)"
-        self._drawing_context = preview
+
+    def _sample_document_context(
+        self,
+        all_texts: Sequence[str],
+    ) -> List[Dict[str, str]]:
+        values = list(dict.fromkeys(str(text).strip() for text in all_texts))
+        values = [text for text in values if text]
+        if not values:
+            return []
+
+        if len(values) <= CODEX_ANALYSIS_MAX_ITEMS:
+            selected_indices = list(range(len(values)))
+        else:
+            last_index = len(values) - 1
+            selected_indices = sorted(
+                {
+                    round(position * last_index / (CODEX_ANALYSIS_MAX_ITEMS - 1))
+                    for position in range(CODEX_ANALYSIS_MAX_ITEMS)
+                }
+            )
+
+        items: List[Dict[str, str]] = []
+        used_chars = 0
+        for index in selected_indices:
+            source_text = values[index]
+            remaining = CODEX_ANALYSIS_MAX_CHARS - used_chars
+            if remaining <= 0:
+                break
+            sampled_text = source_text[: min(500, remaining)]
+            if not sampled_text:
+                continue
+            item = {
+                "id": f"context-{index}",
+                "text": sampled_text,
+            }
+            if self._entity_types:
+                entity_type = self._entity_types.get(source_text)
+                if entity_type:
+                    item["type"] = entity_type
+            items.append(item)
+            used_chars += len(sampled_text)
+        return items
+
+    def _ensure_codex_document_analysis(self) -> None:
+        if self._document_analysis_attempted or self._backend != "codex-cli":
+            return
+        self._document_analysis_attempted = True
+        if not self._document_context_items:
+            return
+
+        approved = self.codex_analysis_session.approved_text
+        if approved:
+            self._document_analysis = approved
+            return
+
+        translator: CodexCliTranslator = self._translator
+        analyze_document = getattr(translator, "analyze_document", None)
+        if not callable(analyze_document):
+            return
+        source_label = (self.source_lang or "auto").strip() or "auto"
+        target_label = (self.target_lang or "ru").strip() or "ru"
+        instructions = (
+            "Act as a senior technical translation editor. Analyze the representative "
+            f"samples from one {self._context_label.lower()} before translation from "
+            f"{source_label} to {target_label}. Infer the subject, purpose, audience, "
+            "register, recurring abbreviations, and terminology that materially affect "
+            "translation choices. Return a compact document summary, no more than six "
+            "actionable translation guidance points, and no more than twenty high-value "
+            "source-to-target terminology pairs. Write the document summary and all "
+            f"translation guidance in the target language ({target_label}). Do not "
+            "translate every sample and do not include generic advice."
+        )
+        used_fallback = False
+        warning = ""
+        try:
+            analysis = analyze_document(
+                self._document_context_items,
+                instructions=instructions,
+                model=self.codex_analysis_model,
+                reasoning_effort=self.codex_analysis_reasoning_effort,
+            )
+            analysis_text = self._format_document_analysis(analysis)
+        except CodexCliError as exc:
+            used_fallback = True
+            warning = (
+                "Codex CLI не смог сформировать структурированный анализ. "
+                f"Показан исходный контекст документа: {exc}"
+            )
+            analysis_text = self._drawing_context
+        if not analysis_text:
+            used_fallback = True
+            warning = (
+                warning
+                or "Codex CLI вернул пустой анализ. Показан исходный контекст документа."
+            )
+            analysis_text = self._drawing_context
+        if not analysis_text:
+            return
+        self._document_analysis = self.codex_analysis_session.resolve(
+            CodexAnalysisReview(
+                text=analysis_text,
+                model=self.codex_analysis_model,
+                reasoning_effort=self.codex_analysis_reasoning_effort,
+                context_label=self._context_label,
+                used_fallback=used_fallback,
+                warning=warning,
+            )
+        )
+
+    @staticmethod
+    def _format_document_analysis(analysis: Dict[str, Any]) -> Optional[str]:
+        summary = str(analysis.get("document_summary") or "").strip()
+        guidance = analysis.get("translation_guidance") or []
+        terminology = analysis.get("terminology") or []
+        sections: List[str] = []
+        if summary:
+            sections.append(f"Document summary: {summary}")
+        clean_guidance = [
+            str(item).strip() for item in guidance if str(item).strip()
+        ][:8]
+        if clean_guidance:
+            sections.append(
+                "Translation guidance:\n"
+                + "\n".join(f"- {item}" for item in clean_guidance)
+            )
+        term_lines = []
+        for item in terminology[:24]:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or "").strip()
+            target = str(item.get("target") or "").strip()
+            if source and target:
+                term_lines.append(f'"{source}" -> "{target}"')
+        if term_lines:
+            sections.append("Preferred terminology:\n" + "\n".join(term_lines))
+        return "\n\n".join(sections) or None
 
     def translate_many(self, texts: Sequence[str]) -> List[str]:
         if not texts:
             return []
         prepared = [prepare_for_translation(t) for t in texts]
         reset_required = False
-        if self._backend == "chatgpt":
+        if self._backend in {"chatgpt", "codex-cli"}:
             self._last_originals = list(texts)
             reset_required = True
         try:
@@ -308,46 +552,12 @@ class TranslationEngine:
         try:
             return list(self._translator.translate_batch(list(texts)))  # type: ignore[attr-defined]
         except AttributeError:
-            return [self._translator.translate(t) for t in texts]  # type: ignore[attr-defined]
-
-    def _googletrans_translate_batch(self, texts: Sequence[str]) -> List[str]:
-        results: List[str] = []
-        translator = self._translator
-
-        def _extract_texts(translation_result) -> List[str]:
-            if isinstance(translation_result, list):
-                items = translation_result
-            else:
-                items = [translation_result]
-            texts_out: List[str] = []
-            for item in items:
-                text = getattr(item, "text", None)
-                if text is None:
-                    return []
-                texts_out.append(text)
-            return texts_out
-
-        def _fallback_chunk(chunk: Sequence[str]) -> List[str]:
-            chunk_results: List[str] = []
-            for piece in chunk:
-                try:
-                    single = translator.translate(piece, src=self.source_lang, dest=self.target_lang)
-                    text = getattr(single, "text", None)
-                    chunk_results.append(text if text is not None else piece)
-                except Exception:
-                    chunk_results.append(piece)
-            return chunk_results
-
-        for chunk in chunked(texts, 30):
             try:
-                translated = translator.translate(list(chunk), src=self.source_lang, dest=self.target_lang)
-                chunk_results = _extract_texts(translated)
-                if len(chunk_results) != len(chunk):
-                    raise ValueError("unexpected googletrans response length")
+                return [self._translator.translate(t) for t in texts]  # type: ignore[attr-defined]
             except Exception:
-                chunk_results = _fallback_chunk(chunk)
-            results.extend(chunk_results)
-        return results
+                return self._google_free_translate_batch(texts)
+        except Exception:
+            return self._google_free_translate_batch(texts)
 
     def _deepl_translate_batch(self, texts: Sequence[str]) -> List[str]:
         translator = self._translator
@@ -385,6 +595,122 @@ class TranslationEngine:
             results.extend(chunk_results)
 
         return results
+
+    def _codex_translate_batch(self, texts: Sequence[str]) -> List[str]:
+        originals = list(self._last_originals or texts)
+        results = list(texts)
+        split_jobs: List[Tuple[str, int, int, str]] = []
+        part_counts: Dict[int, int] = {}
+        part_sources: Dict[Tuple[int, int], str] = {}
+
+        for original_index, text in enumerate(texts):
+            parts = self._split_openai_payload(text, CODEX_MAX_CHARS)
+            part_counts[original_index] = len(parts)
+            for part_index, part in enumerate(parts):
+                job_id = f"{original_index}:{part_index}"
+                split_jobs.append((job_id, original_index, part_index, part))
+                part_sources[(original_index, part_index)] = part
+
+        batches: List[List[Tuple[str, int, int, str]]] = []
+        current: List[Tuple[str, int, int, str]] = []
+        current_chars = 0
+        for job in split_jobs:
+            job_chars = len(job[3])
+            if current and (
+                len(current) >= CODEX_MAX_ITEMS
+                or current_chars + job_chars > CODEX_MAX_CHARS
+            ):
+                batches.append(current)
+                current = []
+                current_chars = 0
+            current.append(job)
+            current_chars += job_chars
+        if current:
+            batches.append(current)
+
+        assembled_parts: Dict[int, Dict[int, str]] = {}
+        self._ensure_codex_document_analysis()
+        instructions = self._codex_system_content()
+        translator: CodexCliTranslator = self._translator
+        for batch in batches:
+            items: List[Dict[str, str]] = []
+            for job_id, original_index, _part_index, text in batch:
+                item = {"id": job_id, "text": text}
+                if self._entity_types:
+                    original = (
+                        originals[original_index]
+                        if original_index < len(originals)
+                        else text
+                    )
+                    entity_type = self._entity_types.get(original)
+                    if entity_type:
+                        item["type"] = entity_type
+                items.append(item)
+
+            translated_values = translator.translate(items, instructions=instructions)
+            for job, translated in zip(batch, translated_values):
+                _job_id, original_index, part_index, source_part = job
+                assembled_parts.setdefault(original_index, {})[part_index] = translated
+                if translated and translated != source_part:
+                    original = (
+                        originals[original_index]
+                        if original_index < len(originals)
+                        else source_part
+                    )
+                    self._glossary[original.strip()] = translated.strip()
+
+        for original_index, source_text in enumerate(texts):
+            total_parts = part_counts.get(original_index, 0)
+            translated_parts = assembled_parts.get(original_index, {})
+            combined = [
+                translated_parts.get(
+                    part_index,
+                    part_sources.get((original_index, part_index), ""),
+                )
+                for part_index in range(total_parts)
+            ]
+            translated_text = "".join(combined)
+            results[original_index] = translated_text if translated_text else source_text
+        return results
+
+    def _codex_system_content(self) -> str:
+        source_label = (self.source_lang or "auto").strip()
+        target_label = (self.target_lang or "ru").strip() or "ru"
+        if source_label.lower() == "auto":
+            source_label = "auto-detected"
+
+        if self.system_prompt_template:
+            content = self.system_prompt_template.replace(
+                "{source_lang}", source_label
+            ).replace("{target_lang}", target_label)
+        else:
+            content = (
+                "You are a professional technical translator of engineering documents. "
+                f"Translate every provided value from {source_label} to {target_label}. "
+                "All values belong to the same document; keep terminology consistent. "
+                "Preserve numbers, identifiers, placeholders such as '__DXF_DIM__', "
+                "format markers, tabs, line breaks, and DXF control sequences."
+            )
+        if self._document_analysis:
+            content += (
+                f"\n\n[{self._context_label} PRE-TRANSLATION ANALYSIS]:\n"
+                + self._document_analysis
+            )
+        elif self._drawing_context:
+            content += (
+                f"\n\n[{self._context_label} CONTEXT - all texts for reference]:\n"
+                + self._drawing_context
+            )
+        if self._glossary:
+            glossary_lines = [
+                f'"{source}" -> "{target}"'
+                for source, target in list(self._glossary.items())[:100]
+            ]
+            content += (
+                "\n\n[GLOSSARY - use these translations consistently]:\n"
+                + "\n".join(glossary_lines)
+            )
+        return content
 
     def _chatgpt_translate_batch(self, texts: Sequence[str]) -> List[str]:
         originals = list(self._last_originals or [])
@@ -592,7 +918,7 @@ class TranslationEngine:
             )
         if self._drawing_context:
             system_content += (
-                "\n\n[DRAWING CONTEXT — all texts from this drawing for reference]:\n"
+                f"\n\n[{self._context_label} CONTEXT — all texts for reference]:\n"
                 + self._drawing_context
             )
         if self._glossary:
@@ -755,14 +1081,15 @@ class TranslationEngine:
         return results
 
     def _openai_generation_kwargs(self, model: Optional[str], *, for_responses: bool = False) -> Dict[str, Any]:
-        model_key = (model or "").lower()
-        if model_key in OPENAI_REASONING_MODELS:
-            if self.openai_strict_mode == "effort":
-                effort = self._reasoning_effort_value()
-                if effort and not for_responses:
-                    return {"reasoning_effort": effort}
+        profile = get_openai_model_profile(model or "")
+        if profile["reasoning_efforts"]:
+            effort = self._reasoning_effort_value(model)
+            if effort and not for_responses:
+                return {"reasoning_effort": effort}
             return {}
-        return {"temperature": self.openai_temperature}
+        if profile["supports_temperature"]:
+            return {"temperature": self.openai_temperature}
+        return {}
 
     def _should_retry_openai(self, exc: Exception) -> bool:
         if isinstance(exc, (ReadTimeout, RemoteDisconnected)):
@@ -808,32 +1135,24 @@ class TranslationEngine:
         formatted: List[Dict[str, Any]] = []
         for message in messages:
             role = str(message.get("role") or "user")
+            if role == "system":
+                role = "developer"
             content = message.get("content", "")
             if isinstance(content, list):
                 formatted.append({"role": role, "content": content})
                 continue
-            formatted.append(
-                {
-                    "role": role,
-                    "content": [{"type": "text", "text": str(content)}],
-                }
-            )
+            formatted.append({"role": role, "content": str(content)})
         return formatted
 
     def _openai_responses_text_config(self, model: Optional[str]) -> Dict[str, Any]:
         config: Dict[str, Any] = {"format": {"type": "json_object"}}
-        model_key = (model or "").lower()
-        if model_key in OPENAI_REASONING_MODELS and self.openai_strict_mode == "verbosity":
-            config["verbosity"] = self._strict_descriptor()
+        profile = get_openai_model_profile(model or "")
+        if profile["supports_verbosity"]:
+            config["verbosity"] = self.openai_verbosity
         return config
 
     def _openai_responses_reasoning(self, model: Optional[str]) -> Optional[Dict[str, str]]:
-        model_key = (model or "").lower()
-        if model_key not in OPENAI_REASONING_MODELS:
-            return None
-        if self.openai_strict_mode != "effort":
-            return None
-        effort = self._reasoning_effort_value()
+        effort = self._reasoning_effort_value(model)
         return {"effort": effort} if effort else None
 
     def _openai_metadata(self) -> Dict[str, str]:
@@ -856,10 +1175,13 @@ class TranslationEngine:
         if response_id:
             print(f"[OpenAI] response stored: {response_id}")
 
-    def _reasoning_effort_value(self) -> Optional[str]:
-        descriptor = self._strict_descriptor()
-        mapping = {"low": "low", "medium": "medium", "high": "high"}
-        return mapping.get(descriptor)
+    def _reasoning_effort_value(self, model: Optional[str] = None) -> Optional[str]:
+        profile = get_openai_model_profile(model or self.openai_model)
+        efforts = tuple(profile["reasoning_efforts"])
+        if self.openai_reasoning_effort in efforts:
+            return self.openai_reasoning_effort
+        fallback = str(profile["default_reasoning_effort"])
+        return fallback if fallback in efforts else None
 
     def _response_text(self, response_obj: object) -> str:
         text_value = getattr(response_obj, "output_text", None)
@@ -877,24 +1199,18 @@ class TranslationEngine:
         return "".join(fragments)
 
     def _openai_reasoning_note(self, model: Optional[str]) -> str:
-        model_key = (model or "").lower()
-        if model_key not in OPENAI_REASONING_MODELS:
+        effort = self._reasoning_effort_value(model)
+        if not effort:
             return ""
-        param = self.openai_strict_mode if self.openai_strict_mode in {"verbosity", "effort"} else "verbosity"
-        level = self._strict_descriptor()
-        if param == "effort":
-            mapping = {
-                "low": "Keep reasoning effort minimal to prioritise speed over exhaustive detail.",
-                "medium": "Balance reasoning effort to maintain accuracy without unnecessary verbosity.",
-                "high": "Apply high reasoning effort to maximise translation accuracy and nuance.",
-            }
-            return mapping.get(level, "")
         mapping = {
-            "low": "Keep the response concise while still delivering an accurate translation.",
-            "medium": "Provide a balanced level of detail to ensure clarity and accuracy.",
-            "high": "Provide exhaustive detail to ensure every nuance of the translation is captured.",
+            "none": "Prioritise a direct, low-latency translation.",
+            "minimal": "Use minimal reasoning while preserving translation accuracy.",
+            "low": "Use efficient reasoning and prioritise terminology consistency.",
+            "medium": "Balance reasoning depth, accuracy, and latency.",
+            "high": "Apply careful reasoning to maximise translation accuracy and nuance.",
+            "xhigh": "Apply the highest available reasoning effort to difficult translation ambiguities.",
         }
-        return mapping.get(level, "")
+        return mapping.get(effort, "")
 
     def _strict_descriptor(self) -> str:
         value = self.openai_strict_value
@@ -926,10 +1242,10 @@ class TranslationEngine:
             url = f"https://translate.googleapis.com/translate_a/single?{base_query}&{q}"
 
             try:
-                with urllib.request.urlopen(url) as resp:
+                with urllib.request.urlopen(url, timeout=15) as resp:
                     payload = resp.read().decode("utf-8")
                 data = _json.loads(payload)
-                translation = data[0][0][0] if isinstance(data, list) and data and isinstance(data[0], list) else None
+                translation = _extract_google_free_translation(data)
             except Exception:
                 translation = None
 
@@ -952,8 +1268,16 @@ def auto_translate(
     openai_base_url: Optional[str] = None,
     openai_project: Optional[str] = None,
     openai_temperature: float = 0.2,
+    openai_reasoning_effort: Optional[str] = None,
+    openai_verbosity: Optional[str] = None,
     openai_strict_mode: Optional[str] = None,
     openai_strict_value: Optional[float] = None,
+    codex_cli_path: Optional[str] = None,
+    codex_model: Optional[str] = None,
+    codex_reasoning_effort: Optional[str] = None,
+    codex_analysis_model: Optional[str] = None,
+    codex_analysis_reasoning_effort: Optional[str] = None,
+    codex_timeout_seconds: int = CODEX_DEFAULT_TIMEOUT_SECONDS,
 ) -> List[str]:
     engine = TranslationEngine(
         provider=provider,
@@ -965,7 +1289,15 @@ def auto_translate(
         openai_base_url=openai_base_url,
         openai_project=openai_project,
         openai_temperature=openai_temperature,
+        openai_reasoning_effort=openai_reasoning_effort,
+        openai_verbosity=openai_verbosity,
         openai_strict_mode=openai_strict_mode,
         openai_strict_value=openai_strict_value,
+        codex_cli_path=codex_cli_path,
+        codex_model=codex_model,
+        codex_reasoning_effort=codex_reasoning_effort,
+        codex_analysis_model=codex_analysis_model,
+        codex_analysis_reasoning_effort=codex_analysis_reasoning_effort,
+        codex_timeout_seconds=codex_timeout_seconds,
     )
     return engine.translate_many(texts)

@@ -9,6 +9,13 @@ from typing import Any, Callable, ContextManager, Dict, List, Optional, Tuple
 
 import ezdxf
 
+from ..translation.analysis import CodexAnalysisSession
+from ..translation.checkpoint import (
+    TranslationCheckpointStore,
+    default_checkpoint_path,
+    file_sha256,
+    stable_text_id,
+)
 from ..translation.engine import TranslationEngine
 from ..utils.io import (
     ensure_parent,
@@ -54,13 +61,17 @@ def _prepare_output_destination(path: Path, fmt: str) -> Path:
     return path.with_suffix(suffix)
 
 
-def apply_translations(doc, pairs: List[Tuple[str, str]], style_font: Optional[str] = None) -> None:
-    if style_font:
-        applier.STYLE_FONT = style_font
-    ru_style = applier.ensure_ru_style(doc)
+def apply_translations(
+    doc,
+    pairs: List[Tuple[str, str]],
+    style_font: Optional[str] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> None:
+    resolver = applier.FontStyleResolver(doc, style_font, log)
+    ru_style = ""
     for layout in [doc.modelspace(), *[l for l in doc.layouts if l.name != "Model"]]:
-        applier.walk_layout(layout, pairs, ru_style)
-    applier.walk_blocks(doc, pairs, ru_style)
+        applier.walk_layout(layout, pairs, ru_style, resolver)
+    applier.walk_blocks(doc, pairs, ru_style, resolver)
 
 
 def translate_dxf(
@@ -77,8 +88,17 @@ def translate_dxf(
     openai_base_url: Optional[str] = None,
     openai_project: Optional[str] = None,
     openai_temperature: float = 0.2,
+    openai_reasoning_effort: Optional[str] = None,
+    openai_verbosity: Optional[str] = None,
     openai_strict_mode: Optional[str] = None,
     openai_strict_value: Optional[float] = None,
+    codex_cli_path: Optional[str] = None,
+    codex_model: Optional[str] = None,
+    codex_reasoning_effort: Optional[str] = None,
+    codex_analysis_model: Optional[str] = None,
+    codex_analysis_reasoning_effort: Optional[str] = None,
+    codex_analysis_session: Optional[CodexAnalysisSession] = None,
+    codex_timeout_seconds: int = 300,
     output_format: Optional[str] = None,
     map_path: Optional[Path] = None,
     save_map: bool = True,
@@ -87,6 +107,8 @@ def translate_dxf(
     save_txt: bool = True,
     log: Optional[Callable[[str], None]] = None,
     translation_context_factory: Optional[Callable[[str], ContextManager[Any]]] = None,
+    checkpoint_path: Optional[Path] = None,
+    resume_policy: str = "auto",
 ) -> Dict[str, Any]:
     logger = log or (lambda message: None)
 
@@ -102,33 +124,36 @@ def translate_dxf(
         doc = ezdxf.readfile(str(processing_input))
 
         freq, entity_types = extractor.extract_text_counts_and_types(doc)
+    document_hash = file_sha256(input_path)
     sorted_items = extractor.sort_frequency(freq)
     english_texts = [text for text, _ in sorted_items]
+    checkpoint_store = TranslationCheckpointStore(
+        path=checkpoint_path or default_checkpoint_path(input_path, "cad"),
+        job_type="cad",
+        document_sha256=document_hash,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        translator=translator_name,
+        resume_policy=resume_policy,
+        log=logger,
+    )
     logger(f"Найдено {len(english_texts)} текстовых элементов для перевода")
     cache_lookup_path: Optional[Path] = None
     if map_path:
         cache_lookup_path = map_path
     elif DEFAULT_MAP_CACHE.exists():
         cache_lookup_path = DEFAULT_MAP_CACHE
-    translation_cache = read_map_csv(cache_lookup_path)
-    if translation_cache and cache_lookup_path:
-        logger(f"Loaded {len(translation_cache)} cached translations from {cache_lookup_path}")
+    checkpoint_cache = checkpoint_store.text_map("cad")
+    translation_cache = dict(checkpoint_cache)
+    if checkpoint_cache:
+        logger(f"Checkpoint: loaded {len(checkpoint_cache)} CAD translations")
+    csv_cache = read_map_csv(cache_lookup_path)
+    if csv_cache and cache_lookup_path:
+        logger(f"Loaded {len(csv_cache)} cached translations from {cache_lookup_path}")
+        for key, value in csv_cache.items():
+            translation_cache.setdefault(key, value)
 
-    translator = TranslationEngine(
-        provider=translator_name,
-        source_lang=source_lang,
-        target_lang=target_lang,
-        deepl_auth_key=deepl_key,
-        openai_api_key=openai_key,
-        openai_model=openai_model,
-        openai_base_url=openai_base_url,
-        openai_project=openai_project,
-        openai_temperature=openai_temperature,
-        openai_strict_mode=openai_strict_mode,
-        openai_strict_value=openai_strict_value,
-    )
-    logger(f"Инициализирован движок перевода: {translator.backend_name()}")
-    translator.set_drawing_context(english_texts, entity_types=entity_types)
+    backend_name = "cached-checkpoint" if checkpoint_cache else "cached-map"
 
     context_factory = translation_context_factory or (lambda _msg: nullcontext())
     logger("Начинаем перевод... [0%]")
@@ -148,6 +173,32 @@ def translate_dxf(
     if total_items == 0 or not unique_pending:
         logger("Начинаем перевод... [100%]")
     else:
+        translator = TranslationEngine(
+            provider=translator_name,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            deepl_auth_key=deepl_key,
+            openai_api_key=openai_key,
+            openai_model=openai_model,
+            openai_base_url=openai_base_url,
+            openai_project=openai_project,
+            openai_temperature=openai_temperature,
+            openai_reasoning_effort=openai_reasoning_effort,
+            openai_verbosity=openai_verbosity,
+            openai_strict_mode=openai_strict_mode,
+            openai_strict_value=openai_strict_value,
+            codex_cli_path=codex_cli_path,
+            codex_model=codex_model,
+            codex_reasoning_effort=codex_reasoning_effort,
+            codex_analysis_model=codex_analysis_model,
+            codex_analysis_reasoning_effort=codex_analysis_reasoning_effort,
+            codex_analysis_session=codex_analysis_session,
+            codex_timeout_seconds=codex_timeout_seconds,
+        )
+        backend_name = translator.backend_name()
+        checkpoint_store.set_backend(backend_name)
+        logger(f"Инициализирован движок перевода: {backend_name}")
+        translator.set_drawing_context(english_texts, entity_types=entity_types)
         processed = cached_hits
         batch_size = max(1, len(unique_pending) // 20)
         with context_factory("Переводим..."):
@@ -156,9 +207,16 @@ def translate_dxf(
                 translated_chunk = translator.translate_many(chunk_texts)
                 for original_text, translated_text in zip(chunk_texts, translated_chunk):
                     translation_cache[original_text] = translated_text
+                    checkpoint_store.upsert(
+                        namespace="cad",
+                        block_id=stable_text_id("cad", original_text),
+                        source_text=original_text,
+                        translated_text=translated_text,
+                    )
                     for text_index in text_to_indices.get(original_text, []):
                         translation_slots[text_index] = translated_text
                         processed += 1
+                checkpoint_store.save()
                 percent = min(100, int(processed / total_items * 100)) if total_items else 100
                 logger(f"Начинаем перевод... [{percent}%]")
         if processed < total_items:
@@ -196,7 +254,7 @@ def translate_dxf(
     pairs = list(zip(english_texts, russian_texts))
     pairs.sort(key=lambda x: -len(x[0]))
     logger("Применяем переводы к DXF")
-    apply_translations(doc, pairs, style_font=style_font)
+    apply_translations(doc, pairs, style_font=style_font, log=logger)
 
     final_output_path = _prepare_output_destination(output_path, final_format)
     ensure_parent(final_output_path)
@@ -219,11 +277,12 @@ def translate_dxf(
 
     return {
         "output_path": final_output_path,
-        "backend": translator.backend_name(),
+        "backend": backend_name,
         "map_saved": bool(save_map and map_path),
         "extracted_txt_saved": bool(save_txt and extracted_txt_path),
         "translated_txt_saved": bool(save_txt and translated_txt_path),
         "items_translated": len(english_texts),
+        "checkpoint_path": checkpoint_store.path,
     }
 
 
@@ -256,8 +315,20 @@ def run_pipeline(args: argparse.Namespace) -> None:
             openai_base_url=getattr(args, "openai_base_url", None),
             openai_project=getattr(args, "openai_project", None),
             openai_temperature=getattr(args, "openai_temperature", 0.2),
+            openai_reasoning_effort=getattr(args, "openai_reasoning_effort", None),
+            openai_verbosity=getattr(args, "openai_verbosity", None),
             openai_strict_mode=getattr(args, "openai_strict_mode", None),
             openai_strict_value=getattr(args, "openai_strict_value", None),
+            codex_cli_path=getattr(args, "codex_cli_path", None),
+            codex_model=getattr(args, "codex_model", None),
+            codex_reasoning_effort=getattr(args, "codex_reasoning_effort", None),
+            codex_analysis_model=getattr(args, "codex_analysis_model", None),
+            codex_analysis_reasoning_effort=getattr(
+                args,
+                "codex_analysis_reasoning_effort",
+                None,
+            ),
+            codex_timeout_seconds=getattr(args, "codex_timeout_seconds", 300),
             output_format=output_format_cli,
             map_path=map_path,
             save_map=not args.no_map,
@@ -265,6 +336,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             translated_txt_path=translated_txt_path,
             save_txt=not args.skip_txt,
             log=cli_log,
+            resume_policy="reset" if args.restart_translation else "auto",
             translation_context_factory=(
                 (lambda msg: Spinner(colorize(msg, "30"), enabled=sys.stdout.isatty()))
                 if sys.stdout.isatty()
@@ -288,18 +360,69 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extracted-txt", default="extracted_texts.txt", help="TXT с исходным текстом")
     parser.add_argument("--translated-txt", default="extracted_texts_ru.txt", help="TXT с переводом")
     parser.add_argument("--skip-txt", action="store_true", help="Не сохранять TXT-файлы")
+    parser.add_argument(
+        "--restart-translation",
+        action="store_true",
+        help="Сбросить checkpoint и начать перевод заново",
+    )
     parser.add_argument("--translator", default="google", help="Движок перевода")
     parser.add_argument("--source-lang", default="en", help="Язык оригинала")
     parser.add_argument("--target-lang", default="ru", help="Язык перевода")
-    parser.add_argument("--style-font", help="Имя TTF-файла для стиля шрифта кириллицы")
+    parser.add_argument(
+        "--style-font",
+        help="Имя TTF/SHX-файла для кириллицы или original для исходных стилей",
+    )
     parser.add_argument("--deepl-key", help="Ключ DeepL")
     parser.add_argument("--openai-key", help="Ключ OpenAI")
     parser.add_argument("--openai-model", help="Модель OpenAI")
     parser.add_argument("--openai-base-url", help="Базовый URL для OpenAI-совместимого API")
     parser.add_argument("--openai-project", help="Идентификатор проекта OpenAI")
     parser.add_argument("--openai-temperature", type=float, default=0.2, help="Температура генерации")
-    parser.add_argument("--openai-strict-mode", choices=["verbosity", "effort"], help="Параметр строгого режима")
-    parser.add_argument("--openai-strict-value", type=float, help="Значение verbosity/effort (0.0-1.0)")
+    parser.add_argument(
+        "--openai-reasoning-effort",
+        choices=["none", "minimal", "low", "medium", "high", "xhigh"],
+        help="Уровень reasoning.effort для reasoning-моделей OpenAI",
+    )
+    parser.add_argument(
+        "--openai-verbosity",
+        choices=["low", "medium", "high"],
+        help="Уровень text.verbosity для GPT-5 моделей",
+    )
+    parser.add_argument(
+        "--openai-strict-mode",
+        choices=["verbosity", "effort"],
+        help="Устаревший параметр совместимости; используйте --openai-reasoning-effort/--openai-verbosity",
+    )
+    parser.add_argument(
+        "--openai-strict-value",
+        type=float,
+        help="Устаревшее значение совместимости 0.0-1.0",
+    )
+    parser.add_argument("--codex-cli-path", help="Путь к исполняемому файлу Codex CLI")
+    parser.add_argument("--codex-model", default="gpt-5.4-mini", help="Модель Codex CLI")
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        choices=["low", "medium", "high", "xhigh"],
+        default="low",
+        help="Уровень reasoning для Codex CLI",
+    )
+    parser.add_argument(
+        "--codex-analysis-model",
+        default="gpt-5.5",
+        help="Модель Codex CLI для предварительного анализа",
+    )
+    parser.add_argument(
+        "--codex-analysis-reasoning-effort",
+        choices=["low", "medium", "high", "xhigh"],
+        default="high",
+        help="Уровень reasoning Codex CLI для предварительного анализа",
+    )
+    parser.add_argument(
+        "--codex-timeout-seconds",
+        type=int,
+        default=300,
+        help="Таймаут одного вызова Codex CLI",
+    )
     parser.add_argument("--output-format", choices=["dwg", "dxf"], default="dwg", help="Формат итогового файла")
     return parser.parse_args()
 

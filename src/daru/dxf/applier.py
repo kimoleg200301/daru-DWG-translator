@@ -4,10 +4,13 @@ import argparse
 import csv
 import re
 import sys
-from typing import Dict, List, Tuple
+import unicodedata
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import ezdxf
+from ezdxf.fonts import fonts
 
+from ..config import ORIGINAL_FONT_VALUE, normalize_style_font
 from .entities import (
     ENTITY_TARGETS,
     get_dim_override_text,
@@ -23,6 +26,13 @@ from .entities import (
 
 STYLE_NAME = "RU"
 STYLE_FONT = "Arial.ttf"
+FALLBACK_FONT_CANDIDATES = (
+    "DejaVuSans.ttf",
+    "ArialUnicode.ttf",
+    "NotoSans-Regular.ttf",
+    "Arial.ttf",
+    "SegoeUI.ttf",
+)
 
 
 def _strip_count_prefix(s: str) -> str:
@@ -66,43 +76,175 @@ def load_map_from_txt_pair(en_txt: str, ru_txt: str) -> List[Tuple[str, str]]:
     return pairs
 
 
-def ensure_ru_style(doc) -> str:
+def ensure_ru_style(doc, style_font: str = STYLE_FONT, style_name: str = STYLE_NAME) -> str:
     styles = doc.styles
-    if STYLE_NAME not in styles:
-        styles.new(STYLE_NAME, dxfattribs={"font": STYLE_FONT})
+    if style_name not in styles:
+        styles.new(style_name, dxfattribs={"font": style_font})
     else:
         try:
-            styles.get(STYLE_NAME).dxf.font = STYLE_FONT
+            styles.get(style_name).dxf.font = style_font
         except Exception:
             pass
-    return STYLE_NAME
+    return style_name
 
 
-def process_entity(e, pairs: List[Tuple[str, str]], ru_style: str):
+def _text_codepoints(text: str) -> Set[int]:
+    return {
+        ord(char)
+        for char in str(text or "")
+        if not char.isspace() and not unicodedata.category(char).startswith("C")
+    }
+
+
+def _font_supports_text(font_name: str, text: str) -> Tuple[bool, str]:
+    if not font_name or not fonts.font_manager.has_font(font_name):
+        return False, "unavailable"
+    codepoints = _text_codepoints(text)
+    if not codepoints:
+        return True, ""
+    suffix = str(font_name).lower()
+    try:
+        if suffix.endswith((".shx", ".shp")):
+            cache = fonts.font_manager.get_shapefile_glyph_cache(font_name)
+            available = set(cache.font.shapes)
+        elif suffix.endswith(".lff"):
+            cache = fonts.font_manager.get_lff_glyph_cache(font_name)
+            available = set(cache.font)
+        else:
+            cmap = fonts.font_manager.get_ttf_font(font_name).getBestCmap() or {}
+            available = set(cmap)
+    except Exception:
+        return False, "unavailable"
+    return (True, "") if codepoints.issubset(available) else (False, "missing_glyphs")
+
+
+def _style_font_name(doc, style_name: str) -> str:
+    try:
+        style = doc.styles.get(style_name)
+    except Exception:
+        return ""
+    font_name = str(style.dxf.get("font", "") or "").strip()
+    if font_name:
+        return font_name
+    try:
+        family, italic, bold = style.get_extended_font_data()
+        if family:
+            face = fonts.font_manager.find_best_match(
+                family=family,
+                italic=italic,
+                weight=700 if bold else 400,
+            )
+            if face is not None:
+                return fonts.find_font_file_name(face)
+    except Exception:
+        pass
+    return ""
+
+
+class FontStyleResolver:
+    """Resolve a text style per entity without mutating module-global state."""
+
+    def __init__(
+        self,
+        doc,
+        style_font: Optional[str],
+        log: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self.doc = doc
+        self.style_font = normalize_style_font(style_font or STYLE_FONT) or STYLE_FONT
+        self.original_mode = self.style_font == ORIGINAL_FONT_VALUE
+        self.log = log or (lambda _message: None)
+        self._fallback_styles: Dict[str, str] = {}
+        self._warned: Set[Tuple[str, str]] = set()
+
+    def style_for_entity(self, entity, translated_text: str) -> str:
+        if not self.original_mode:
+            return self._fallback_style(self.style_font)
+
+        original_style = str(entity.dxf.get("style", "Standard") or "Standard")
+        font_name = _style_font_name(self.doc, original_style)
+        supported, reason = _font_supports_text(font_name, translated_text)
+        if supported:
+            return original_style
+
+        fallback_font = self._find_fallback_font(translated_text)
+        self._warn_once(font_name or original_style, reason, fallback_font)
+        return self._fallback_style(fallback_font)
+
+    def _find_fallback_font(self, text: str) -> str:
+        for font_name in FALLBACK_FONT_CANDIDATES:
+            supported, _reason = _font_supports_text(font_name, text)
+            if supported:
+                return font_name
+        return STYLE_FONT
+
+    def _fallback_style(self, font_name: str) -> str:
+        cached = self._fallback_styles.get(font_name)
+        if cached:
+            return cached
+        if not self.original_mode:
+            resolved = ensure_ru_style(self.doc, font_name)
+            self._fallback_styles[font_name] = resolved
+            return resolved
+        style_name = STYLE_NAME
+        suffix = 2
+        while style_name in self.doc.styles:
+            style_name = f"{STYLE_NAME}_{suffix}"
+            suffix += 1
+        resolved = ensure_ru_style(self.doc, font_name, style_name)
+        self._fallback_styles[font_name] = resolved
+        return resolved
+
+    def _warn_once(self, font_name: str, reason: str, fallback_font: str) -> None:
+        key = (font_name.casefold(), reason)
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        if reason == "missing_glyphs":
+            detail = "не содержит всех символов перевода"
+        else:
+            detail = "недоступен в системе"
+        self.log(
+            f"CAD: исходный шрифт «{font_name}» {detail}; "
+            f"используется {fallback_font}"
+        )
+
+
+def process_entity(
+    e,
+    pairs: List[Tuple[str, str]],
+    ru_style: str,
+    style_resolver: Optional[FontStyleResolver] = None,
+):
     dxft = e.dxftype()
 
     if dxft == "TEXT":
         t = e.dxf.text or ""
-        e.dxf.text = translate_text_keep_dim_and_mtext_controls(t, pairs)
-        if ru_style:
-            e.dxf.style = ru_style
+        new_t = translate_text_keep_dim_and_mtext_controls(t, pairs)
+        e.dxf.text = new_t
+        target_style = style_resolver.style_for_entity(e, new_t) if style_resolver else ru_style
+        if target_style:
+            e.dxf.style = target_style
 
     elif dxft == "MTEXT":
         t = safe_mtext_text(e)
         new_t = translate_text_keep_dim_and_mtext_controls(t, pairs)
         safe_set_mtext(e, new_t)
-        if ru_style:
+        target_style = style_resolver.style_for_entity(e, new_t) if style_resolver else ru_style
+        if target_style:
             try:
-                e.dxf.style = ru_style
+                e.dxf.style = target_style
             except Exception:
                 pass
 
     elif dxft in ("ATTRIB", "ATTDEF"):
         t = e.dxf.text or ""
-        e.dxf.text = translate_text_keep_dim_and_mtext_controls(t, pairs)
-        if ru_style:
+        new_t = translate_text_keep_dim_and_mtext_controls(t, pairs)
+        e.dxf.text = new_t
+        target_style = style_resolver.style_for_entity(e, new_t) if style_resolver else ru_style
+        if target_style:
             try:
-                e.dxf.style = ru_style
+                e.dxf.style = target_style
             except Exception:
                 pass
 
@@ -128,17 +270,27 @@ def process_entity(e, pairs: List[Tuple[str, str]], ru_style: str):
             pass
 
 
-def walk_layout(layout, pairs: List[Tuple[str, str]], ru_style: str):
+def walk_layout(
+    layout,
+    pairs: List[Tuple[str, str]],
+    ru_style: str,
+    style_resolver: Optional[FontStyleResolver] = None,
+):
     for e in layout:
         if e.dxftype() in ENTITY_TARGETS:
-            process_entity(e, pairs, ru_style)
+            process_entity(e, pairs, ru_style, style_resolver)
 
 
-def walk_blocks(doc, pairs: List[Tuple[str, str]], ru_style: str):
+def walk_blocks(
+    doc,
+    pairs: List[Tuple[str, str]],
+    ru_style: str,
+    style_resolver: Optional[FontStyleResolver] = None,
+):
     for block in doc.blocks:
         for e in block:
             if e.dxftype() in ENTITY_TARGETS:
-                process_entity(e, pairs, ru_style)
+                process_entity(e, pairs, ru_style, style_resolver)
 
 
 def parse_args():
@@ -147,15 +299,19 @@ def parse_args():
     p.add_argument("mapping", help="map.csv (text_en,text_ru) ИЛИ translated.txt (русский TXT)")
     p.add_argument("output_dxf", help="Выходной DXF (русский)")
     p.add_argument("--source-en", help="Исходный EN TXT ([count] text). Обязателен, если mapping=*.txt без EN.")
-    p.add_argument("--style-font", help=f"TTF шрифт для стиля {STYLE_NAME} (по умолчанию {STYLE_FONT})")
+    p.add_argument(
+        "--style-font",
+        help=(
+            f"TTF/SHX шрифт для стиля {STYLE_NAME} или original "
+            f"(по умолчанию {STYLE_FONT})"
+        ),
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    global STYLE_FONT
-    if args.style_font:
-        STYLE_FONT = args.style_font
+    style_font = args.style_font or STYLE_FONT
 
     mapping_path = args.mapping.lower()
     if mapping_path.endswith(".csv"):
@@ -174,12 +330,12 @@ def main():
         sys.exit(3)
 
     doc = ezdxf.readfile(args.input_dxf)
-    ru_style = ensure_ru_style(doc)
-    walk_layout(doc.modelspace(), pairs, ru_style)
+    resolver = FontStyleResolver(doc, style_font, print)
+    walk_layout(doc.modelspace(), pairs, "", resolver)
     for layout in doc.layouts:
         if layout.name != "Model":
-            walk_layout(layout, pairs, ru_style)
-    walk_blocks(doc, pairs, ru_style)
+            walk_layout(layout, pairs, "", resolver)
+    walk_blocks(doc, pairs, "", resolver)
     doc.saveas(args.output_dxf)
     print("Saved:", args.output_dxf)
 

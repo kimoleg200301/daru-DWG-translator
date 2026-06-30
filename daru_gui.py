@@ -9,7 +9,7 @@ _src = Path(__file__).resolve().parent / "src"
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
-from src.daru.gui.app import main  # noqa: E402
+from daru.gui.app import main  # noqa: E402
 
 if __name__ == "__main__":
     main()

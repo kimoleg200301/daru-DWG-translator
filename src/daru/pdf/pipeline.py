@@ -7,6 +7,8 @@ This wrapper provides clean imports while allowing gradual decomposition.
 from ._core import (  # noqa: F401
     PDF_TYPE_NATIVE,
     PDF_TYPE_SCANNED,
+    PDF_PROCESSING_TEXTRACT,
+    PDF_PROCESSING_TEXTRACT_VISION,
     PdfProcessingConfig,
     PdfProcessingResult,
     PageImage,
@@ -38,15 +40,19 @@ from ._core import (  # noqa: F401
     images_to_pdf,
     save_translation_mapping,
     load_translation_mapping,
+    load_translation_stable_mapping,
     load_translation_canonicals,
     TEXTRACT_LOG_PATH,
     _CACHE_DIR,
     TRANSLATABLE_BLOCK_TYPES,
 )
+from .native import NativePage, NativeTextUnit  # noqa: F401
 
 __all__ = [
     "PDF_TYPE_NATIVE",
     "PDF_TYPE_SCANNED",
+    "PDF_PROCESSING_TEXTRACT",
+    "PDF_PROCESSING_TEXTRACT_VISION",
     "PdfProcessingConfig",
     "PdfProcessingResult",
     "PageImage",
@@ -78,8 +84,11 @@ __all__ = [
     "images_to_pdf",
     "save_translation_mapping",
     "load_translation_mapping",
+    "load_translation_stable_mapping",
     "load_translation_canonicals",
     "TEXTRACT_LOG_PATH",
     "_CACHE_DIR",
     "TRANSLATABLE_BLOCK_TYPES",
+    "NativePage",
+    "NativeTextUnit",
 ]

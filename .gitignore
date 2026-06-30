@@ -1,27 +1,95 @@
-# Игнорировать папку Applications в корне репозитория
+# Случайные системные/прикладные директории
 /Applications/
-
-# (опционально) Игнорировать любые папки с именем Applications на любых уровнях
 **/Applications/
 
-/dist/
-/build/
+# Python bytecode / caches
 __pycache__/
+**/__pycache__/
 *.py[cod]
-*.egg-info/
-*.egg
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
 
-# Virtual environment
+# Virtual environments
 .venv/
+venv/
+env/
+ENV/
 
-# IDE
+# Packaging / build artifacts
+/build/
+/dist/
+/site/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+*.manifest
+*.spec.tmp
+
+# PyInstaller generated internals
+*.toc
+*.pkg
+
+# IDE / editor
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Cache / data
-cache/
+# Secrets / local settings
+.env
+.env.*
+!.env.example
+*.secret
+*.local
+.daru_gui_settings.json
+
+# Runtime caches / generated data
+/cache/
+/.cache/
+**/.cache/
+/src/daru/pdf/cache/
+/tmp/
+/out/
+/output/
+/outputs/
+/exports/
+/expotrs/
+/models/
+/анализ */
 *.log
+*.tmp
+*.bak
+
+# Translation and OCR intermediate files
+/map_auto.csv
+*.checkpoint.json
+*.translation.json
+*.output.json
+textract-cache.jsonl
+*textract-cache*.jsonl
+
+# Generated translated documents/drawings
+*-translated.pdf
+*-translated.docx
+*-translated.dxf
+*-translated.dwg
+*_translated.pdf
+*_translated.docx
+*_translated.dxf
+*_translated.dwg

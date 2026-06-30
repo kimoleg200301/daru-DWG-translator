@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daru"
-version = "1.0.0"
-description = "Automatic localization of DWG/DXF engineering drawings and PDF documents"
+dynamic = ["version"]
+description = "Automatic localization of DWG/DXF, PDF, and DOCX documents"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,16 +13,16 @@ dependencies = [
     "boto3",
     "ezdxf",
     "deep-translator",
-    "googletrans==4.0.0-rc1",
     "deepl",
-    "openai",
+    "openai>=2.41.1",
     "pdf2image",
     "pytesseract",
     "PyPDF2",
-    "pymupdf",
+    "pymupdf>=1.27.2.2",
     "Pillow",
     "opencv-python",
     "easyocr",
+    "lxml",
 ]
 
 [project.optional-dependencies]
@@ -34,3 +34,6 @@ daru-translate = "daru.dxf.pipeline:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "daru.__version__"}

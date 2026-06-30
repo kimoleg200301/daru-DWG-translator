@@ -3,13 +3,13 @@ pyinstaller
 boto3
 ezdxf
 deep-translator
-googletrans==4.0.0-rc1
 deepl
-openai
+openai>=2.41.1
 pdf2image
 pytesseract
 PyPDF2
-pymupdf
+pymupdf>=1.27.2.2
 Pillow
 opencv-python
 easyocr
+lxml

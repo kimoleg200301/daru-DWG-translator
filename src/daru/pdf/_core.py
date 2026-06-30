@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,24 @@ import re
 from io import BytesIO
 import numpy as np
 
+from daru.config import ORIGINAL_FONT_VALUE, normalize_style_font
+from daru.pdf.vision import (
+    CodexCliVisionLayoutRefiner,
+    CodexCliVisionQaReviewer,
+    OpenAIVisionLayoutRefiner,
+    OpenAIVisionQaReviewer,
+    VisionBlockUpdate,
+    VisionQaIssue,
+    VISION_IMAGE_QUALITIES,
+    VISION_IMAGE_QUALITY_STABLE,
+    VISION_REQUEST_MODE_BATCHED,
+    VISION_REQUEST_MODES,
+)
+from daru.translation.analysis import CodexAnalysisSession
+from daru.translation.checkpoint import (
+    TranslationCheckpointStore,
+    default_checkpoint_path,
+)
 from daru.translation.engine import TranslationEngine, chunked
 
 try:  # pragma: no cover - optional dependency guards
@@ -54,6 +73,8 @@ BBoxWH = Tuple[int, int, int, int]  # (x, y, w, h)
 
 PDF_TYPE_SCANNED = "scanned"
 PDF_TYPE_NATIVE = "native"
+PDF_PROCESSING_TEXTRACT = "textract"
+PDF_PROCESSING_TEXTRACT_VISION = "textract_vision"
 TRANSLATABLE_BLOCK_TYPES: Set[str] = {"TEXT", "TITLE", "LIST", "CELL", "KEY", "VALUE"}
 FIGURE_BLOCK_TYPES: Set[str] = {"LAYOUT_FIGURE", "FIGURE"}
 # Use a dedicated cache folder next to this script instead of a generic logs/ path.
@@ -65,6 +86,20 @@ TEXTRACT_LOG_PATH = _CACHE_DIR / "textract_requests.log"
 
 def _noop_log(_message: str) -> None:
     return
+
+
+def _resolve_scanned_style_font(
+    style_font: Optional[str],
+    log: PdfLog,
+) -> Optional[str]:
+    resolved = normalize_style_font(style_font or "")
+    if resolved == ORIGINAL_FONT_VALUE:
+        log(
+            "PDF: для отсканированной страницы невозможно надежно определить "
+            "исходное семейство шрифта; используется Unicode-шрифт по умолчанию"
+        )
+        return None
+    return resolved or None
 
 
 def _require_dependency(obj: object, message: str) -> None:
@@ -167,7 +202,7 @@ class PdfProcessingConfig:
     min_box_height: int = 8
     merge_line_y_ratio: float = 0.6
     merge_x_gap_ratio: float = 1.0
-    textract_split_lines: bool = True
+    textract_split_lines: bool = False
     textract_vertical_aspect_ratio: float = 2.2
     textract_vertical_top_margin_ratio: float = 0.15 # добавляет больше рабочую область переведенного вертикального текста
     text_bold_fill_ratio: float = 0.45
@@ -180,6 +215,17 @@ class PdfProcessingConfig:
     max_region_margin_ratio: float = 0.2
     textract_bbox_height_boost: float = 0.15 # добавляет больше рабочую область переведенного текста
     textract_bbox_width_boost: float = 0.1
+    vision_backend: str = "openai_api"
+    vision_model: Optional[str] = "gpt-5.5"
+    vision_reasoning_effort: Optional[str] = "medium"
+    vision_api_key: Optional[str] = None
+    vision_base_url: Optional[str] = None
+    vision_project: Optional[str] = None
+    vision_codex_cli_path: Optional[str] = None
+    vision_codex_timeout_seconds: int = 300
+    vision_request_mode: str = VISION_REQUEST_MODE_BATCHED
+    vision_image_quality: str = VISION_IMAGE_QUALITY_STABLE
+    vision_cache_path: Optional[Path] = None
 
     def normalized(self) -> "PdfProcessingConfig":
         blur = self.blur_kernel_size if self.blur_kernel_size % 2 == 1 else self.blur_kernel_size + 1
@@ -223,6 +269,34 @@ class PdfProcessingConfig:
             max_region_margin_ratio=max(0.05, min(0.9, self.max_region_margin_ratio)),
             textract_bbox_height_boost=max(0.0, min(0.5, self.textract_bbox_height_boost)),
             textract_bbox_width_boost=max(0.0, min(0.5, self.textract_bbox_width_boost)),
+            vision_backend=(
+                str(self.vision_backend or "openai_api").strip().lower()
+                if str(self.vision_backend or "openai_api").strip().lower()
+                in {"openai_api", "codex_cli"}
+                else "openai_api"
+            ),
+            vision_model=self.vision_model or "gpt-5.5",
+            vision_reasoning_effort=self.vision_reasoning_effort or "medium",
+            vision_api_key=self.vision_api_key or None,
+            vision_base_url=self.vision_base_url or None,
+            vision_project=self.vision_project or None,
+            vision_codex_cli_path=self.vision_codex_cli_path or None,
+            vision_codex_timeout_seconds=max(
+                10, int(self.vision_codex_timeout_seconds or 300)
+            ),
+            vision_request_mode=(
+                str(self.vision_request_mode or VISION_REQUEST_MODE_BATCHED).strip().lower()
+                if str(self.vision_request_mode or VISION_REQUEST_MODE_BATCHED).strip().lower()
+                in VISION_REQUEST_MODES
+                else VISION_REQUEST_MODE_BATCHED
+            ),
+            vision_image_quality=(
+                str(self.vision_image_quality or VISION_IMAGE_QUALITY_STABLE).strip().lower()
+                if str(self.vision_image_quality or VISION_IMAGE_QUALITY_STABLE).strip().lower()
+                in VISION_IMAGE_QUALITIES
+                else VISION_IMAGE_QUALITY_STABLE
+            ),
+            vision_cache_path=Path(self.vision_cache_path) if self.vision_cache_path else None,
         )
 
 
@@ -245,6 +319,7 @@ class PageImage:
     width: int
     height: int
     dpi: int
+    physical_size_points: Optional[Tuple[float, float]] = None
 
 
 @dataclass
@@ -296,9 +371,22 @@ class RegionInfo:
     translated_text: Optional[str] = None
     mask: Optional["np.ndarray"] = None  # text mask in ROI coordinates
     font_size_estimate: int = 12
+    source_font_size_estimate: int = 0
+    rendered_font_size: int = 0
     is_vertical: bool = False
     is_bold: bool = False
+    font_weight: str = "auto"
     is_table_cell: bool = False
+    stable_id: str = ""
+    alignment: str = "left"
+    confidence: float = 0.0
+    parent_block_id: Optional[str] = None
+    content_bbox: Optional[BBoxWH] = None
+    corrected_text: str = ""
+    semantic_type: str = "unknown"
+    fit_strategy: str = "default"
+    vision_confidence: float = 0.0
+    qa_flags: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -318,6 +406,9 @@ class LineRegion:
     source_text: str
     translated_text: Optional[str] = None
     word_boxes: List[BBoxWH] = field(default_factory=list)
+    confidence: float = 0.0
+    rotation_deg: float = 0.0
+    parent_block_id: Optional[str] = None
 
 
 @dataclass
@@ -336,6 +427,21 @@ class BlockRegion:
     render_id: Optional[int] = None
     word_boxes: List[BBoxWH] = field(default_factory=list)
     is_table: bool = False
+    confidence: float = 0.0
+    rotation_deg: float = 0.0
+    parent_block_id: Optional[str] = None
+    parent_block_type: Optional[str] = None
+    parent_bbox: Optional[Tuple[int, int, int, int]] = None
+    alignment: str = "left"
+    font_weight: str = "auto"
+    stable_id: str = ""
+    should_translate: bool = True
+    render_enabled: bool = True
+    corrected_text: str = ""
+    semantic_type: str = "unknown"
+    fit_strategy: str = "default"
+    vision_confidence: float = 0.0
+    qa_flags: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -394,6 +500,31 @@ def _bbox_intersection_area_wh(a: BBoxWH, b: BBoxWH) -> int:
     return int((inter_x1 - inter_x0) * (inter_y1 - inter_y0))
 
 
+def _bbox_intersection_ratio(
+    inner: Tuple[int, int, int, int],
+    outer: Tuple[int, int, int, int],
+) -> float:
+    ix0 = max(inner[0], outer[0])
+    iy0 = max(inner[1], outer[1])
+    ix1 = min(inner[2], outer[2])
+    iy1 = min(inner[3], outer[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    inter_area = float((ix1 - ix0) * (iy1 - iy0))
+    inner_area = float(max(1, (inner[2] - inner[0]) * (inner[3] - inner[1])))
+    return inter_area / inner_area
+
+
+def _median_float(values: Sequence[float], default: float = 0.0) -> float:
+    clean = sorted(float(value) for value in values if value is not None)
+    if not clean:
+        return default
+    middle = len(clean) // 2
+    if len(clean) % 2:
+        return clean[middle]
+    return (clean[middle - 1] + clean[middle]) / 2.0
+
+
 # === Pipeline components ======================================================
 
 
@@ -419,10 +550,32 @@ class PageLoader:
 
     def _load_pdf(self, pdf_path: Path) -> List[PageImage]:
         images = pdf_to_images(pdf_path, self.config.render_dpi, self.config.image_format, self.log)
+        physical_sizes: List[Optional[Tuple[float, float]]] = [None] * len(images)
+        try:
+            import fitz  # type: ignore
+
+            document = fitz.open(str(pdf_path))
+            try:
+                for idx in range(min(len(images), len(document))):
+                    rect = document[idx].rect
+                    physical_sizes[idx] = (float(rect.width), float(rect.height))
+            finally:
+                document.close()
+        except Exception:
+            pass
         pages: List[PageImage] = []
         for idx, image in enumerate(images):
             width, height = image.size
-            pages.append(PageImage(page_index=idx, image=image, width=width, height=height, dpi=self.config.render_dpi))
+            pages.append(
+                PageImage(
+                    page_index=idx,
+                    image=image,
+                    width=width,
+                    height=height,
+                    dpi=self.config.render_dpi,
+                    physical_size_points=physical_sizes[idx],
+                )
+            )
         return pages
 
     def _load_image(self, image_path: Path) -> PageImage:
@@ -636,6 +789,8 @@ class TextractLayoutExtractor:
             bbox = self._bbox_from_geometry(block.get("Geometry"), page_width, page_height)
             if not bbox:
                 continue
+            confidence = float(block.get("Confidence") or 0.0)
+            rotation_deg = self._rotation_from_geometry(block.get("Geometry"))
             word_boxes: List[BBoxWH] = []
             for rel in block.get("Relationships", []) or []:
                 if str(rel.get("Type", "")).upper() != "CHILD":
@@ -660,6 +815,8 @@ class TextractLayoutExtractor:
                     bbox=bbox,
                     source_text=text,
                     word_boxes=word_boxes,
+                    confidence=confidence,
+                    rotation_deg=rotation_deg,
                 )
             )
         lines.sort(key=lambda ln: (ln.bbox[1], ln.bbox[0]))
@@ -680,6 +837,22 @@ class TextractLayoutExtractor:
         blocks: List[BlockRegion] = []
         figure_blocks: List[Dict[str, object]] = []
         figure_line_ids: Set[str] = set()
+        if allow_figures and page_image is not None:
+            figure_blocks = [
+                block
+                for block in blocks_by_id.values()
+                if str(block.get("BlockType", "")).upper() in FIGURE_BLOCK_TYPES
+            ]
+            for figure_block in figure_blocks:
+                figure_id = str(figure_block.get("Id", ""))
+                if figure_id:
+                    figure_line_ids.update(
+                        self._collect_line_ids_from_block(
+                            figure_id,
+                            blocks_by_id,
+                            set(),
+                        )
+                    )
         has_table_cells = any(
             str(block.get("BlockType", "")).upper() in {"CELL", "MERGED_CELL"} for block in blocks_by_id.values()
         )
@@ -711,10 +884,6 @@ class TextractLayoutExtractor:
         for block in blocks_by_id.values():
             block_type_raw = str(block.get("BlockType", "")).upper()
             if block_type_raw in FIGURE_BLOCK_TYPES and allow_figures and page_image is not None:
-                figure_blocks.append(block)
-                block_id = str(block.get("Id", ""))
-                if block_id:
-                    figure_line_ids.update(self._collect_line_ids_from_block(block_id, blocks_by_id, set()))
                 continue
             if has_table_cells and block_type_raw in {"TABLE", "LAYOUT_TABLE"}:
                 blocks.extend(
@@ -786,6 +955,8 @@ class TextractLayoutExtractor:
             if figure_container:
                 blocks.append(figure_container)
             blocks.extend(child_blocks)
+        self._finalize_block_metadata(blocks)
+        blocks = self._deduplicate_blocks(blocks)
         blocks.sort(key=lambda b: (b.bbox[1], b.bbox[0]))
         return blocks
 
@@ -845,6 +1016,35 @@ class TextractLayoutExtractor:
             return []
 
         blocks_out: List[BlockRegion] = []
+        parent_id = str(block.get("Id", "")) or None
+        parent_bbox = self._bbox_from_geometry(block.get("Geometry"), page_width, page_height)
+        if block_type == "LIST" and line_regions:
+            groups = self._group_list_lines(line_regions)
+            base_id = str(block.get("Id", ""))
+            for idx, group in enumerate(groups):
+                for line in group:
+                    used_line_ids.add(line.line_id)
+                group_bbox = _union_bbox([line.bbox for line in group]) or group[0].bbox
+                blocks_out.append(
+                    BlockRegion(
+                        page_index=page_index,
+                        block_id=f"{base_id}:item:{idx}" if base_id else f"list:item:{idx}",
+                        block_type=block_type,
+                        bbox=group_bbox,
+                        lines=list(group),
+                        source_text="\n".join(
+                            line.source_text.strip()
+                            for line in group
+                            if line.source_text.strip()
+                        ),
+                        confidence=_median_float([line.confidence for line in group]),
+                        rotation_deg=_median_float([line.rotation_deg for line in group]),
+                        parent_block_id=parent_id,
+                        parent_block_type=block_type,
+                        parent_bbox=parent_bbox,
+                    )
+                )
+            return blocks_out
         split_lines = bool(getattr(self.config, "textract_split_lines", False))
         split_by_gap = split_lines and self._should_split_lines_by_horizontal_gap(line_regions)
         if split_by_gap and line_regions:
@@ -860,6 +1060,11 @@ class TextractLayoutExtractor:
                         lines=[ln],
                         cells=[],
                         source_text=ln.source_text,
+                        confidence=ln.confidence,
+                        rotation_deg=ln.rotation_deg,
+                        parent_block_id=parent_id,
+                        parent_block_type=block_type,
+                        parent_bbox=parent_bbox,
                     )
                 )
             return blocks_out
@@ -885,9 +1090,31 @@ class TextractLayoutExtractor:
                 lines=line_regions,
                 cells=[],
                 source_text=source_text,
+                parent_block_id=parent_id,
+                parent_block_type=block_type,
+                parent_bbox=parent_bbox,
             )
         )
         return blocks_out
+
+    def _group_list_lines(self, lines: Sequence[LineRegion]) -> List[List[LineRegion]]:
+        ordered = sorted(lines, key=lambda line: (line.bbox[1], line.bbox[0]))
+        if len(ordered) <= 1:
+            return [list(ordered)] if ordered else []
+        heights = [max(1, line.bbox[3] - line.bbox[1]) for line in ordered]
+        median_height = _median_float(heights, 1.0)
+        bullet_re = re.compile(r"^(?:[-*•▪◦◇◆]|\(?\d+[.)])\s*")
+        groups: List[List[LineRegion]] = [[ordered[0]]]
+        for line in ordered[1:]:
+            previous = groups[-1][-1]
+            vertical_gap = max(0, line.bbox[1] - previous.bbox[3])
+            starts_item = bool(bullet_re.match(line.source_text.strip()))
+            same_indent = abs(line.bbox[0] - groups[-1][0].bbox[0]) <= median_height
+            if starts_item or (same_indent and vertical_gap > median_height * 0.75):
+                groups.append([line])
+            else:
+                groups[-1].append(line)
+        return groups
 
     def _line_center_in_any_bbox(self, line: LineRegion, bboxes: Sequence[Tuple[int, int, int, int]]) -> bool:
         if not bboxes:
@@ -961,6 +1188,9 @@ class TextractLayoutExtractor:
                     source_text=source_text,
                     word_boxes=word_boxes,
                     is_table=True,
+                    parent_block_id=base_id or None,
+                    parent_block_type="LAYOUT_TABLE",
+                    parent_bbox=bbox,
                 )
             )
         return blocks_out
@@ -1061,6 +1291,9 @@ class TextractLayoutExtractor:
             source_text=text.strip(),
             word_boxes=word_boxes,
             is_table=True,
+            parent_block_id=str(cell_block.get("Id", "")) or None,
+            parent_block_type="CELL",
+            parent_bbox=bbox,
         )
 
     def _build_merged_cell_block(
@@ -1112,6 +1345,9 @@ class TextractLayoutExtractor:
             source_text=source_text,
             word_boxes=word_boxes,
             is_table=True,
+            parent_block_id=str(merged_block.get("Id", "")) or None,
+            parent_block_type="MERGED_CELL",
+            parent_bbox=bbox,
         )
 
     def _build_figure_block(
@@ -1143,13 +1379,22 @@ class TextractLayoutExtractor:
         ordered_lines.sort(key=lambda ln: (ln.bbox[1], ln.bbox[0]))
         for line in ordered_lines:
             used_line_ids.add(line.line_id)
-        # Delegate figure text detection to a dedicated Textract pass on the cropped region.
-        detected_blocks = self._analyze_figure_region(bbox, page_image, block_id=str(block.get("Id", "")))
+        figure_id = str(block.get("Id", ""))
+        usable_lines = [line for line in ordered_lines if self._is_usable_figure_line(line)]
+        if usable_lines:
+            detected_blocks = self._figure_blocks_from_lines(
+                usable_lines,
+                figure_id=figure_id,
+                figure_bbox=bbox,
+                page_index=page_index,
+            )
+        else:
+            detected_blocks = self._analyze_figure_region(bbox, page_image, block_id=figure_id)
         container: Optional[BlockRegion] = None
         if bbox:
             container = BlockRegion(
                 page_index=page_index,
-                block_id=str(block.get("Id", "")),
+                block_id=figure_id,
                 block_type="FIGURE",
                 bbox=bbox,
                 lines=[],
@@ -1158,6 +1403,61 @@ class TextractLayoutExtractor:
                 source_text="",
             )
         return container, detected_blocks
+
+    def _is_usable_figure_line(self, line: LineRegion) -> bool:
+        text = re.sub(r"\s+", " ", str(line.source_text or "")).strip()
+        if not text:
+            return False
+        if line.confidence and line.confidence < max(40.0, float(self.config.min_confidence) - 10.0):
+            return False
+        alnum_count = sum(character.isalnum() for character in text)
+        letter_count = sum(character.isalpha() for character in text)
+        if alnum_count < 2 or (letter_count == 0 and alnum_count < 4):
+            return False
+        if len(text) <= 3 and text.isupper():
+            # Short diagram labels such as "AND" are meaningful. Keep them only
+            # when Textract is highly confident; this still rejects common OCR
+            # fragments such as "#2", stray punctuation, and uncertain initials.
+            if line.confidence < 90.0 or letter_count < 2:
+                return False
+        symbols = sum(not character.isalnum() and not character.isspace() for character in text)
+        return symbols <= max(4, int(len(text) * 0.55))
+
+    def _figure_blocks_from_lines(
+        self,
+        lines: Sequence[LineRegion],
+        *,
+        figure_id: str,
+        figure_bbox: Optional[Tuple[int, int, int, int]],
+        page_index: int,
+    ) -> List[BlockRegion]:
+        groups = self._group_layout_table_lines(lines)
+        output: List[BlockRegion] = []
+        for idx, group in enumerate(groups):
+            bbox = _union_bbox([line.bbox for line in group])
+            if bbox is None:
+                continue
+            text = "\n".join(line.source_text.strip() for line in group if line.source_text.strip()).strip()
+            if not text:
+                continue
+            word_boxes = [box for line in group for box in line.word_boxes]
+            output.append(
+                BlockRegion(
+                    page_index=page_index,
+                    block_id=f"{figure_id}:text:{idx}",
+                    block_type="TEXT",
+                    bbox=bbox,
+                    lines=list(group),
+                    source_text=text,
+                    word_boxes=word_boxes,
+                    confidence=_median_float([line.confidence for line in group]),
+                    rotation_deg=_median_float([line.rotation_deg for line in group]),
+                    parent_block_id=figure_id or None,
+                    parent_block_type="FIGURE",
+                    parent_bbox=figure_bbox,
+                )
+            )
+        return output
 
     def _analyze_figure_region(self, bbox: Optional[Tuple[int, int, int, int]], page: PageImage, block_id: str) -> List[BlockRegion]:
         if not bbox:
@@ -1212,8 +1512,10 @@ class TextractLayoutExtractor:
         )
 
         # Shift sub-block coordinates back to original page space.
-        shifted_blocks: List[BlockRegion] = []
+        shifted_lines: List[LineRegion] = []
         for line in lines.values():
+            if not self._is_usable_figure_line(line):
+                continue
             lx0, ly0, lx1, ly1 = line.bbox
             shifted_bbox = (lx0 + x0, ly0 + y0, lx1 + x0, ly1 + y0)
             shifted_word_boxes: List[BBoxWH] = []
@@ -1226,19 +1528,140 @@ class TextractLayoutExtractor:
                 source_text=line.source_text,
                 translated_text=line.translated_text,
                 word_boxes=shifted_word_boxes,
+                confidence=line.confidence,
+                rotation_deg=line.rotation_deg,
+                parent_block_id=block_id or None,
             )
-            shifted_blocks.append(
-                BlockRegion(
-                    page_index=page.page_index,
-                    block_id=f"{block_id}-LINE-{line.line_id}",
-                    block_type="TEXT",
-                    bbox=shifted_bbox,
-                    lines=[shifted_line],
-                    cells=[],
-                    source_text=line.source_text,
+            shifted_lines.append(shifted_line)
+        return self._figure_blocks_from_lines(
+            shifted_lines,
+            figure_id=block_id,
+            figure_bbox=bbox,
+            page_index=page.page_index,
+        )
+
+    def _finalize_block_metadata(self, blocks: Sequence[BlockRegion]) -> None:
+        for block in blocks:
+            if block.block_type not in TRANSLATABLE_BLOCK_TYPES:
+                continue
+            if block.lines:
+                for line in block.lines:
+                    if line.parent_block_id is None:
+                        line.parent_block_id = block.parent_block_id or block.block_id
+                if not block.word_boxes:
+                    block.word_boxes = [box for line in block.lines for box in line.word_boxes]
+                if block.confidence <= 0:
+                    block.confidence = _median_float([line.confidence for line in block.lines])
+                if abs(block.rotation_deg) < 1e-6:
+                    block.rotation_deg = _median_float([line.rotation_deg for line in block.lines])
+            block.alignment = self._infer_alignment(block)
+
+    def _infer_alignment(self, block: BlockRegion) -> str:
+        if block.block_type == "TITLE":
+            return "center"
+        content_bbox = _block_content_bbox(block) or block.bbox
+        container = block.parent_bbox or block.bbox
+        if content_bbox is None:
+            return "left"
+        left_gap = max(0, content_bbox[0] - container[0])
+        right_gap = max(0, container[2] - content_bbox[2])
+        width = max(1, container[2] - container[0])
+        if abs(left_gap - right_gap) <= width * 0.12:
+            return "center"
+        if right_gap <= width * 0.08 and left_gap > right_gap * 1.5:
+            return "right"
+        return "left"
+
+    def _deduplicate_blocks(self, blocks: Sequence[BlockRegion]) -> List[BlockRegion]:
+        blocks = self._remove_table_text_overlays(blocks)
+        kept: List[BlockRegion] = []
+        removed = 0
+
+        def priority(block: BlockRegion) -> Tuple[int, float, int]:
+            type_priority = {
+                "CELL": 5,
+                "TITLE": 4,
+                "LIST": 4,
+                "KEY": 4,
+                "VALUE": 4,
+                "TEXT": 3,
+            }.get(block.block_type, 1)
+            return (type_priority, block.confidence, len(block.source_text or ""))
+
+        for block in blocks:
+            if block.block_type not in TRANSLATABLE_BLOCK_TYPES:
+                kept.append(block)
+                continue
+            canonical = re.sub(r"\s+", " ", str(block.source_text or "")).strip().casefold()
+            if not canonical:
+                continue
+            duplicate_index: Optional[int] = None
+            for idx, previous in enumerate(kept):
+                if previous.block_type not in TRANSLATABLE_BLOCK_TYPES:
+                    continue
+                previous_canonical = re.sub(
+                    r"\s+", " ", str(previous.source_text or "")
+                ).strip().casefold()
+                if canonical != previous_canonical:
+                    continue
+                overlap = max(
+                    _bbox_intersection_ratio(block.bbox, previous.bbox),
+                    _bbox_intersection_ratio(previous.bbox, block.bbox),
                 )
-            )
-        return shifted_blocks
+                if overlap >= 0.78:
+                    duplicate_index = idx
+                    break
+            if duplicate_index is None:
+                kept.append(block)
+                continue
+            removed += 1
+            previous = kept[duplicate_index]
+            if priority(block) > priority(previous):
+                kept[duplicate_index] = block
+        if removed:
+            self.log(f"Textract: удалено геометрических дублей блоков: {removed}")
+        return kept
+
+    def _remove_table_text_overlays(self, blocks: Sequence[BlockRegion]) -> List[BlockRegion]:
+        cells = [
+            block
+            for block in blocks
+            if block.block_type == "CELL" and block.bbox[2] > block.bbox[0] and block.bbox[3] > block.bbox[1]
+        ]
+        if not cells:
+            return list(blocks)
+
+        def intersection_area(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> int:
+            x0 = max(a[0], b[0])
+            y0 = max(a[1], b[1])
+            x1 = min(a[2], b[2])
+            y1 = min(a[3], b[3])
+            if x1 <= x0 or y1 <= y0:
+                return 0
+            return (x1 - x0) * (y1 - y0)
+
+        filtered: List[BlockRegion] = []
+        removed = 0
+        for block in blocks:
+            if block.block_type == "CELL" or block.block_type not in TRANSLATABLE_BLOCK_TYPES or block.is_table:
+                filtered.append(block)
+                continue
+            area = max(1, (block.bbox[2] - block.bbox[0]) * (block.bbox[3] - block.bbox[1]))
+            overlap_area = 0
+            overlap_cells = 0
+            for cell in cells:
+                inter = intersection_area(block.bbox, cell.bbox)
+                if inter <= 0:
+                    continue
+                overlap_area += inter
+                overlap_cells += 1
+            if overlap_cells >= 2 and overlap_area / float(area) >= 0.45:
+                removed += 1
+                continue
+            filtered.append(block)
+        if removed:
+            self.log(f"Textract: removed table text overlays: {removed}")
+        return filtered
 
     def _collect_text(
         self,
@@ -1342,6 +1765,31 @@ class TextractLayoutExtractor:
         if x1 <= x0 or y1 <= y0:
             return None
         return (x0, y0, x1, y1)
+
+    def _rotation_from_geometry(self, geometry: Optional[Dict[str, object]]) -> float:
+        if not isinstance(geometry, dict):
+            return 0.0
+        try:
+            explicit = geometry.get("RotationAngle")
+            if explicit is not None:
+                return float(explicit) % 360.0
+        except Exception:
+            pass
+        polygon = geometry.get("Polygon")
+        if not isinstance(polygon, list) or len(polygon) < 2:
+            return 0.0
+        try:
+            first = polygon[0]
+            second = polygon[1]
+            dx = float(second.get("X", 0.0)) - float(first.get("X", 0.0))
+            dy = float(second.get("Y", 0.0)) - float(first.get("Y", 0.0))
+            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                return 0.0
+            angle = math.degrees(math.atan2(dy, dx)) % 360.0
+            nearest = round(angle / 90.0) * 90.0
+            return nearest % 360.0 if abs(angle - nearest) <= 8.0 else angle
+        except Exception:
+            return 0.0
 
     def _dedup_and_sort_lines(self, lines: Sequence[LineRegion]) -> List[LineRegion]:
         seen: Dict[str, LineRegion] = {}
@@ -1792,6 +2240,7 @@ class RegionAnalyzer:
             translated_text=None,
             mask=mask,
             font_size_estimate=font_height,
+            source_font_size_estimate=font_height,
         )
 
     def _estimate_font_size_from_segments(self, merged_region: MergedRegion, fallback_height: int) -> int:
@@ -1878,7 +2327,10 @@ class BlockRegionTranslator:
         self.log = log
 
     def translate(
-        self, blocks: Sequence[BlockRegion], canonical_cache: Optional[Dict[str, str]] = None
+        self,
+        blocks: Sequence[BlockRegion],
+        canonical_cache: Optional[Dict[str, str]] = None,
+        checkpoint_store: Optional[TranslationCheckpointStore] = None,
     ) -> Dict[str, str]:
         """
         Translate unique block texts once (based on canonical form) and reuse results.
@@ -1914,17 +2366,32 @@ class BlockRegionTranslator:
         if queued:
             canonical_order = [item[0] for item in queued]
             source_order = [item[1] for item in queued]
-            translated: List[str] = []
             total = len(source_order)
             processed = 0
-            for chunk in chunked(source_order, self.batch_size):
+            for start in range(0, len(source_order), self.batch_size):
+                chunk = source_order[start : start + self.batch_size]
+                chunk_keys = canonical_order[start : start + self.batch_size]
                 chunk_translated = self.engine.translate_many(list(chunk))
-                translated.extend(chunk_translated)
+                for canonical_key, source_text, translated_text in zip(
+                    chunk_keys,
+                    chunk,
+                    chunk_translated,
+                ):
+                    final_text = translated_text or source_text
+                    cache[canonical_key] = final_text
+                    if checkpoint_store is not None and final_text:
+                        checkpoint_store.upsert(
+                            namespace="pdf-scanned:canonical",
+                            block_id=canonical_key,
+                            source_text=canonical_key,
+                            translated_text=final_text,
+                            extra={"sample_source_text": source_text},
+                        )
+                if checkpoint_store is not None and chunk_translated:
+                    checkpoint_store.save()
                 processed = min(total, processed + len(chunk_translated))
                 percent = int((processed / total) * 100)
                 self.log(f"Перевод блоков... [{percent}%]")
-            for canonical_key, source_text, translated_text in zip(canonical_order, source_order, translated):
-                cache[canonical_key] = translated_text or source_text
 
         for block in targets:
             canonical = _canonicalize_text_for_dedup(block.source_text)
@@ -1976,23 +2443,17 @@ class Renderer:
                 mask = mask.astype(np.uint8)
             if mask.shape[:2] != roi.shape[:2]:
                 continue
-            if region.is_table_cell:
-                pad = max(1, int(roi.shape[0] * 0.01))
-                if pad > 0 and pad < roi.shape[0]:
-                    shifted = np.zeros_like(mask)
-                    shifted[pad:, :] = mask[:-pad, :]
-                    mask = cv2.bitwise_or(mask, shifted)
-            bg_color = region.background_color
-            fill = np.full_like(roi, bg_color, dtype=np.uint8)
-            text_region = cv2.bitwise_and(fill, fill, mask=mask)
-            background_region = cv2.bitwise_and(roi, roi, mask=cv2.bitwise_not(mask))
-            cleaned = cv2.add(background_region, text_region)
-            if not region.is_table_cell:
-                cleaned = cv2.GaussianBlur(
-                    cleaned,
-                    (max(3, self.config.blur_kernel_size | 1), max(3, self.config.blur_kernel_size | 1)),
-                    0,
-                )
+            mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+            inpaint_radius = max(
+                3,
+                min(5, int(math.ceil(self.config.dilation_kernel_size / 2.0)) + 2),
+            )
+            cleaned = cv2.inpaint(
+                roi,
+                mask,
+                inpaint_radius,
+                cv2.INPAINT_TELEA,
+            )
             bgr[y:y1, x:x1] = cleaned
 
         cleaned_pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)).convert("RGBA")
@@ -2015,33 +2476,44 @@ class Renderer:
         text = str(region.translated_text or region.source_text or "").strip()
         if not text:
             return
-        padding_ratio = 0.04 if region.is_table_cell else 0.06
+        if region.source_font_size_estimate <= 0:
+            region.source_font_size_estimate = region.font_size_estimate
+        dense_fit = region.fit_strategy in {"tight", "shrink", "preserve_small"} or region.semantic_type in {
+            "map_label",
+            "caption",
+            "contact",
+        }
+        padding_ratio = 0.025 if dense_fit else (0.04 if region.is_table_cell else 0.06)
         padding = max(1, int(min(w, h) * padding_ratio))
         max_text_width = max(1, w - 2 * padding)
         max_text_height = max(1, h - 2 * padding)
 
-        start_size = max(8, min(96, region.font_size_estimate))
+        min_font_size = 5 if dense_fit or region.fit_strategy in {"wrap", "shrink"} else 8
+        start_size = max(min_font_size, min(96, region.font_size_estimate))
         chosen_font: Optional["ImageFont.FreeTypeFont"] = None
+        chosen_size = min_font_size
         wrapped_lines: List[str] = []
         line_spacing = 0
-        for size in range(start_size, 7, -1):
+        for size in range(start_size, min_font_size - 1, -1):
             font = self.font_loader.get(size)
             lines = _wrap_text(text, draw, font, max_text_width)
             if not lines:
                 continue
             line_height = _measure_text("Ay", draw, font)[1]
-            spacing = max(1, int(line_height * 0.25))
+            spacing = max(0 if dense_fit else 1, int(line_height * (0.12 if dense_fit else 0.25)))
             total_height = len(lines) * line_height + max(0, len(lines) - 1) * spacing
             max_width = max(_measure_text(line, draw, font)[0] for line in lines)
             if total_height <= max_text_height and max_width <= max_text_width:
                 chosen_font = font
+                chosen_size = size
                 wrapped_lines = lines
                 line_spacing = spacing
                 break
         if chosen_font is None:
-            chosen_font = self.font_loader.get(8)
+            chosen_font = self.font_loader.get(min_font_size)
+            chosen_size = min_font_size
             wrapped_lines = _wrap_text(text, draw, chosen_font, max_text_width)
-            line_spacing = max(1, int(_measure_text("Ay", draw, chosen_font)[1] * 0.25))
+            line_spacing = max(0 if dense_fit else 1, int(_measure_text("Ay", draw, chosen_font)[1] * 0.15))
 
         if region.text_color:
             b, g, r = region.text_color
@@ -2051,12 +2523,17 @@ class Renderer:
         stroke_w = 1 if region.is_bold else 0
         stroke_fill = text_color
 
+        total_text_height = 0
+        if wrapped_lines and chosen_font is not None:
+            line_heights = [_measure_text(line or " ", draw, chosen_font)[1] for line in wrapped_lines]
+            total_text_height = sum(line_heights) + max(0, len(wrapped_lines) - 1) * line_spacing
+
         if region.is_vertical:
             # Pick font size starting from the estimated size of the source block; shrink only if не помещается.
             layer_w, layer_h = h, w  # swapped canvas before rotation
             available_w = max(1, layer_w - 2 * padding)
             available_h = max(1, layer_h - 2 * padding)
-            target_size = max(8, min(96, region.font_size_estimate))
+            target_size = max(min_font_size, min(96, region.font_size_estimate))
             chosen_font = None
             char_lines: List[str] = []
             for paragraph in wrapped_lines:
@@ -2066,10 +2543,10 @@ class Renderer:
                 # reversed so that after -90 rotation чтение идёт сверху вниз
                 char_lines.extend(list(reversed(paragraph)))
                 char_lines.append("")
-            for size in range(target_size, 7, -1):
+            for size in range(target_size, min_font_size - 1, -1):
                 font = self.font_loader.get(size)
                 line_height = _measure_text("Ay", draw, font)[1]
-                spacing = max(1, int(line_height * 0.25))
+                spacing = max(0 if dense_fit else 1, int(line_height * (0.12 if dense_fit else 0.25)))
                 max_width_needed = 0
                 width_acc = 0
                 total_h = 0
@@ -2088,11 +2565,14 @@ class Renderer:
                 total_h += max(0, len(char_lines) - 1) * spacing
                 if max_width_needed <= available_w and total_h <= available_h:
                     chosen_font = font
+                    chosen_size = size
                     line_spacing = spacing
                     break
             if chosen_font is None:
-                chosen_font = self.font_loader.get(8)
-                line_spacing = max(1, int(_measure_text("Ay", draw, chosen_font)[1] * 0.25))
+                chosen_font = self.font_loader.get(min_font_size)
+                chosen_size = min_font_size
+                line_spacing = max(0 if dense_fit else 1, int(_measure_text("Ay", draw, chosen_font)[1] * 0.15))
+            region.rendered_font_size = chosen_size
 
             # Draw along X (right->left) on swapped canvas; after -90 rotation it flows top->bottom.
             layer_w, layer_h = h, w
@@ -2122,19 +2602,57 @@ class Renderer:
             rotated = region_layer.rotate(angle, expand=True, resample=Image.BICUBIC)
             overlay.alpha_composite(rotated, dest=(x0, y0))
         else:
+            region.rendered_font_size = chosen_size
             region_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
             region_draw = ImageDraw.Draw(region_layer)
             current_y = padding
-            for line in wrapped_lines:
+            if region.is_table_cell and region.content_bbox:
+                _cx, cy, _cw, ch = region.content_bbox
+                target_y = cy + max(0, int((ch - total_text_height) / 2))
+                current_y = max(padding, min(target_y, max(padding, h - padding - max(1, total_text_height))))
+            for line_index, line in enumerate(wrapped_lines):
                 line_width, line_height = _measure_text(line, region_draw, chosen_font)
-                region_draw.text(
-                    (padding, current_y),
-                    line,
-                    fill=text_color,
-                    font=chosen_font,
-                    stroke_width=stroke_w,
-                    stroke_fill=stroke_fill,
+                if region.is_table_cell and region.content_bbox:
+                    cx, _cy, cw, _ch = region.content_bbox
+                    if region.alignment == "center":
+                        line_x = int(cx + (cw - line_width) / 2)
+                    elif region.alignment == "right":
+                        line_x = int(cx + cw - line_width)
+                    else:
+                        line_x = int(cx)
+                    line_x = max(padding, min(line_x, max(padding, w - padding - line_width)))
+                elif region.alignment == "center":
+                    line_x = max(padding, int((w - line_width) / 2))
+                elif region.alignment == "right":
+                    line_x = max(padding, w - padding - line_width)
+                else:
+                    line_x = padding
+                should_justify = (
+                    region.alignment == "justify"
+                    and line_index < len(wrapped_lines) - 1
+                    and len(line.split()) > 1
                 )
+                if should_justify:
+                    self._draw_justified_line(
+                        region_draw,
+                        line,
+                        x=padding,
+                        y=current_y,
+                        width=max_text_width,
+                        font=chosen_font,
+                        fill=text_color,
+                        stroke_width=stroke_w,
+                        stroke_fill=stroke_fill,
+                    )
+                else:
+                    region_draw.text(
+                        (line_x, current_y),
+                        line,
+                        fill=text_color,
+                        font=chosen_font,
+                        stroke_width=stroke_w,
+                        stroke_fill=stroke_fill,
+                    )
                 current_y += line_height + line_spacing
 
             angle = region.text_orientation_deg or 0.0
@@ -2143,6 +2661,45 @@ class Renderer:
                 overlay.alpha_composite(rotated, dest=(x0, y0))
             else:
                 overlay.alpha_composite(region_layer, dest=(x0, y0))
+
+    def _draw_justified_line(
+        self,
+        draw: "ImageDraw.ImageDraw",
+        text: str,
+        *,
+        x: int,
+        y: int,
+        width: int,
+        font: "ImageFont.FreeTypeFont",
+        fill: Tuple[int, int, int, int],
+        stroke_width: int,
+        stroke_fill: Tuple[int, int, int, int],
+    ) -> None:
+        words = text.split()
+        if len(words) <= 1:
+            draw.text(
+                (x, y),
+                text,
+                fill=fill,
+                font=font,
+                stroke_width=stroke_width,
+                stroke_fill=stroke_fill,
+            )
+            return
+        word_widths = [_measure_text(word, draw, font)[0] for word in words]
+        total_words_width = sum(word_widths)
+        gap = max(0.0, (width - total_words_width) / float(len(words) - 1))
+        current_x = float(x)
+        for word, word_width in zip(words, word_widths):
+            draw.text(
+                (int(round(current_x)), y),
+                word,
+                fill=fill,
+                font=font,
+                stroke_width=stroke_width,
+                stroke_fill=stroke_fill,
+            )
+            current_x += word_width + gap
 
 
 class Exporter:
@@ -2155,26 +2712,470 @@ class Exporter:
         images_to_pdf(images, output_path, dpi=dpi, log=self.log)
 
 
-def _iter_translatable_blocks(blocks: Sequence[BlockRegion]) -> Iterable[BlockRegion]:
+def _iter_candidate_blocks(blocks: Sequence[BlockRegion]) -> Iterable[BlockRegion]:
     for block in blocks:
         if block.block_type in TRANSLATABLE_BLOCK_TYPES:
             yield block
         if block.cells:
-            yield from _iter_translatable_blocks(block.cells)
+            yield from _iter_candidate_blocks(block.cells)
 
 
-def _assign_render_ids_for_page(blocks: Sequence[BlockRegion]) -> None:
-    ordered = sorted(_iter_translatable_blocks(blocks), key=lambda b: (b.bbox[1], b.bbox[0]))
+def _iter_translatable_blocks(blocks: Sequence[BlockRegion]) -> Iterable[BlockRegion]:
+    for block in _iter_candidate_blocks(blocks):
+        if block.should_translate:
+            yield block
+
+
+def _stable_block_id(block: BlockRegion, page: Optional[PageImage]) -> str:
+    page_width = max(1, page.width if page is not None else max(block.bbox[2], 1))
+    page_height = max(1, page.height if page is not None else max(block.bbox[3], 1))
+    normalized_bbox = (
+        round(block.bbox[0] / page_width, 4),
+        round(block.bbox[1] / page_height, 4),
+        round(block.bbox[2] / page_width, 4),
+        round(block.bbox[3] / page_height, 4),
+    )
+    identity = json.dumps(
+        {
+            "page": block.page_index,
+            "type": block.block_type,
+            "text": _canonicalize_text_for_dedup(block.source_text),
+            "bbox": normalized_bbox,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def _assign_render_ids_for_page(
+    blocks: Sequence[BlockRegion],
+    page: Optional[PageImage] = None,
+) -> None:
+    ordered = sorted(_iter_candidate_blocks(blocks), key=lambda b: (b.bbox[1], b.bbox[0]))
     for idx, block in enumerate(ordered):
         block.render_id = idx
+        block.stable_id = _stable_block_id(block, page)
+
+
+_EMAIL_RE = re.compile(
+    r"^(?:(?:e|email)\s*[:.]?\s*)?[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}$",
+    re.IGNORECASE,
+)
+_PHONE_RE = re.compile(
+    r"^(?:(?:tel|telephone|phone|fax|t|f)\s*[:.]?\s*)?"
+    r"[+()\d][\d\s()+./-]{5,}$",
+    re.IGNORECASE,
+)
+
+
+def _nontranslatable_text_reason(text: str) -> Optional[str]:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return "empty"
+    compact_lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if compact_lines and all(_EMAIL_RE.fullmatch(line) for line in compact_lines):
+        return "email"
+    if compact_lines and all(_PHONE_RE.fullmatch(line) for line in compact_lines):
+        return "phone"
+    alnum_count = sum(character.isalnum() for character in normalized)
+    letter_count = sum(character.isalpha() for character in normalized)
+    if alnum_count < 2:
+        return "decorative"
+    if letter_count == 0 and alnum_count < 4:
+        return "decorative"
+    symbols = sum(
+        not character.isalnum() and not character.isspace()
+        for character in normalized
+    )
+    if symbols > max(5, int(len(normalized) * 0.6)):
+        return "decorative"
+    return None
+
+
+def _uppercase_tokens(text: str) -> List[str]:
+    return re.findall(r"[A-Za-z][A-Za-z0-9&-]{2,}", str(text or "").upper())
+
+
+def _mark_nontranslatable_blocks(
+    page_layouts: Sequence[TextractPageData],
+    log: PdfLog = _noop_log,
+) -> None:
+    candidates = [
+        block
+        for layout in page_layouts
+        for block in _iter_candidate_blocks(layout.blocks)
+    ]
+    token_pages: Dict[str, Set[int]] = {}
+    for block in candidates:
+        for token in set(_uppercase_tokens(block.source_text)):
+            token_pages.setdefault(token, set()).add(block.page_index)
+    repeated_tokens = {
+        token
+        for token, pages in token_pages.items()
+        if len(pages) >= 2 and len(token) >= 4
+    }
+    brand_tokens: Set[str] = set()
+    for block in candidates:
+        if block.parent_block_type != "FIGURE":
+            continue
+        tokens = _uppercase_tokens(block.source_text)
+        letters = [character for character in str(block.source_text or "") if character.isalpha()]
+        uppercase_ratio = (
+            sum(character.isupper() for character in letters) / len(letters)
+            if letters
+            else 0.0
+        )
+        repeated_in_text = {token for token in tokens if token in repeated_tokens}
+        if uppercase_ratio >= 0.9 and 2 <= len(tokens) <= 5 and len(repeated_in_text) >= 2:
+            brand_tokens.update(repeated_in_text)
+
+    skipped: Dict[str, int] = {}
+    company_suffixes = {
+        "CO",
+        "COMPANY",
+        "CORP",
+        "CORPORATION",
+        "INC",
+        "LTD",
+        "LLC",
+    }
+    logo_blocks: List[BlockRegion] = []
+    for block in candidates:
+        reason = _nontranslatable_text_reason(block.source_text)
+        tokens = _uppercase_tokens(block.source_text)
+        if reason is None and tokens and not block.is_table:
+            uppercase_text = str(block.source_text or "").strip()
+            letters = [character for character in uppercase_text if character.isalpha()]
+            uppercase_ratio = (
+                sum(character.isupper() for character in letters) / len(letters)
+                if letters
+                else 0.0
+            )
+            def is_brand_prefix(token: str, *, allow_repeated: bool) -> bool:
+                pools: List[str] = list(brand_tokens)
+                if allow_repeated:
+                    pools.extend(repeated_tokens)
+                return any(
+                    len(token) >= 3 and len(repeated) > len(token) and repeated.startswith(token)
+                    for repeated in pools
+                )
+
+            def is_brand_like(token: str, *, allow_repeated: bool) -> bool:
+                return (
+                    token in brand_tokens
+                    or (allow_repeated and token in repeated_tokens)
+                    or is_brand_prefix(token, allow_repeated=allow_repeated)
+                    or token in company_suffixes
+                )
+
+            allow_repeated = block.parent_block_type != "FIGURE"
+            repeated_or_prefix = all(
+                is_brand_like(token, allow_repeated=allow_repeated)
+                for token in tokens
+            )
+            brand_token_count = sum(
+                1
+                for token in tokens
+                if is_brand_like(token, allow_repeated=True)
+                and token not in company_suffixes
+            )
+            single_brand_fragment = (
+                len(tokens) == 1
+                and (
+                    tokens[0] in brand_tokens
+                    or is_brand_prefix(tokens[0], allow_repeated=True)
+                )
+            )
+            if (
+                uppercase_ratio >= 0.9
+                and len(tokens) <= 4
+                and repeated_or_prefix
+                and (block.parent_block_type == "FIGURE" or brand_token_count >= 2 or single_brand_fragment)
+            ):
+                reason = "logo"
+        if reason is None:
+            continue
+        block.should_translate = False
+        block.render_enabled = False
+        if reason == "logo":
+            logo_blocks.append(block)
+        skipped[reason] = skipped.get(reason, 0) + 1
+    if logo_blocks:
+        initial_logo_blocks = list(logo_blocks)
+
+        def is_near_logo(candidate: BlockRegion, logo: BlockRegion) -> bool:
+            if candidate.page_index != logo.page_index:
+                return False
+            text = str(candidate.source_text or "").strip()
+            if not text or len(text.split()) > 4:
+                return False
+            bx0, by0, bx1, by1 = candidate.bbox
+            lx0, ly0, lx1, ly1 = logo.bbox
+            bw = max(1, bx1 - bx0)
+            bh = max(1, by1 - by0)
+            lw = max(1, lx1 - lx0)
+            lh = max(1, ly1 - ly0)
+            if bh > max(90, int(lh * 1.5)):
+                return False
+            vertical_gap = max(0, max(by0, ly0) - min(by1, ly1))
+            center_gap = abs(((bx0 + bx1) / 2.0) - ((lx0 + lx1) / 2.0))
+            max_width = max(bw, lw)
+            return (
+                vertical_gap <= max(80, int(lh * 0.9))
+                and center_gap <= max(80, int(max_width * 0.35))
+            )
+
+        for block in candidates:
+            if not block.render_enabled or block.is_table:
+                continue
+            if block.parent_block_type == "FIGURE":
+                continue
+            if any(is_near_logo(block, logo) for logo in initial_logo_blocks):
+                block.should_translate = False
+                block.render_enabled = False
+                skipped["logo"] = skipped.get("logo", 0) + 1
+    if skipped:
+        details = ", ".join(f"{reason}: {count}" for reason, count in sorted(skipped.items()))
+        log(f"Textract: исключены из перевода неизменяемые блоки ({details})")
+
+
+def _disable_unchanged_blocks(blocks: Sequence[BlockRegion]) -> None:
+    for block in _iter_translatable_blocks(blocks):
+        source = _canonicalize_text_for_dedup(block.source_text)
+        translated = _canonicalize_text_for_dedup(block.translated_text or "")
+        if source and source == translated:
+            block.render_enabled = False
+
+
+def _apply_vision_block_updates(
+    blocks: Sequence[BlockRegion],
+    updates: Dict[str, VisionBlockUpdate],
+) -> int:
+    if not updates:
+        return 0
+    applied = 0
+    for block in _iter_candidate_blocks(blocks):
+        update = updates.get(block.stable_id)
+        if update is None:
+            continue
+        corrected = str(update.corrected_text or "").strip()
+        if corrected:
+            block.corrected_text = corrected
+            block.source_text = corrected
+        block.semantic_type = update.semantic_type or "unknown"
+        block.fit_strategy = update.fit_strategy or "default"
+        if update.font_weight in {"auto", "normal", "bold"}:
+            block.font_weight = update.font_weight
+        if update.alignment in {"left", "center", "right", "justify"}:
+            block.alignment = update.alignment
+        block.vision_confidence = max(0.0, min(1.0, float(update.confidence or 0.0)))
+        block.qa_flags = list(update.qa_flags)
+        if not update.translate or block.semantic_type in {"brand", "contact", "decorative"}:
+            block.should_translate = False
+            block.render_enabled = False
+        if block.semantic_type == "table_cell":
+            block.is_table = True
+        if block.semantic_type == "vertical" and block.fit_strategy == "default":
+            block.fit_strategy = "vertical"
+        applied += 1
+    return applied
+
+
+def _vision_cache_path(config: PdfProcessingConfig) -> Path:
+    if config.vision_cache_path:
+        return Path(config.vision_cache_path)
+    return _CACHE_DIR / "vision_requests.json"
+
+
+def _vision_mode_enabled(processing_mode: object) -> bool:
+    return str(processing_mode or "").strip().lower() == PDF_PROCESSING_TEXTRACT_VISION
+
+
+def _run_vision_layout_refinement(
+    page_layouts: Sequence[TextractPageData],
+    *,
+    config: PdfProcessingConfig,
+    openai_key: Optional[str],
+    openai_base_url: Optional[str],
+    openai_project: Optional[str],
+    codex_cli_path: Optional[str],
+    codex_timeout_seconds: int,
+    log: PdfLog,
+) -> None:
+    if not page_layouts:
+        return
+    try:
+        if config.vision_backend == "codex_cli":
+            refiner = CodexCliVisionLayoutRefiner(
+                cli_path=config.vision_codex_cli_path or codex_cli_path or "",
+                model=config.vision_model or "gpt-5.5",
+                reasoning_effort=config.vision_reasoning_effort or "medium",
+                timeout_seconds=(
+                    config.vision_codex_timeout_seconds
+                    or codex_timeout_seconds
+                ),
+                cache_path=_vision_cache_path(config),
+                request_mode=config.vision_request_mode,
+                image_quality=config.vision_image_quality,
+                log=log,
+            )
+        else:
+            refiner = OpenAIVisionLayoutRefiner(
+                api_key=config.vision_api_key or openai_key,
+                model=config.vision_model or "gpt-5.5",
+                base_url=config.vision_base_url or openai_base_url,
+                project=config.vision_project or openai_project,
+                reasoning_effort=config.vision_reasoning_effort or "medium",
+                image_quality=config.vision_image_quality,
+                cache_path=_vision_cache_path(config),
+                log=log,
+            )
+    except Exception as exc:
+        log(f"GPT Vision: layout refinement skipped ({exc})")
+        return
+
+    total = 0
+    for layout in page_layouts:
+        try:
+            updates = refiner.refine_page(
+                page_index=layout.page.page_index,
+                image=layout.page.image,
+                blocks=list(_iter_candidate_blocks(layout.blocks)),
+            )
+        except Exception as exc:
+            log(f"GPT Vision: page {layout.page.page_index + 1} layout refinement failed ({exc})")
+            continue
+        applied = _apply_vision_block_updates(layout.blocks, updates)
+        total += applied
+        log(f"GPT Vision: page {layout.page.page_index + 1} refined blocks: {applied}")
+    if total:
+        log(f"GPT Vision: total refined blocks: {total}")
+
+
+def _apply_vision_qa_issues(
+    regions: Sequence[RegionInfo],
+    issues: Sequence[VisionQaIssue],
+) -> bool:
+    if not issues:
+        return False
+    regions_by_id: Dict[str, List[RegionInfo]] = {}
+    for region in regions:
+        if region.stable_id:
+            regions_by_id.setdefault(region.stable_id, []).append(region)
+    changed = False
+    deterministic_actions = {
+        "shrink_text",
+        "wrap_text",
+        "reduce_padding",
+        "preserve_font_size",
+        "set_bold",
+        "set_normal",
+        "align_left",
+        "align_center",
+        "align_right",
+        "align_justify",
+    }
+    for issue in issues:
+        target_regions = regions_by_id.get(issue.stable_id, [])
+        for region in target_regions:
+            flag = issue.issue_type or issue.action
+            if flag and flag not in region.qa_flags:
+                region.qa_flags.append(flag)
+            if issue.action not in deterministic_actions or issue.confidence < 0.45:
+                continue
+            if issue.action == "wrap_text":
+                region.fit_strategy = "wrap"
+            elif issue.action == "reduce_padding":
+                region.fit_strategy = "tight"
+            elif issue.action == "preserve_font_size":
+                region.fit_strategy = "tight"
+                region.font_size_estimate = max(
+                    region.font_size_estimate,
+                    region.source_font_size_estimate or region.font_size_estimate,
+                )
+            elif issue.action == "set_bold":
+                region.font_weight = "bold"
+                region.is_bold = True
+            elif issue.action == "set_normal":
+                region.font_weight = "normal"
+                region.is_bold = False
+            elif issue.action.startswith("align_"):
+                alignment = issue.action.removeprefix("align_")
+                if alignment in {"left", "center", "right", "justify"}:
+                    region.alignment = alignment
+            elif issue.action == "shrink_text":
+                region.fit_strategy = "shrink"
+                region.font_size_estimate = max(
+                    5, int(region.font_size_estimate * 0.85)
+                )
+            changed = True
+    return changed
+
+
+def _make_vision_qa_reviewer(
+    *,
+    config: PdfProcessingConfig,
+    openai_key: Optional[str],
+    openai_base_url: Optional[str],
+    openai_project: Optional[str],
+    codex_cli_path: Optional[str],
+    codex_timeout_seconds: int,
+    log: PdfLog,
+) -> Optional[object]:
+    try:
+        if config.vision_backend == "codex_cli":
+            return CodexCliVisionQaReviewer(
+                cli_path=config.vision_codex_cli_path or codex_cli_path or "",
+                model=config.vision_model or "gpt-5.5",
+                reasoning_effort=config.vision_reasoning_effort or "medium",
+                timeout_seconds=(
+                    config.vision_codex_timeout_seconds
+                    or codex_timeout_seconds
+                ),
+                cache_path=_vision_cache_path(config),
+                request_mode=config.vision_request_mode,
+                image_quality=config.vision_image_quality,
+                log=log,
+            )
+        return OpenAIVisionQaReviewer(
+            api_key=config.vision_api_key or openai_key,
+            model=config.vision_model or "gpt-5.5",
+            base_url=config.vision_base_url or openai_base_url,
+            project=config.vision_project or openai_project,
+            reasoning_effort=config.vision_reasoning_effort or "medium",
+            image_quality=config.vision_image_quality,
+            cache_path=_vision_cache_path(config),
+            log=log,
+        )
+    except Exception as exc:
+        log(f"GPT Vision: QA skipped ({exc})")
+        return None
 
 def _apply_cached_translations(blocks: Sequence[BlockRegion], existing: Dict[Tuple[int, int], str]) -> None:
-    for block in _iter_translatable_blocks(blocks):
+    for block in _iter_candidate_blocks(blocks):
+        if block.translated_text:
+            continue
         if block.render_id is None:
             continue
         cached_value = str(existing.get((block.page_index, block.render_id), "") or "").strip()
         if cached_value:
             block.translated_text = cached_value
+
+
+def _apply_stable_cached_translations(
+    blocks: Sequence[BlockRegion],
+    existing: Dict[str, str],
+) -> None:
+    if not existing:
+        return
+    for block in _iter_candidate_blocks(blocks):
+        if not block.stable_id:
+            continue
+        cached_value = str(existing.get(block.stable_id, "") or "").strip()
+        if cached_value:
+            block.translated_text = cached_value
+
 
 def _apply_canonical_map(blocks: Sequence[BlockRegion], canonical_map: Dict[str, str]) -> None:
     """Apply translations by canonicalized source text (ignores render_id mismatch)."""
@@ -2223,108 +3224,322 @@ def _clamp_bbox_to_page(
     return (x0, y0, x1, y1)
 
 
+def _collect_block_word_boxes(block: BlockRegion) -> List[BBoxWH]:
+    boxes = list(block.word_boxes)
+    for line in block.lines:
+        boxes.extend(line.word_boxes)
+    unique: List[BBoxWH] = []
+    seen: Set[BBoxWH] = set()
+    for box in boxes:
+        normalized = tuple(int(value) for value in box)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    return unique
+
+
+def _block_content_bbox(block: BlockRegion) -> Optional[Tuple[int, int, int, int]]:
+    word_boxes = _collect_block_word_boxes(block)
+    if word_boxes:
+        return _union_bbox([(x, y, x + w, y + h) for x, y, w, h in word_boxes])
+    if block.lines:
+        return _union_bbox([line.bbox for line in block.lines])
+    return None
+
+
+def _bounded_block_bbox(
+    block: BlockRegion,
+    candidates: Sequence[BlockRegion],
+    config: PdfProcessingConfig,
+    page_width: int,
+    page_height: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    clamped = _clamp_bbox_to_page(block.bbox, page_width, page_height)
+    if clamped is None:
+        return None
+    x0, y0, x1, y1 = clamped
+    if block.is_table:
+        return clamped
+
+    loose_parent = _needs_large_heading_recovery(block)
+    parent = (
+        (0, 0, page_width, page_height)
+        if loose_parent
+        else _clamp_bbox_to_page(
+            block.parent_bbox or (0, 0, page_width, page_height),
+            page_width,
+            page_height,
+        )
+        or (0, 0, page_width, page_height)
+    )
+    left_limit, top_limit, right_limit, bottom_limit = parent
+    block_width = max(1, x1 - x0)
+    block_height = max(1, y1 - y0)
+
+    for neighbor in candidates:
+        if neighbor is block or not neighbor.render_enabled:
+            continue
+        nx0, ny0, nx1, ny1 = neighbor.bbox
+        vertical_overlap = max(0, min(y1, ny1) - max(y0, ny0))
+        horizontal_overlap = max(0, min(x1, nx1) - max(x0, nx0))
+        min_height = max(1, min(block_height, ny1 - ny0))
+        min_width = max(1, min(block_width, nx1 - nx0))
+        if vertical_overlap / min_height >= 0.3:
+            if nx1 <= x0:
+                left_limit = max(left_limit, nx1)
+            elif nx0 >= x1:
+                right_limit = min(right_limit, nx0)
+        if horizontal_overlap / min_width >= 0.3:
+            if ny1 <= y0:
+                top_limit = max(top_limit, ny1)
+            elif ny0 >= y1:
+                bottom_limit = min(bottom_limit, ny0)
+
+    extra_x = int(block_width * max(0.0, min(0.5, config.textract_bbox_width_boost)))
+    extra_y = int(block_height * max(0.0, min(0.5, config.textract_bbox_height_boost)))
+    if loose_parent:
+        extra_x = max(extra_x, int(block_width * 1.4), int(block_height * 0.8))
+    left_extra = min(extra_x // 4, int(block_width * 0.15)) if loose_parent else extra_x // 2
+    top_extra = extra_y // 2
+    expanded = (
+        max(left_limit, x0 - left_extra),
+        max(top_limit, y0 - top_extra),
+        min(right_limit, x1 + (extra_x - left_extra)),
+        min(bottom_limit, y1 + (extra_y - top_extra)),
+    )
+    return _clamp_bbox_to_page(expanded, page_width, page_height)
+
+
+def _needs_large_heading_recovery(block: BlockRegion) -> bool:
+    if block.parent_block_type == "FIGURE":
+        return False
+    text = str(block.source_text or "").strip()
+    if not text:
+        return False
+    letters = [character for character in text if character.isalpha()]
+    if not letters:
+        return False
+    uppercase_ratio = sum(character.isupper() for character in letters) / len(letters)
+    if block.block_type == "TITLE" and uppercase_ratio >= 0.6:
+        return True
+    heights = [line.bbox[3] - line.bbox[1] for line in block.lines if line.bbox[3] > line.bbox[1]]
+    median_height = _median_float(heights, 0.0)
+    return median_height >= 55.0 or (uppercase_ratio >= 0.75 and median_height >= 35.0)
+
+
+def _trim_recovery_bbox_to_light_background(
+    bgr_page: "np.ndarray",
+    expanded: Tuple[int, int, int, int],
+    original: Tuple[int, int, int, int],
+) -> Tuple[int, int, int, int]:
+    x0, y0, x1, y1 = expanded
+    ox0, _oy0, ox1, _oy1 = original
+    if x1 <= x0 or y1 <= y0 or bgr_page.size == 0:
+        return expanded
+    height, width = bgr_page.shape[:2]
+    y0 = max(0, min(height, y0))
+    y1 = max(y0 + 1, min(height, y1))
+    x0 = max(0, min(width, x0))
+    x1 = max(x0 + 1, min(width, x1))
+    ox0 = max(x0, min(x1, ox0))
+    ox1 = max(x0, min(x1, ox1))
+    step = max(3, min(12, (y1 - y0) // 20 or 3))
+
+    def is_light_column(x: int) -> bool:
+        left = max(0, min(width - 1, x))
+        right = min(width, left + max(2, step))
+        column = bgr_page[y0:y1, left:right]
+        if column.size == 0:
+            return True
+        sample = column.reshape(-1, 3)
+        b = sample[:, 0].astype(float)
+        g = sample[:, 1].astype(float)
+        r = sample[:, 2].astype(float)
+        brightness = 0.299 * r + 0.587 * g + 0.114 * b
+        saturation = np.maximum.reduce([r, g, b]) - np.minimum.reduce([r, g, b])
+        paper_pixels = (brightness >= 205.0) & (saturation <= 80.0)
+        return float(np.mean(paper_pixels)) >= 0.35
+
+    trimmed_left = x0
+    probe = ox0
+    while probe > x0:
+        if not is_light_column(probe - step):
+            look = probe - step
+            found_light = False
+            lower_bound = max(x0, probe - step * 12)
+            while look > lower_bound:
+                if is_light_column(look):
+                    found_light = True
+                    break
+                look -= step
+            if not found_light:
+                trimmed_left = max(x0, probe)
+                break
+            trimmed_left = max(x0, look)
+            probe = look
+            continue
+        trimmed_left = max(x0, probe - step)
+        probe -= step
+
+    trimmed_right = x1
+    probe = ox1
+    while probe < x1:
+        if not is_light_column(probe):
+            look = probe + step
+            found_light = False
+            upper_bound = min(x1, probe + step * 12)
+            while look < upper_bound:
+                if is_light_column(look):
+                    found_light = True
+                    break
+                look += step
+            if not found_light:
+                trimmed_right = min(x1, probe)
+                break
+            trimmed_right = min(x1, look + step)
+            probe = look + step
+            continue
+        trimmed_right = min(x1, probe + step)
+        probe += step
+
+    if trimmed_right <= trimmed_left:
+        return expanded
+    return (trimmed_left, y0, trimmed_right, y1)
+
+
 def _block_to_region_info(
     block: BlockRegion,
     bgr_page: "np.ndarray",
     config: PdfProcessingConfig,
     page_width: int,
     page_height: int,
+    candidates: Sequence[BlockRegion],
 ) -> Optional[RegionInfo]:
-    clamped = _clamp_bbox_to_page(block.bbox, page_width, page_height)
+    clamped = _bounded_block_bbox(
+        block,
+        candidates,
+        config,
+        page_width,
+        page_height,
+    )
     if not clamped:
         return None
+    if _needs_large_heading_recovery(block):
+        clamped = _trim_recovery_bbox_to_light_background(bgr_page, clamped, block.bbox)
     x0, y0, x1, y1 = clamped
     is_table = bool(block.is_table)
-    # Add a small vertical margin so descenders are not clipped after rendering.
-    height_boost = 0.0 if is_table else max(0.0, min(0.5, config.textract_bbox_height_boost))
-    if height_boost > 0:
-        extra = int((y1 - y0) * height_boost)
-        if extra > 0:
-            grow_down = min(extra, page_height - y1)
-            grow_up = extra - grow_down
-            y1 = min(page_height, y1 + grow_down)
-            y0 = max(0, y0 - grow_up)
-    # Add a small horizontal margin to avoid clipping long translated words.
-    width_boost = 0.0 if is_table else max(0.0, min(0.5, config.textract_bbox_width_boost))
-    if width_boost > 0:
-        extra = int((x1 - x0) * width_boost)
-        if extra > 0:
-            grow_right = min(extra, page_width - x1)
-            grow_left = extra - grow_right
-            x1 = min(page_width, x1 + grow_right)
-            x0 = max(0, x0 - grow_left)
     roi = bgr_page[y0:y1, x0:x1].copy()
     if roi.size == 0:
         return None
-    mask_for_cleaning: Optional["np.ndarray"] = None
-    mask_for_color: Optional["np.ndarray"] = None
-    if is_table:
-        word_boxes: List[BBoxWH] = []
-        if block.word_boxes:
-            word_boxes.extend(block.word_boxes)
-        if block.lines:
-            for line in block.lines:
-                if line.word_boxes:
-                    word_boxes.extend(line.word_boxes)
-        mask_for_cleaning = build_text_mask_from_word_boxes(
+    word_boxes = _collect_block_word_boxes(block)
+    mask_for_cleaning = build_text_mask_from_word_boxes(
+        roi,
+        word_boxes,
+        offset_x=x0,
+        offset_y=y0,
+        dilation_kernel=config.dilation_kernel_size,
+    )
+    mask_for_color = build_text_mask_from_word_boxes(
+        roi,
+        word_boxes,
+        offset_x=x0,
+        offset_y=y0,
+        dilation_kernel=1,
+    )
+    if mask_for_cleaning is None:
+        mask_for_cleaning = build_text_mask(
             roi,
-            word_boxes,
-            offset_x=x0,
-            offset_y=y0,
             dilation_kernel=config.dilation_kernel_size,
         )
-        mask_for_color = build_text_mask_from_word_boxes(
-            roi,
-            word_boxes,
-            offset_x=x0,
-            offset_y=y0,
-            dilation_kernel=1,
-        )
-        if mask_for_color is None:
-            mask_for_color = mask_for_cleaning
-        if mask_for_color is None:
-            mask_for_color = build_text_mask(roi, dilation_kernel=1)
-    else:
-        mask_for_cleaning = build_text_mask(roi, dilation_kernel=config.dilation_kernel_size)
-        mask_for_color = mask_for_cleaning
+    if mask_for_color is None:
+        mask_for_color = build_text_mask(roi, dilation_kernel=1)
     if mask_for_color is None:
         mask_for_color = np.zeros(roi.shape[:2], dtype=np.uint8)
+    if _needs_large_heading_recovery(block):
+        fallback_mask = build_text_mask(roi, dilation_kernel=config.dilation_kernel_size)
+        if fallback_mask is not None:
+            mask_for_cleaning = fallback_mask if mask_for_cleaning is None else cv2.bitwise_or(mask_for_cleaning, fallback_mask)
+        fallback_color_mask = build_text_mask(roi, dilation_kernel=1)
+        if fallback_color_mask is not None:
+            mask_for_color = cv2.bitwise_or(mask_for_color, fallback_color_mask)
     bg_color = _estimate_background_color(roi, mask_for_color)
     raw_text_color = _estimate_text_color(
         roi, mask_for_color if mask_for_color is not None else np.ones(roi.shape[:2], dtype=np.uint8)
     )
-    is_vertical = False
+    rotation = float(block.rotation_deg or 0.0) % 360.0
+    signed_rotation = rotation if rotation <= 180.0 else rotation - 360.0
+    is_vertical = abs(abs(signed_rotation) - 90.0) <= 12.0
+    if block.semantic_type == "vertical" or block.fit_strategy == "vertical":
+        is_vertical = True
+        signed_rotation = 90.0 if abs(signed_rotation) < 1e-1 else signed_rotation
     is_bold = False
     width = max(1, x1 - x0)
     height = max(1, y1 - y0)
     aspect = height / float(width)
-    if aspect >= config.textract_vertical_aspect_ratio:
+    if not is_vertical and aspect >= config.textract_vertical_aspect_ratio:
         is_vertical = True
-        top_extra = int(height * max(0.0, min(0.5, config.textract_vertical_top_margin_ratio)))
-        if top_extra > 0:
-            y0 = max(0, y0 - top_extra)
+        signed_rotation = 90.0
     if mask_for_color is not None and mask_for_color.size >= 400:
         fill_ratio = float(np.count_nonzero(mask_for_color)) / float(mask_for_color.size)
         if fill_ratio >= max(0.05, min(0.9, config.text_bold_fill_ratio)):
             is_bold = True
+    if block.font_weight == "bold":
+        is_bold = True
+    elif block.font_weight == "normal":
+        is_bold = False
     boosted_text_color = _boost_text_contrast(raw_text_color, bg_color)
     font_size = _estimate_font_size_from_block(block)
-    if is_table:
-        font_size = max(8, int(font_size * 0.9))
+    if block.semantic_type in {"map_label", "caption", "contact"}:
+        if block.fit_strategy == "default":
+            block.fit_strategy = "preserve_small"
+    content_bbox: Optional[BBoxWH] = None
+    content_abs = _block_content_bbox(block)
+    if content_abs:
+        cx0, cy0, cx1, cy1 = content_abs
+        clipped = _clamp_bbox_to_page(
+            (
+                max(x0, cx0),
+                max(y0, cy0),
+                min(x1, cx1),
+                min(y1, cy1),
+            ),
+            page_width,
+            page_height,
+        )
+        if clipped:
+            content_bbox = (
+                clipped[0] - x0,
+                clipped[1] - y0,
+                max(1, clipped[2] - clipped[0]),
+                max(1, clipped[3] - clipped[1]),
+            )
     return RegionInfo(
         page_index=block.page_index,
         region_id=int(block.render_id if block.render_id is not None else 0),
         bbox=(x0, y0, max(1, x1 - x0), max(1, y1 - y0)),
-        text_orientation_deg=-90.0 if is_vertical else 0.0,
+        text_orientation_deg=-signed_rotation if is_vertical else -signed_rotation,
         text_color=boosted_text_color,
         background_color=bg_color,
         source_text=block.source_text,
         translated_text=block.translated_text or block.source_text,
         mask=mask_for_cleaning,
         font_size_estimate=font_size,
+        source_font_size_estimate=font_size,
         is_vertical=is_vertical,
         is_bold=is_bold,
+        font_weight=block.font_weight,
         is_table_cell=is_table,
+        stable_id=block.stable_id,
+        alignment=block.alignment,
+        confidence=block.confidence,
+        parent_block_id=block.parent_block_id,
+        content_bbox=content_bbox,
+        corrected_text=block.corrected_text,
+        semantic_type=block.semantic_type,
+        fit_strategy=block.fit_strategy,
+        vision_confidence=block.vision_confidence,
+        qa_flags=list(block.qa_flags),
     )
 
 
@@ -2336,8 +3551,10 @@ def _build_regions_from_blocks(
     regions: List[RegionInfo] = []
     seen_render_ids: Set[int] = set()
     seen_by_text: Dict[str, List[RegionInfo]] = {}
-    last_text_color: Optional[Tuple[int, int, int]] = None
+    candidates = list(_iter_candidate_blocks(blocks))
     for block in _iter_translatable_blocks(blocks):
+        if not block.render_enabled:
+            continue
         if block.render_id is None:
             continue
         if block.render_id in seen_render_ids:
@@ -2348,12 +3565,15 @@ def _build_regions_from_blocks(
         text_value = block.translated_text or block.source_text
         if not str(text_value or "").strip():
             continue
-        region = _block_to_region_info(block, bgr_page, config, page.width, page.height)
+        region = _block_to_region_info(
+            block,
+            bgr_page,
+            config,
+            page.width,
+            page.height,
+            candidates,
+        )
         if region:
-            if region.is_table_cell and last_text_color:
-                region.text_color = last_text_color
-            elif region.text_color:
-                last_text_color = region.text_color
             canonical = _canonicalize_text_for_dedup(region.translated_text or region.source_text)
             overlaps = False
             for prev in seen_by_text.get(canonical, []):
@@ -2421,11 +3641,17 @@ def process_pdf(
     pages = loader.load(input_path)
     processed_images: List["Image.Image"] = []
     all_regions: List[RegionInfo] = []
+    page_layouts: List[TextractPageData] = []
 
     for page in pages:
         logger(f"PDF: обработка страницы {page.page_index + 1}/{len(pages)}")
         page_layout = textract.analyze(page)
-        _assign_render_ids_for_page(page_layout.blocks)
+        _assign_render_ids_for_page(page_layout.blocks, page)
+        page_layouts.append(page_layout)
+
+    _mark_nontranslatable_blocks(page_layouts, logger)
+    for page_layout in page_layouts:
+        page = page_layout.page
         for block in _iter_translatable_blocks(page_layout.blocks):
             block.translated_text = block.source_text
         regions = _build_regions_from_blocks(page, page_layout.blocks, cfg, log=logger)
@@ -2434,7 +3660,7 @@ def process_pdf(
         processed_images.append(processed_image)
 
     if write_blurred_pdf:
-        Exporter(logger).to_pdf(processed_images, output_path, dpi=cfg.dpi)
+        Exporter(logger).to_pdf(processed_images, output_path, dpi=cfg.render_dpi)
         logger(f"PDF: файл сохранён: {output_path}")
 
     return PdfProcessingResult(
@@ -2444,7 +3670,7 @@ def process_pdf(
     )
 
 
-def translate_pdf(
+def _translate_scanned_pdf(
     *,
     input_path: Path,
     output_path: Path,
@@ -2462,13 +3688,24 @@ def translate_pdf(
     openai_base_url: Optional[str] = None,
     openai_project: Optional[str] = None,
     openai_temperature: float = 0.2,
+    openai_reasoning_effort: Optional[str] = None,
+    openai_verbosity: Optional[str] = None,
     openai_strict_mode: Optional[str] = None,
     openai_strict_value: Optional[float] = None,
+    codex_cli_path: Optional[str] = None,
+    codex_model: Optional[str] = None,
+    codex_reasoning_effort: Optional[str] = None,
+    codex_analysis_model: Optional[str] = None,
+    codex_analysis_reasoning_effort: Optional[str] = None,
+    codex_analysis_session: Optional[CodexAnalysisSession] = None,
+    codex_timeout_seconds: int = 300,
+    checkpoint_path: Optional[Path] = None,
+    resume_policy: str = "auto",
 ) -> Dict[str, object]:
     """
     High-quality PDF translation pipeline driven purely by Textract layout blocks.
     """
-    _ = pdf_type  # retained for UI compatibility
+    _ = pdf_type
     config = PdfProcessingConfig().normalized()
     if processing_options:
         config = PdfProcessingConfig(
@@ -2501,15 +3738,64 @@ def translate_pdf(
             region_margin_scale_y=processing_options.get("region_margin_scale_y", config.region_margin_scale_y),
             min_region_margin_px=processing_options.get("min_region_margin_px", config.min_region_margin_px),
             max_region_margin_ratio=processing_options.get("max_region_margin_ratio", config.max_region_margin_ratio),
+            textract_bbox_height_boost=processing_options.get(
+                "textract_bbox_height_boost", config.textract_bbox_height_boost
+            ),
+            textract_bbox_width_boost=processing_options.get(
+                "textract_bbox_width_boost", config.textract_bbox_width_boost
+            ),
+            vision_backend=processing_options.get(
+                "vision_backend", config.vision_backend
+            ),
+            vision_model=processing_options.get("vision_model", config.vision_model),
+            vision_reasoning_effort=processing_options.get(
+                "vision_reasoning_effort", config.vision_reasoning_effort
+            ),
+            vision_api_key=processing_options.get(
+                "vision_api_key", config.vision_api_key
+            ),
+            vision_base_url=processing_options.get(
+                "vision_base_url", config.vision_base_url
+            ),
+            vision_project=processing_options.get(
+                "vision_project", config.vision_project
+            ),
+            vision_codex_cli_path=processing_options.get(
+                "vision_codex_cli_path", config.vision_codex_cli_path
+            ),
+            vision_codex_timeout_seconds=processing_options.get(
+                "vision_codex_timeout_seconds",
+                config.vision_codex_timeout_seconds,
+            ),
+            vision_request_mode=processing_options.get(
+                "vision_request_mode",
+                config.vision_request_mode,
+            ),
+            vision_image_quality=processing_options.get(
+                "vision_image_quality",
+                config.vision_image_quality,
+            ),
+            vision_cache_path=processing_options.get("vision_cache_path", config.vision_cache_path),
         ).normalized()
 
     if layer_json_path is None:
         layer_json_path = _CACHE_DIR / f"{input_path.stem}.translation.json"
 
     file_hash = _compute_file_sha256(input_path)
+    checkpoint_store = TranslationCheckpointStore(
+        path=checkpoint_path or default_checkpoint_path(input_path, "pdf-scanned"),
+        job_type="pdf-scanned",
+        document_sha256=file_hash,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        translator=translator_name,
+        resume_policy=resume_policy,
+        log=log,
+    )
     pdf_processing_mode = (processing_options.get("pdf_processing_mode", "textract") if processing_options else "textract") or "textract"
+    use_vision_mode = _vision_mode_enabled(pdf_processing_mode)
     textract_client_override: Optional[object] = None
-    if str(pdf_processing_mode).lower() == "textract":
+    if str(pdf_processing_mode).lower() in {PDF_PROCESSING_TEXTRACT, PDF_PROCESSING_TEXTRACT_VISION}:
         region_name = processing_options.get("textract_region") if processing_options else None
         access_key = processing_options.get("textract_access_key") if processing_options else None
         secret_key = processing_options.get("textract_secret_key") if processing_options else None
@@ -2528,7 +3814,11 @@ def translate_pdf(
                 raise RuntimeError(f"Textract: не удалось создать клиент с заданными ключами: {exc}") from exc
 
     loader = PageLoader(config, log)
-    renderer = Renderer(config, log, style_font=style_font)
+    renderer = Renderer(
+        config,
+        log,
+        style_font=_resolve_scanned_style_font(style_font, log),
+    )
     exporter = Exporter(log)
     textract = TextractLayoutExtractor(
         textract_client_override,
@@ -2543,9 +3833,22 @@ def translate_pdf(
     page_layouts: List[TextractPageData] = []
     for page in pages:
         layout = textract.analyze(page)
-        _assign_render_ids_for_page(layout.blocks)
+        _assign_render_ids_for_page(layout.blocks, page)
         page_layouts.append(layout)
 
+    if use_vision_mode:
+        _run_vision_layout_refinement(
+            page_layouts,
+            config=config,
+            openai_key=openai_key,
+            openai_base_url=openai_base_url,
+            openai_project=openai_project,
+            codex_cli_path=codex_cli_path,
+            codex_timeout_seconds=codex_timeout_seconds,
+            log=log,
+        )
+
+    _mark_nontranslatable_blocks(page_layouts, log)
     all_blocks: List[BlockRegion] = []
     for layout in page_layouts:
         all_blocks.extend(list(_iter_translatable_blocks(layout.blocks)))
@@ -2554,18 +3857,27 @@ def translate_pdf(
         raise RuntimeError("Не удалось извлечь текст из PDF/изображения")
 
     existing_map: Dict[Tuple[int, int], str] = {}
-    existing_canonicals: Dict[str, str] = {}
+    existing_stable_map: Dict[str, str] = {}
+    checkpoint_canonicals = checkpoint_store.text_map("pdf-scanned:canonical")
+    existing_canonicals: Dict[str, str] = dict(checkpoint_canonicals)
+    if checkpoint_canonicals:
+        log(f"PDF: checkpoint loaded canonical translations: {len(checkpoint_canonicals)}")
     if layer_json_path and layer_json_path.exists():
         existing_map = load_translation_mapping(layer_json_path, log)
-        existing_canonicals = load_translation_canonicals(layer_json_path, log)
-        if existing_map:
-            log(f"PDF: найден готовый слой перевода, используем без обращения к API ({len(existing_map)} областей)")
+        existing_stable_map = load_translation_stable_mapping(layer_json_path, log)
+        layer_canonicals = load_translation_canonicals(layer_json_path, log)
+        for key, value in layer_canonicals.items():
+            existing_canonicals.setdefault(key, value)
+        cached_count = len(existing_stable_map) or len(existing_map)
+        if cached_count:
+            log(f"PDF: найден готовый слой перевода, используем без обращения к API ({cached_count} областей)")
 
     for layout in page_layouts:
+        _apply_stable_cached_translations(layout.blocks, existing_stable_map)
         _apply_cached_translations(layout.blocks, existing_map)
         _apply_canonical_map(layout.blocks, existing_canonicals)
 
-    backend_name = "cached-layer"
+    backend_name = "cached-checkpoint" if checkpoint_canonicals else "cached-layer"
     canonical_cache = _collect_canonical_cache(all_blocks)
     missing_canonicals: Set[str] = set()
     pending_block_count = 0
@@ -2603,8 +3915,17 @@ def translate_pdf(
             openai_base_url=openai_base_url,
             openai_project=openai_project,
             openai_temperature=openai_temperature,
+            openai_reasoning_effort=openai_reasoning_effort,
+            openai_verbosity=openai_verbosity,
             openai_strict_mode=openai_strict_mode,
             openai_strict_value=openai_strict_value,
+            codex_cli_path=codex_cli_path,
+            codex_model=codex_model,
+            codex_reasoning_effort=codex_reasoning_effort,
+            codex_analysis_model=codex_analysis_model,
+            codex_analysis_reasoning_effort=codex_analysis_reasoning_effort,
+            codex_analysis_session=codex_analysis_session,
+            codex_timeout_seconds=codex_timeout_seconds,
             system_prompt_template=pdf_prompt_template,
         )
         all_source_texts = [
@@ -2614,15 +3935,22 @@ def translate_pdf(
         ]
         translator.set_drawing_context(all_source_texts)
         backend_name = translator.backend_name()
+        checkpoint_store.set_backend(backend_name)
         log(f"Инициализирован движок перевода: {backend_name}")
 
         log(
             f"Готовим {len(missing_canonicals)} уникальных блоков текста к переводу "
             f"(из {pending_block_count} без готового перевода)"
         )
-        canonical_cache = BlockRegionTranslator(translator, log).translate(all_blocks, canonical_cache)
+        canonical_cache = BlockRegionTranslator(translator, log).translate(
+            all_blocks,
+            canonical_cache,
+            checkpoint_store=checkpoint_store,
+        )
 
     _apply_canonical_translations(all_blocks, canonical_cache)
+    for layout in page_layouts:
+        _disable_unchanged_blocks(layout.blocks)
 
     for block in all_blocks:
         if block.render_id is not None and block.translated_text:
@@ -2635,14 +3963,50 @@ def translate_pdf(
         page_regions[layout.page.page_index] = regions
         all_regions.extend(regions)
 
+    rendered_images: List["Image.Image"] = []
+    layout_warnings: List[str] = []
+    vision_reviewer = (
+        _make_vision_qa_reviewer(
+            config=config,
+            openai_key=openai_key,
+            openai_base_url=openai_base_url,
+            openai_project=openai_project,
+            codex_cli_path=codex_cli_path,
+            codex_timeout_seconds=codex_timeout_seconds,
+            log=log,
+        )
+        if use_vision_mode
+        else None
+    )
+    for layout in page_layouts:
+        regions = page_regions.get(layout.page.page_index, [])
+        rendered = renderer.render_page(layout.page, regions)
+        if vision_reviewer is not None and regions:
+            try:
+                qa_issues = vision_reviewer.review_page(
+                    page_index=layout.page.page_index,
+                    source_image=layout.page.image,
+                    rendered_image=rendered,
+                    regions=regions,
+                )
+            except Exception as exc:
+                log(f"GPT Vision: page {layout.page.page_index + 1} QA failed ({exc})")
+                qa_issues = []
+            for issue in qa_issues:
+                warning = (
+                    f"page={layout.page.page_index + 1} stable_id={issue.stable_id} "
+                    f"issue={issue.issue_type} action={issue.action}: {issue.message}"
+                )
+                layout_warnings.append(warning)
+            if _apply_vision_qa_issues(regions, qa_issues):
+                log(f"GPT Vision: page {layout.page.page_index + 1} rerendered after QA adjustments")
+                rendered = renderer.render_page(layout.page, regions)
+        rendered_images.append(rendered)
+
     if layer_json_path:
         save_translation_mapping(all_regions, layer_json_path, log)
 
-    rendered_images: List["Image.Image"] = []
-    for layout in page_layouts:
-        rendered_images.append(renderer.render_page(layout.page, page_regions.get(layout.page.page_index, [])))
-
-    exporter.to_pdf(rendered_images, output_path, dpi=config.dpi)
+    exporter.to_pdf(rendered_images, output_path, dpi=config.render_dpi)
     log(f"PDF: файл сохранён: {output_path}")
 
     return {
@@ -2650,9 +4014,138 @@ def translate_pdf(
         "backend": backend_name,
         "pages": len(rendered_images),
         "job_type": "pdf",
+        "processing_mode": PDF_PROCESSING_TEXTRACT_VISION if use_vision_mode else "scanned",
+        "native_pages": [],
+        "ocr_pages": list(range(1, len(rendered_images) + 1)),
         "ocr_performed": True,
         "translated_blocks": len(all_blocks),
+        "layout_warnings": layout_warnings,
+        "checkpoint_path": checkpoint_store.path,
     }
+
+
+def translate_pdf(
+    *,
+    input_path: Path,
+    output_path: Path,
+    translator_name: str,
+    source_lang: str,
+    target_lang: str,
+    log: PdfLog,
+    pdf_type: str = PDF_TYPE_SCANNED,
+    layer_json_path: Optional[Path] = None,
+    processing_options: Optional[Dict[str, object]] = None,
+    style_font: Optional[str] = None,
+    deepl_key: Optional[str] = None,
+    openai_key: Optional[str] = None,
+    openai_model: Optional[str] = None,
+    openai_base_url: Optional[str] = None,
+    openai_project: Optional[str] = None,
+    openai_temperature: float = 0.2,
+    openai_reasoning_effort: Optional[str] = None,
+    openai_verbosity: Optional[str] = None,
+    openai_strict_mode: Optional[str] = None,
+    openai_strict_value: Optional[float] = None,
+    codex_cli_path: Optional[str] = None,
+    codex_model: Optional[str] = None,
+    codex_reasoning_effort: Optional[str] = None,
+    codex_analysis_model: Optional[str] = None,
+    codex_analysis_reasoning_effort: Optional[str] = None,
+    codex_analysis_session: Optional[CodexAnalysisSession] = None,
+    codex_timeout_seconds: int = 300,
+    checkpoint_path: Optional[Path] = None,
+    resume_policy: str = "auto",
+) -> Dict[str, object]:
+    """Route searchable PDFs to the native pipeline and scans to OCR/Textract."""
+
+    if str(translator_name or "").strip().lower() == "codex":
+        codex_analysis_session = codex_analysis_session or CodexAnalysisSession()
+
+    normalized_type = str(pdf_type or PDF_TYPE_SCANNED).strip().lower()
+    common_args = {
+        "input_path": input_path,
+        "output_path": output_path,
+        "translator_name": translator_name,
+        "source_lang": source_lang,
+        "target_lang": target_lang,
+        "log": log,
+        "layer_json_path": layer_json_path,
+        "processing_options": processing_options,
+        "style_font": style_font,
+        "deepl_key": deepl_key,
+        "openai_key": openai_key,
+        "openai_model": openai_model,
+        "openai_base_url": openai_base_url,
+        "openai_project": openai_project,
+        "openai_temperature": openai_temperature,
+        "openai_reasoning_effort": openai_reasoning_effort,
+        "openai_verbosity": openai_verbosity,
+        "openai_strict_mode": openai_strict_mode,
+        "openai_strict_value": openai_strict_value,
+        "codex_cli_path": codex_cli_path,
+        "codex_model": codex_model,
+        "codex_reasoning_effort": codex_reasoning_effort,
+        "codex_analysis_model": codex_analysis_model,
+        "codex_analysis_reasoning_effort": codex_analysis_reasoning_effort,
+        "codex_analysis_session": codex_analysis_session,
+        "codex_timeout_seconds": codex_timeout_seconds,
+        "checkpoint_path": checkpoint_path,
+        "resume_policy": resume_policy,
+    }
+    if normalized_type != PDF_TYPE_NATIVE:
+        return _translate_scanned_pdf(pdf_type=PDF_TYPE_SCANNED, **common_args)
+
+    from .native import translate_native_pdf
+
+    def translate_fallback_page(page_index: int) -> bytes:
+        try:
+            import fitz  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "Для гибридной обработки PDF требуется PyMuPDF>=1.27.2.2"
+            ) from exc
+
+        import tempfile
+
+        log(f"PDF: запускаем OCR fallback для страницы {page_index + 1}")
+        with tempfile.TemporaryDirectory(prefix="daru-pdf-fallback-") as temp_dir:
+            temp_root = Path(temp_dir)
+            fallback_input = temp_root / f"page-{page_index + 1}.pdf"
+            fallback_output = temp_root / f"page-{page_index + 1}-translated.pdf"
+            fallback_layer = temp_root / f"page-{page_index + 1}.translation.json"
+
+            source_document = fitz.open(str(input_path))
+            one_page = fitz.open()
+            try:
+                one_page.insert_pdf(
+                    source_document,
+                    from_page=page_index,
+                    to_page=page_index,
+                )
+                one_page.save(str(fallback_input), garbage=4, deflate=True)
+            finally:
+                one_page.close()
+                source_document.close()
+
+            fallback_args = dict(common_args)
+            fallback_args.update(
+                {
+                    "input_path": fallback_input,
+                    "output_path": fallback_output,
+                    "layer_json_path": fallback_layer,
+                    "checkpoint_path": default_checkpoint_path(
+                        input_path,
+                        f"pdf-fallback-{page_index + 1}",
+                    ),
+                }
+            )
+            _translate_scanned_pdf(pdf_type=PDF_TYPE_SCANNED, **fallback_args)
+            return fallback_output.read_bytes()
+
+    native_args = dict(common_args)
+    native_args.pop("processing_options", None)
+    native_args["fallback_page_translator"] = translate_fallback_page
+    return translate_native_pdf(**native_args)
 
 
 def pdf_to_images(pdf_path: Path, dpi: int, image_format: str, log: PdfLog) -> List["Image.Image"]:
@@ -2861,7 +4354,7 @@ def build_text_mask_from_word_boxes(
     offset_y: int,
     dilation_kernel: int,
 ) -> Optional["np.ndarray"]:
-    """Construct a mask from known word boxes, keeping only detected text."""
+    """Construct a glyph-level mask constrained by Textract word boxes."""
     _require_dependency(cv2, "opencv-python (pip install opencv-python)")
     if roi.size == 0 or not word_boxes:
         return None
@@ -2871,14 +4364,93 @@ def build_text_mask_from_word_boxes(
         ry0 = max(0, min(roi.shape[0], int(wy - offset_y)))
         rx1 = max(0, min(roi.shape[1], int(wx + ww - offset_x)))
         ry1 = max(0, min(roi.shape[0], int(wy + wh - offset_y)))
-        if rx1 > rx0 and ry1 > ry0:
-            cv2.rectangle(mask, (rx0, ry0), (rx1, ry1), color=255, thickness=-1)
+        if rx1 <= rx0 or ry1 <= ry0:
+            continue
+        patch = roi[ry0:ry1, rx0:rx1]
+        if patch.size == 0:
+            continue
+        border = np.concatenate(
+            (
+                patch[0, :, :],
+                patch[-1, :, :],
+                patch[:, 0, :],
+                patch[:, -1, :],
+            ),
+            axis=0,
+        )
+        background = np.median(border, axis=0)
+        distance = np.linalg.norm(
+            patch.astype(np.float32) - background.astype(np.float32),
+            axis=2,
+        )
+        distance_u8 = np.clip(distance, 0, 255).astype(np.uint8)
+        if np.max(distance_u8) <= 8:
+            continue
+        otsu_threshold, local_mask = cv2.threshold(
+            distance_u8,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        if otsu_threshold < 8:
+            local_mask = np.where(distance_u8 >= 10, 255, 0).astype(np.uint8)
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        _, threshold = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        threshold_inverse = 255 - threshold
+        threshold_ratio = float(np.count_nonzero(threshold)) / float(threshold.size)
+        inverse_ratio = float(np.count_nonzero(threshold_inverse)) / float(threshold_inverse.size)
+        usable_threshold = 0.003 <= threshold_ratio <= 0.68
+        usable_inverse = 0.003 <= inverse_ratio <= 0.68
+        if usable_threshold and usable_inverse:
+            gray_mask = threshold if threshold_ratio <= inverse_ratio else threshold_inverse
+        elif usable_threshold:
+            gray_mask = threshold
+        elif usable_inverse:
+            gray_mask = threshold_inverse
+        else:
+            gray_mask = local_mask
+        combined = cv2.bitwise_or(local_mask, gray_mask)
+        combined_ratio = float(np.count_nonzero(combined)) / float(combined.size)
+        if combined_ratio <= 0.72:
+            local_mask = combined
+        local_size = max(
+            3,
+            min(
+                9,
+                int(round(min(patch.shape[0], patch.shape[1]) * 0.08)) | 1,
+            ),
+        )
+        local_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (local_size, local_size),
+        )
+        local_mask = cv2.morphologyEx(local_mask, cv2.MORPH_CLOSE, local_kernel)
+        local_mask = cv2.dilate(local_mask, local_kernel, iterations=1)
+        target = mask[ry0:ry1, rx0:rx1]
+        mask[ry0:ry1, rx0:rx1] = cv2.bitwise_or(target, local_mask)
     if np.count_nonzero(mask) == 0:
         return None
-    kernel_size = max(1, int(dilation_kernel))
+    word_heights = [max(1, int(height)) for _, _, _, height in word_boxes if height > 0]
+    median_word_height = _median_float(word_heights, 1.0)
+    shadow_kernel = int(round(median_word_height * 0.05)) | 1
+    kernel_size = max(
+        1,
+        int(dilation_kernel),
+        min(9, shadow_kernel),
+    )
     if kernel_size > 1:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         mask = cv2.dilate(mask, kernel, iterations=1)
+    shadow_offset = max(1, min(8, int(round(median_word_height * 0.05))))
+    if shadow_offset < mask.shape[0] and shadow_offset < mask.shape[1]:
+        shifted = np.zeros_like(mask)
+        shifted[shadow_offset:, shadow_offset:] = mask[:-shadow_offset, :-shadow_offset]
+        mask = cv2.bitwise_or(mask, shifted)
     return mask
 
 
@@ -2925,7 +4497,7 @@ def _has_translation(existing: Dict[Tuple[int, int], str], region: RegionInfo) -
 
 
 def load_translation_mapping(path: Path, log: PdfLog) -> Dict[Tuple[int, int], str]:
-    """Load an existing translation layer file if available."""
+    """Load legacy page/render-id mappings from any supported layer version."""
     mapping: Dict[Tuple[int, int], str] = {}
     if not path.exists():
         return mapping
@@ -2957,6 +4529,31 @@ def load_translation_mapping(path: Path, log: PdfLog) -> Dict[Tuple[int, int], s
                 continue
     return mapping
 
+
+def load_translation_stable_mapping(path: Path, log: PdfLog) -> Dict[str, str]:
+    """Load stable block-id mappings from a version 2 scanned-PDF layer."""
+    mapping: Dict[str, str] = {}
+    if not path.exists():
+        return mapping
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        log(f"PDF: не удалось прочитать слой перевода {path}: {exc}")
+        return mapping
+    pages = data.get("pages") if isinstance(data, dict) else None
+    if not pages:
+        return mapping
+    for page in pages:
+        blocks = page.get("blocks") or page.get("regions") or []
+        for block in blocks:
+            stable_id = str(block.get("stable_id", "") or "").strip()
+            translated_text = str(block.get("translated_text", "") or "").strip()
+            if stable_id and translated_text:
+                mapping[stable_id] = translated_text
+    return mapping
+
+
 def load_translation_canonicals(path: Path, log: PdfLog) -> Dict[str, str]:
     """Load canonicalized text->translation pairs from a saved layer (ignoring region ids)."""
     canonicals: Dict[str, str] = {}
@@ -2976,12 +4573,14 @@ def load_translation_canonicals(path: Path, log: PdfLog) -> Dict[str, str]:
         for block in blocks:
             try:
                 source_text = str(block.get("text", "") or "").strip()
+                corrected_text = str(block.get("corrected_text", "") or "").strip()
                 translated_text = str(block.get("translated_text", "") or "").strip()
                 if not source_text or not translated_text:
                     continue
-                canonical = _canonicalize_text_for_dedup(source_text)
-                if canonical:
-                    canonicals.setdefault(canonical, translated_text)
+                for candidate_source in (source_text, corrected_text):
+                    canonical = _canonicalize_text_for_dedup(candidate_source)
+                    if canonical:
+                        canonicals.setdefault(canonical, translated_text)
                 # Additionally add line-wise pairs when counts match (helps if Textract разбил блоки).
                 src_lines = [ln.strip() for ln in source_text.splitlines() if ln.strip()]
                 dst_lines = [ln.strip() for ln in translated_text.splitlines() if ln.strip()]
@@ -3005,7 +4604,7 @@ class _FontLoader:
         self._preferred_font_path = self._resolve_font_path()
 
     def get(self, size: int) -> "ImageFont.FreeTypeFont":
-        size = max(8, min(128, int(size)))
+        size = max(5, min(128, int(size)))
         cached = self._cache.get(size)
         if cached is not None:
             return cached
@@ -3105,25 +4704,63 @@ def _measure_text(text: str, draw: "ImageDraw.ImageDraw", font: "ImageFont.FreeT
     return int(size[0]), int(size[1])
 
 
+def _split_word_to_width(
+    word: str,
+    draw: "ImageDraw.ImageDraw",
+    font: "ImageFont.FreeTypeFont",
+    max_width: int,
+) -> List[str]:
+    if not word:
+        return [word]
+    parts: List[str] = []
+    current = ""
+    for character in word:
+        candidate = current + character
+        if current and _measure_text(candidate, draw, font)[0] > max_width:
+            parts.append(current)
+            current = character
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts or [word]
+
+
 def _wrap_text(text: str, draw: "ImageDraw.ImageDraw", font: "ImageFont.FreeTypeFont", max_width: int) -> List[str]:
     if max_width <= 0:
         return [text]
     lines: List[str] = []
     for paragraph in text.splitlines() or [""]:
-        words = paragraph.split()
-        if not words:
+        raw_words = paragraph.split()
+        if not raw_words:
             lines.append("")
             continue
-        current = words[0]
-        for word in words[1:]:
+        current = ""
+        for raw_word in raw_words:
+            split_parts = (
+                _split_word_to_width(raw_word, draw, font, max_width)
+                if _measure_text(raw_word, draw, font)[0] > max_width
+                else [raw_word]
+            )
+            if len(split_parts) > 1:
+                if current:
+                    lines.append(current)
+                    current = ""
+                lines.extend(split_parts[:-1])
+                current = split_parts[-1]
+                continue
+            word = split_parts[0]
             candidate = f"{current} {word}"
             width, _ = _measure_text(candidate, draw, font)
-            if width <= max_width or not current:
+            if not current:
+                current = word
+            elif width <= max_width:
                 current = candidate
             else:
                 lines.append(current)
                 current = word
-        lines.append(current)
+        if current:
+            lines.append(current)
     return lines
 
 
@@ -3186,12 +4823,32 @@ def _estimate_text_color(roi: "np.ndarray", text_mask: "np.ndarray") -> Tuple[in
     text_pixels = roi[mask > 0]
     if text_pixels.size == 0:
         text_pixels = roi.reshape(-1, 3)
+    bg_pixels = roi[mask == 0]
+    if bg_pixels.size:
+        bg_median = np.median(bg_pixels, axis=0)
+    else:
+        bg_median = np.median(roi.reshape(-1, 3), axis=0)
+    bb, bg, br = [float(value) for value in bg_median.tolist()]
+    bg_luma = 0.299 * br + 0.587 * bg + 0.114 * bb
+    pixels = text_pixels.reshape(-1, 3)
+    b = pixels[:, 0].astype(float)
+    g = pixels[:, 1].astype(float)
+    r = pixels[:, 2].astype(float)
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    if bg_luma >= 128.0:
+        threshold = np.percentile(luma, 35)
+        selected = pixels[luma <= threshold]
+    else:
+        threshold = np.percentile(luma, 65)
+        selected = pixels[luma >= threshold]
+    if len(selected) >= 5:
+        text_pixels = selected
     median = np.median(text_pixels, axis=0).astype(int)
     b, g, r = [int(max(0, min(255, c))) for c in median.tolist()]
     return (b, g, r)
 
 
-def _boost_text_contrast(text_color: Tuple[int, int, int], bg_color: Tuple[int, int, int], *, min_diff: int = 40) -> Tuple[int, int, int]:
+def _boost_text_contrast(text_color: Tuple[int, int, int], bg_color: Tuple[int, int, int], *, min_diff: int = 100) -> Tuple[int, int, int]:
     """Make text color more distinguishable from background without changing hue drastically."""
     tb, tg, tr = text_color
     bb, bg, br = bg_color
@@ -3201,14 +4858,14 @@ def _boost_text_contrast(text_color: Tuple[int, int, int], bg_color: Tuple[int, 
     if diff >= min_diff:
         return (tb, tg, tr)
     adjust = int(min_diff - diff)
-    if text_l >= bg_l:
-        tb = max(0, tb - adjust)
-        tg = max(0, tg - adjust)
-        tr = max(0, tr - adjust)
-    else:
+    if text_l > bg_l or (abs(text_l - bg_l) < 1e-6 and bg_l < 128):
         tb = min(255, tb + adjust)
         tg = min(255, tg + adjust)
         tr = min(255, tr + adjust)
+    else:
+        tb = max(0, tb - adjust)
+        tg = max(0, tg - adjust)
+        tr = max(0, tr - adjust)
     return (tb, tg, tr)
 
 
@@ -3230,9 +4887,24 @@ def save_translation_mapping(
             blocks_payload.append(
                 {
                     "region_id": region.region_id,
+                    "stable_id": region.stable_id,
                     "bbox": list(region.bbox),
                     "text": region.source_text,
                     "translated_text": region.translated_text or "",
+                    "corrected_text": region.corrected_text or "",
+                    "semantic_type": region.semantic_type or "unknown",
+                    "translate": bool(region.translated_text),
+                    "fit_strategy": region.fit_strategy or "default",
+                    "vision_confidence": region.vision_confidence,
+                    "qa_flags": list(region.qa_flags),
+                    "alignment": region.alignment,
+                    "font_weight": region.font_weight,
+                    "is_bold": region.is_bold,
+                    "source_font_size_estimate": region.source_font_size_estimate,
+                    "rendered_font_size": region.rendered_font_size,
+                    "rotation_deg": region.text_orientation_deg,
+                    "confidence": region.confidence,
+                    "parent_block_id": region.parent_block_id,
                 }
             )
         payload_pages.append(
@@ -3243,7 +4915,7 @@ def save_translation_mapping(
             }
         )
     payload = {
-        "version": 1,
+        "version": 3,
         "pages": payload_pages,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
