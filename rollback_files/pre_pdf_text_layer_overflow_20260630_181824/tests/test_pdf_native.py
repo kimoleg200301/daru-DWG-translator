@@ -113,40 +113,6 @@ def test_native_pdf_preserves_vector_content_and_searchable_text(tmp_path, monke
         document.close()
 
 
-def test_native_pdf_restores_links_and_page_labels_after_redaction(tmp_path, monkeypatch):
-    source = tmp_path / "linked.pdf"
-    output = tmp_path / "linked-translated.pdf"
-    document = fitz.open()
-    page = document.new_page(width=320, height=180)
-    link_rect = fitz.Rect(50, 50, 220, 82)
-    page.insert_textbox(link_rect, "Safety device link text.", fontsize=12)
-    page.insert_link(
-        {
-            "kind": fitz.LINK_URI,
-            "from": link_rect,
-            "uri": "https://example.com/manual",
-        }
-    )
-    document.set_page_labels(
-        [{"startpage": 0, "prefix": "M-", "firstpagenum": 1, "style": "D"}]
-    )
-    document.save(source)
-    document.close()
-    monkeypatch.setattr(native, "TranslationEngine", PrefixTranslationEngine)
-
-    _translate(source, output)
-
-    translated = fitz.open(output)
-    try:
-        links = translated[0].get_links()
-        assert any(link.get("uri") == "https://example.com/manual" for link in links)
-        assert translated.get_page_labels() == [
-            {"startpage": 0, "prefix": "M-", "firstpagenum": 1, "style": "D"}
-        ]
-    finally:
-        translated.close()
-
-
 def test_native_pdf_original_mode_falls_back_for_base14_font(tmp_path, monkeypatch):
     source = tmp_path / "source.pdf"
     output = tmp_path / "translated.pdf"
@@ -197,7 +163,7 @@ def test_native_pdf_uses_page_level_fallback_only_for_image_page(tmp_path, monke
         document.close()
 
 
-def test_translation_layer_v3_reuses_exact_source_blocks(tmp_path, monkeypatch):
+def test_translation_layer_v2_reuses_exact_source_blocks(tmp_path, monkeypatch):
     source = tmp_path / "source.pdf"
     first_output = tmp_path / "first.pdf"
     second_output = tmp_path / "second.pdf"
@@ -207,19 +173,11 @@ def test_translation_layer_v3_reuses_exact_source_blocks(tmp_path, monkeypatch):
 
     _translate(source, first_output, layer_path=layer)
     payload = json.loads(layer.read_text(encoding="utf-8"))
-    assert payload["version"] == 3
+    assert payload["version"] == 2
     assert payload["document_sha256"]
     assert payload["native_pages"] == [1]
     assert payload["ocr_pages"] == []
     assert payload["pages"][0]["blocks"][0]["stable_id"]
-    assert payload["pages"][0]["blocks"][0]["style"]["font_family_kind"]
-    assert "lines" in payload["pages"][0]["blocks"][0]
-    first_span = payload["pages"][0]["blocks"][0]["lines"][0]["spans"][0]
-    assert "alpha" in first_span
-    assert "ascender" in first_span
-    assert "descender" in first_span
-    assert "char_flags" in first_span
-    assert "average_char_width" in first_span
 
     monkeypatch.setattr(native, "TranslationEngine", FailIfCreatedEngine)
     result = _translate(source, second_output, layer_path=layer)
@@ -228,55 +186,6 @@ def test_translation_layer_v3_reuses_exact_source_blocks(tmp_path, monkeypatch):
     document = fitz.open(second_output)
     try:
         assert "Перевод" in document[0].get_text()
-    finally:
-        document.close()
-
-
-def test_translation_layer_v2_reuses_by_text_and_bbox_overlap(tmp_path, monkeypatch):
-    source = tmp_path / "source.pdf"
-    output = tmp_path / "translated.pdf"
-    layer = tmp_path / "source.translation.json"
-    _save_native_pdf(source)
-
-    document = fitz.open(source)
-    try:
-        page = native._extract_page(document[0], 0, "en")
-    finally:
-        document.close()
-
-    layer.write_text(
-        json.dumps(
-            {
-                "version": 2,
-                "document_sha256": native._file_sha256(source),
-                "pages": [
-                    {
-                        "page_index": 0,
-                        "blocks": [
-                            {
-                                "stable_id": f"old-{index}",
-                                "bbox": list(unit.bbox),
-                                "text": unit.source_text,
-                                "translated_text": f"Cached v2 translation {index}",
-                            }
-                            for index, unit in enumerate(page.units)
-                        ],
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(native, "TranslationEngine", FailIfCreatedEngine)
-    result = _translate(source, output, layer_path=layer)
-
-    assert result["backend"] == "cached-layer"
-    document = fitz.open(output)
-    try:
-        text = document[0].get_text().replace("\u00a0", " ")
-        assert "Cached v2 translation 0" in text
-        assert "Cached v2 translation 1" in text
     finally:
         document.close()
 
@@ -457,93 +366,6 @@ def test_long_translation_records_layout_warning(tmp_path, monkeypatch):
     assert result["layout_warnings"][0]["page"] == 1
 
 
-def test_insert_unit_tries_expanded_rect_before_scaling_down():
-    unit = native._make_unit(
-        page_index=0,
-        bbox=(20.0, 20.0, 120.0, 45.0),
-        role="TEXT",
-        source_text="Short warning",
-        font_size=12,
-        font_name="Arial",
-        color=0,
-        bold=False,
-        rotation=0,
-        alignment="left",
-    )
-    unit.translated_text = "Long translated warning text"
-
-    class FakePage:
-        rect = fitz.Rect(0, 0, 240, 120)
-
-        def __init__(self):
-            self.calls = []
-
-        def insert_htmlbox(self, rect, *_args, scale_low=0, **_kwargs):
-            candidate = fitz.Rect(rect)
-            self.calls.append((candidate, scale_low))
-            if scale_low >= native.PREFERRED_NATIVE_FONT_SCALE and candidate.width > 100:
-                return 1.0, 1.0
-            return -1.0, scale_low
-
-    page = FakePage()
-    warning = native._insert_unit(
-        page,
-        unit,
-        occupied=[fitz.Rect(unit.bbox)],
-        font_resource=native._FontResource("Fallback", None, ""),
-    )
-
-    assert warning is None
-    assert unit.font_scale == 1.0
-    assert unit.rendered_bbox[2] - unit.rendered_bbox[0] > 100
-    assert page.calls[0][1] == native.PREFERRED_NATIVE_FONT_SCALE
-    assert page.calls[1][1] == native.PREFERRED_NATIVE_FONT_SCALE
-
-
-def test_insert_unit_relaxed_pass_prefers_larger_candidate():
-    unit = native._make_unit(
-        page_index=0,
-        bbox=(20.0, 20.0, 120.0, 45.0),
-        role="TEXT",
-        source_text="Short warning",
-        font_size=12,
-        font_name="Arial",
-        color=0,
-        bold=False,
-        rotation=0,
-        alignment="left",
-    )
-    unit.translated_text = "Long translated warning text"
-
-    class FakePage:
-        rect = fitz.Rect(0, 0, 240, 120)
-
-        def __init__(self):
-            self.calls = []
-
-        def insert_htmlbox(self, rect, *_args, scale_low=0, **_kwargs):
-            candidate = fitz.Rect(rect)
-            self.calls.append((candidate, scale_low))
-            if scale_low >= native.PREFERRED_NATIVE_FONT_SCALE:
-                return -1.0, scale_low
-            if scale_low == native.MIN_NATIVE_FONT_SCALE:
-                scale = 0.90 if candidate.get_area() > 2500 else 0.82
-                return 1.0, scale
-            return -1.0, scale_low
-
-    page = FakePage()
-    warning = native._insert_unit(
-        page,
-        unit,
-        occupied=[fitz.Rect(unit.bbox)],
-        font_resource=native._FontResource("Fallback", None, ""),
-    )
-
-    assert warning["reason"] == "font_scaled_below_preferred_minimum"
-    assert unit.font_scale == 0.90
-    assert unit.rendered_bbox[2] - unit.rendered_bbox[0] > 100
-
-
 def test_generated_html_css_has_balanced_braces():
     unit = native._make_unit(
         page_index=0,
@@ -560,125 +382,6 @@ def test_generated_html_css_has_balanced_braces():
     css = native._unit_css(unit, native._resolve_font_resource("Arial.ttf"))
 
     assert css.count("{") == css.count("}")
-
-
-def test_unit_html_preserves_span_styles():
-    styles = [
-        native.NativeTextSpanStyle(
-            text="Alpha",
-            bbox=(10.0, 10.0, 40.0, 24.0),
-            font_size=14.0,
-            font_name="TestSerif-Bold",
-            color=0x112233,
-            bold=True,
-            italic=False,
-            font_family_kind="serif",
-        ),
-        native.NativeTextSpanStyle(
-            text="Beta",
-            bbox=(45.0, 10.0, 80.0, 24.0),
-            font_size=10.0,
-            font_name="TestSerif-Italic",
-            color=0x445566,
-            bold=False,
-            italic=True,
-            font_family_kind="serif",
-        ),
-    ]
-    unit = native._make_unit(
-        page_index=0,
-        bbox=(10.0, 10.0, 90.0, 28.0),
-        role="TEXT",
-        source_text="Alpha Beta",
-        font_size=12,
-        font_name="TestSerif",
-        color=0,
-        bold=False,
-        rotation=0,
-        alignment="left",
-        style_runs=styles,
-        font_family_kind="serif",
-    )
-    resource = native._FontResource("Fallback", None, "", source_name="fallback.ttf")
-
-    html = native._unit_html(unit, resource, "First Second")
-
-    assert "font-size:14.00pt" in html
-    assert "font-weight:700" in html
-    assert "color:#112233" in html
-    assert "font-size:10.00pt" in html
-    assert "font-style:italic" in html
-    assert "color:#445566" in html
-
-
-def test_unit_html_uses_span_font_resources():
-    styles = [
-        native.NativeTextSpanStyle(
-            text="Alpha",
-            bbox=(10.0, 10.0, 40.0, 24.0),
-            font_size=14.0,
-            font_name="TestSerif-Bold",
-            color=0,
-            bold=True,
-            italic=False,
-            font_family_kind="serif",
-        ),
-        native.NativeTextSpanStyle(
-            text="Beta",
-            bbox=(45.0, 10.0, 80.0, 24.0),
-            font_size=10.0,
-            font_name="TestSans-Italic",
-            color=0,
-            bold=False,
-            italic=True,
-            font_family_kind="sans",
-        ),
-    ]
-    unit = native._make_unit(
-        page_index=0,
-        bbox=(10.0, 10.0, 90.0, 28.0),
-        role="TEXT",
-        source_text="Alpha Beta",
-        font_size=12,
-        font_name="TestSerif",
-        color=0,
-        bold=False,
-        rotation=0,
-        alignment="left",
-        style_runs=styles,
-        font_family_kind="serif",
-    )
-    default = native._FontResource(
-        "DefaultFamily",
-        None,
-        "@font-face { font-family: DefaultFamily; src: url('default.ttf'); }",
-    )
-    serif = native._FontResource(
-        "SerifBoldFamily",
-        None,
-        "@font-face { font-family: SerifBoldFamily; src: url('serif-bold.ttf'); }",
-    )
-    sans = native._FontResource(
-        "SansItalicFamily",
-        None,
-        "@font-face { font-family: SansItalicFamily; src: url('sans-italic.ttf'); }",
-    )
-    bundle = native._build_font_bundle(
-        default,
-        {
-            native._style_resource_key(styles[0]): serif,
-            native._style_resource_key(styles[1]): sans,
-        },
-    )
-
-    css = native._unit_css(unit, bundle)
-    html = native._unit_html(unit, bundle, "First Second")
-
-    assert "DefaultFamily" in css
-    assert "SerifBoldFamily" in css
-    assert "SansItalicFamily" in css
-    assert "font-family:SerifBoldFamily" in html
-    assert "font-family:SansItalicFamily" in html
 
 
 def test_original_font_resolver_uses_matching_embedded_font(monkeypatch):
@@ -766,83 +469,6 @@ def test_original_font_resolver_falls_back_once_for_missing_glyphs(monkeypatch):
     assert "не содержит всех символов" in logs[0]
 
 
-def test_original_font_resolver_uses_similar_cyrillic_fallback(monkeypatch):
-    class FakeDocument:
-        def get_page_fonts(self, _page_index, full=True):
-            assert full
-            return [(11, "ttf", "Type0", "Latin Serif Bold", "F1", "Identity-H", 0)]
-
-    class LatinOnlyFont:
-        def has_glyph(self, codepoint):
-            return 1 if codepoint < 128 else 0
-
-    calls = []
-    fallback = native._FontResource(
-        "FallbackSerifBold",
-        None,
-        "",
-        source_name="serif-bold.ttf",
-        family_kind="serif",
-        bold=True,
-    )
-
-    def fake_resolve(style_font, *, family_kind="sans", bold=False, italic=False, text=""):
-        calls.append(
-            {
-                "style_font": style_font,
-                "family_kind": family_kind,
-                "bold": bold,
-                "italic": italic,
-                "text": text,
-            }
-        )
-        return fallback
-
-    monkeypatch.setattr(native, "_resolve_font_resource", fake_resolve)
-    resolver = native._OriginalFontResolver(
-        FakeDocument(),
-        native._FallbackFontResolver(None),
-        lambda _message: None,
-    )
-    monkeypatch.setattr(
-        resolver,
-        "_resource_from_xref",
-        lambda xref: native._FontResource(
-            "LatinOnly",
-            None,
-            "",
-            font=LatinOnlyFont(),
-            source_name="latin.ttf",
-            family_kind="serif",
-        )
-        if xref == 11
-        else None,
-    )
-    unit = native._make_unit(
-        page_index=0,
-        bbox=(10.0, 10.0, 100.0, 30.0),
-        role="TITLE",
-        source_text="Heading",
-        font_size=18,
-        font_name="Latin Serif Bold",
-        color=0,
-        bold=True,
-        rotation=0,
-        alignment="left",
-    )
-    unit.translated_text = "Заголовок"
-
-    try:
-        assert resolver.resolve(unit) is fallback
-    finally:
-        resolver.close()
-
-    assert unit.font_fallback_reason == "font_fallback_missing_glyphs"
-    assert calls[-1]["family_kind"] == "serif"
-    assert calls[-1]["bold"] is True
-    assert calls[-1]["text"] == "Заголовок"
-
-
 def test_scanned_original_font_uses_fallback_and_logs_warning():
     logs = []
 
@@ -865,55 +491,6 @@ def test_candidate_expansion_does_not_cross_vector_graphics():
     )
 
     assert all(candidate.x1 <= 100 for candidate in candidates)
-
-
-def test_candidate_expansion_keeps_left_alignment_anchor():
-    source = fitz.Rect(20, 20, 100, 40)
-
-    candidates = native._candidate_rects(
-        fitz.Rect(0, 0, 300, 200),
-        source,
-        "TEXT",
-        [source],
-        alignment="left",
-    )
-
-    assert len(candidates) > 1
-    assert all(abs(candidate.x0 - source.x0) <= 0.01 for candidate in candidates)
-
-
-def test_candidate_expansion_keeps_right_alignment_anchor():
-    source = fitz.Rect(20, 20, 100, 40)
-
-    candidates = native._candidate_rects(
-        fitz.Rect(0, 0, 300, 200),
-        source,
-        "TEXT",
-        [source],
-        alignment="right",
-    )
-
-    assert len(candidates) > 1
-    assert all(abs(candidate.x1 - source.x1) <= 0.01 for candidate in candidates)
-
-
-def test_candidate_expansion_keeps_center_alignment_anchor():
-    source = fitz.Rect(20, 20, 100, 40)
-    source_center = (source.x0 + source.x1) / 2
-
-    candidates = native._candidate_rects(
-        fitz.Rect(0, 0, 300, 200),
-        source,
-        "TEXT",
-        [source],
-        alignment="center",
-    )
-
-    assert len(candidates) > 1
-    assert all(
-        abs(((candidate.x0 + candidate.x1) / 2) - source_center) <= 0.01
-        for candidate in candidates
-    )
 
 
 def test_ordinary_building_sentence_is_not_protected_as_an_address():
@@ -965,69 +542,6 @@ def test_distant_spans_on_one_line_are_separate_translation_units():
         "Product Guide",
     ]
     assert units[0].bbox[2] < units[1].bbox[0]
-
-
-def test_overlapping_large_title_lines_are_one_text_frame():
-    block = {
-        "type": 0,
-        "lines": [
-            {
-                "dir": (1.0, 0.0),
-                "origin": (54.0, 110.0),
-                "spans": [
-                    {
-                        "bbox": (54.0, 55.0, 676.0, 126.0),
-                        "text": "The Founder’s Playbook:",
-                        "size": 56.0,
-                        "font": "AnthropicSerifVariable-T",
-                        "color": 0x141413,
-                        "flags": 0,
-                    }
-                ],
-            },
-            {
-                "dir": (1.0, 0.0),
-                "origin": (54.0, 172.0),
-                "spans": [
-                    {
-                        "bbox": (54.0, 117.0, 610.0, 188.0),
-                        "text": "Building an AI-Native",
-                        "size": 56.0,
-                        "font": "AnthropicSerifVariable-T",
-                        "color": 0x141413,
-                        "flags": 0,
-                    }
-                ],
-            },
-            {
-                "dir": (1.0, 0.0),
-                "origin": (54.0, 234.0),
-                "spans": [
-                    {
-                        "bbox": (54.0, 179.0, 242.0, 250.0),
-                        "text": "Startup",
-                        "size": 56.0,
-                        "font": "AnthropicSerifVariable-T",
-                        "color": 0x141413,
-                        "flags": 0,
-                    }
-                ],
-            },
-        ],
-    }
-
-    units = native._units_from_block(
-        block,
-        page_index=0,
-        source_lang="en",
-        median_font_size=12.0,
-    )
-
-    assert len(units) == 1
-    assert units[0].role == "TITLE"
-    assert units[0].font_family_kind == "serif"
-    assert len(units[0].lines) == 3
-    assert units[0].source_text == "The Founder’s Playbook: Building an AI-Native Startup"
 
 
 def test_zero_width_space_spans_are_preserved():

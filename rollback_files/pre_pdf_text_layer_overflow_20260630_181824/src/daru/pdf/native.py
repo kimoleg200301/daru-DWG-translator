@@ -36,12 +36,8 @@ BBox = Tuple[float, float, float, float]
 MAX_BATCH_ITEMS = 24
 MAX_BATCH_CHARS = 12_000
 MAX_DAMAGED_RATIO = 0.10
-PREFERRED_NATIVE_FONT_SCALE = 0.92
-MIN_NATIVE_FONT_SCALE = 0.82
-FORCED_FONT_SCALE = 0.68
-EMERGENCY_FONT_SCALE = 0.50
-NORMAL_LINE_HEIGHT = 1.08
-COMPACT_LINE_HEIGHT = 1.0
+MIN_NATIVE_FONT_SCALE = 0.70
+FORCED_FONT_SCALE = 0.35
 
 NATIVE_PDF_SYSTEM_PROMPT = (
     "You are a professional technical translator of elevator operation and maintenance manuals. "
@@ -93,38 +89,6 @@ class ProtectedText:
 
 
 @dataclass
-class NativeTextSpanStyle:
-    text: str
-    bbox: BBox
-    font_size: float
-    font_name: str
-    color: int
-    bold: bool
-    italic: bool
-    font_family_kind: str
-    flags: int = 0
-    char_flags: int = 0
-    alpha: int = 255
-    ascender: Optional[float] = None
-    descender: Optional[float] = None
-    origin: Optional[Tuple[float, float]] = None
-    bidi: int = 0
-    char_count: int = 0
-    average_char_width: float = 0.0
-
-
-@dataclass
-class NativeTextLineLayout:
-    text: str
-    bbox: BBox
-    origin: Tuple[float, float]
-    font_size: float
-    direction: Tuple[float, float] = (1.0, 0.0)
-    writing_mode: int = 0
-    spans: List[NativeTextSpanStyle] = field(default_factory=list)
-
-
-@dataclass
 class NativeTextUnit:
     page_index: int
     stable_id: str
@@ -136,18 +100,13 @@ class NativeTextUnit:
     font_name: str
     color: int
     bold: bool
-    italic: bool
     rotation: int
-    lines: List[NativeTextLineLayout] = field(default_factory=list)
-    style_runs: List[NativeTextSpanStyle] = field(default_factory=list)
-    font_family_kind: str = "sans"
     alignment: str = "left"
     translated_text: Optional[str] = None
     rendered_bbox: Optional[BBox] = None
     font_scale: float = 1.0
     cached: bool = False
     layout_warning: Optional[str] = None
-    font_fallback_reason: Optional[str] = None
 
 
 @dataclass
@@ -223,8 +182,6 @@ def translate_native_pdf(
     )
     document = fitz.open(str(input_path))
     try:
-        link_snapshots = _snapshot_document_links(document)
-        page_labels = _snapshot_page_labels(document)
         pages = [_extract_page(document[index], index, source_lang) for index in range(len(document))]
         native_pages = [page.page_index + 1 for page in pages if page.is_native]
         ocr_pages = [page.page_index + 1 for page in pages if not page.is_native]
@@ -280,13 +237,7 @@ def translate_native_pdf(
         for page_index in (page.page_index for page in pages if not page.is_native):
             fallback_documents[page_index] = fallback_page_translator(page_index)
 
-        _save_output_document(
-            document,
-            fallback_documents,
-            output_path,
-            link_snapshots=link_snapshots,
-            page_labels=page_labels,
-        )
+        _save_output_document(document, fallback_documents, output_path)
         _save_translation_layer(
             layer_json_path,
             file_hash=file_hash,
@@ -446,10 +397,8 @@ def _extract_table_cells(
                         font_name=style["font_name"],
                         color=style["color"],
                         bold=style["bold"] or row_index == 0,
-                        italic=style["italic"],
                         rotation=style["rotation"],
                         alignment=style["alignment"],
-                        font_family_kind=style["font_family_kind"],
                         stable_salt=f"table:{table_index}:{row_index}:{column_index}",
                     )
                 )
@@ -477,18 +426,12 @@ def _units_from_block(
             for span in line["spans"]
             if str(span.get("text", "")).strip()
         ]
-        font_size, font_name, color, bold, italic, font_family_kind = _dominant_span_style(
+        font_size, font_name, color, bold = _dominant_span_style(
             spans,
             median_font_size,
         )
         rotation = _rotation_from_lines(lines)
         role = _classify_role(source_text, font_size, median_font_size)
-        line_layouts = [_line_layout_from_segment(line) for line in lines]
-        style_runs = [
-            span_style
-            for line_layout in line_layouts
-            for span_style in line_layout.spans
-        ]
         units.append(
             _make_unit(
                 page_index=page_index,
@@ -499,12 +442,8 @@ def _units_from_block(
                 font_name=font_name,
                 color=color,
                 bold=bold,
-                italic=italic,
                 rotation=rotation,
                 alignment="left",
-                lines=line_layouts,
-                style_runs=style_runs,
-                font_family_kind=font_family_kind,
                 stable_salt=f"fragment:{fragment_index}",
             )
         )
@@ -517,7 +456,7 @@ def _split_block_fragments(block: Dict[str, Any]) -> List[Dict[str, Any]]:
         segments.extend(_split_line_segments(line))
     if not segments:
         return []
-    segments.sort(key=lambda segment: (segment["baseline_y"], segment["bbox"][0]))
+    segments.sort(key=lambda segment: (segment["bbox"][1], segment["bbox"][0]))
 
     fragments: List[Dict[str, Any]] = []
     for segment in segments:
@@ -525,20 +464,16 @@ def _split_block_fragments(block: Dict[str, Any]) -> List[Dict[str, Any]]:
         best_fragment = None
         best_score = -1.0
         for fragment in fragments:
-            previous_line = fragment["lines"][-1]
-            baseline_gap = float(segment["baseline_y"]) - float(previous_line["baseline_y"])
-            same_baseline = abs(baseline_gap) <= max(
-                1.5,
-                min(float(segment["font_size"]), float(previous_line["font_size"])) * 0.25,
-            )
-            if same_baseline:
+            previous_rect = fitz.Rect(fragment["lines"][-1]["bbox"])
+            if _vertical_overlap_ratio(previous_rect, segment_rect) > 0.5:
                 continue
+            vertical_gap = segment_rect.y0 - previous_rect.y1
             max_gap = max(
                 6.0,
                 float(segment["font_size"]) * 1.8,
-                float(previous_line["font_size"]) * 1.8,
+                float(fragment["lines"][-1]["font_size"]) * 1.8,
             )
-            if baseline_gap <= 0.0 or baseline_gap > max_gap:
+            if vertical_gap < -1.0 or vertical_gap > max_gap:
                 continue
             overlap = _horizontal_overlap_ratio(
                 fitz.Rect(fragment["bbox"]),
@@ -606,112 +541,18 @@ def _split_line_segments(line: Dict[str, Any]) -> List[Dict[str, Any]]:
         text = "".join(str(span.get("text", "")) for span in group).strip()
         if not text:
             continue
-        bbox = _bbox_union_many(bboxes)
         segments.append(
             {
-                "bbox": bbox,
+                "bbox": _bbox_union_many(bboxes),
                 "text": text,
                 "spans": group,
                 "dir": line.get("dir", (1.0, 0.0)),
-                "wmode": int(line.get("wmode", 0) or 0),
                 "font_size": median(
                     [float(span.get("size", 10) or 10) for span in group]
                 ),
-                "origin": _segment_origin(line, group, bbox),
-                "baseline_y": _segment_baseline_y(line, group, bbox),
             }
         )
     return segments
-
-
-def _segment_origin(
-    line: Dict[str, Any],
-    spans: Sequence[Dict[str, Any]],
-    bbox: BBox,
-) -> Tuple[float, float]:
-    origin = line.get("origin")
-    if isinstance(origin, (tuple, list)) and len(origin) == 2:
-        try:
-            return (float(origin[0]), float(origin[1]))
-        except (TypeError, ValueError):
-            pass
-    origins = [
-        span.get("origin")
-        for span in spans
-        if isinstance(span.get("origin"), (tuple, list))
-        and len(span.get("origin")) == 2
-    ]
-    if origins:
-        try:
-            return (float(origins[0][0]), float(origins[0][1]))
-        except (TypeError, ValueError):
-            pass
-    return (float(bbox[0]), float(bbox[3]))
-
-
-def _segment_baseline_y(
-    line: Dict[str, Any],
-    spans: Sequence[Dict[str, Any]],
-    bbox: BBox,
-) -> float:
-    return _segment_origin(line, spans, bbox)[1]
-
-
-def _line_layout_from_segment(segment: Dict[str, Any]) -> NativeTextLineLayout:
-    spans = [
-        style
-        for span in segment.get("spans", [])
-        if (style := _span_style_from_span(span)) is not None
-    ]
-    raw_origin = segment.get("origin") or (segment["bbox"][0], segment["bbox"][3])
-    try:
-        origin = (float(raw_origin[0]), float(raw_origin[1]))
-    except (TypeError, ValueError, IndexError):
-        origin = (float(segment["bbox"][0]), float(segment["bbox"][3]))
-    direction = _coerce_point(segment.get("dir"), (1.0, 0.0))
-    return NativeTextLineLayout(
-        text=str(segment.get("text") or ""),
-        bbox=segment["bbox"],
-        origin=origin,
-        font_size=float(segment.get("font_size", 10) or 10),
-        direction=direction,
-        writing_mode=int(segment.get("wmode", 0) or 0),
-        spans=spans,
-    )
-
-
-def _span_style_from_span(span: Dict[str, Any]) -> Optional[NativeTextSpanStyle]:
-    bbox = _coerce_span_bbox(span.get("bbox"))
-    text = str(span.get("text", ""))
-    if bbox is None or not text.strip():
-        return None
-    font_name = str(span.get("font") or "sans-serif")
-    flags = int(span.get("flags", 0) or 0)
-    bold = bool(flags & 16) or "bold" in font_name.lower()
-    italic = bool(flags & 2) or any(
-        marker in font_name.lower() for marker in ("italic", "oblique")
-    )
-    char_count = len([char for char in text if not char.isspace()])
-    average_char_width = (bbox[2] - bbox[0]) / char_count if char_count else 0.0
-    return NativeTextSpanStyle(
-        text=text,
-        bbox=bbox,
-        font_size=max(4.0, float(span.get("size", 10) or 10)),
-        font_name=font_name,
-        color=int(span.get("color", 0) or 0),
-        bold=bold,
-        italic=italic,
-        font_family_kind=_font_family_kind(font_name),
-        flags=flags,
-        char_flags=int(span.get("char_flags", 0) or 0),
-        alpha=max(0, min(255, int(span.get("alpha", 255) or 255))),
-        ascender=_coerce_optional_float(span.get("ascender")),
-        descender=_coerce_optional_float(span.get("descender")),
-        origin=_coerce_optional_point(span.get("origin")),
-        bidi=int(span.get("bidi", 0) or 0),
-        char_count=char_count,
-        average_char_width=average_char_width,
-    )
 
 
 def _make_unit(
@@ -726,41 +567,11 @@ def _make_unit(
     bold: bool,
     rotation: int,
     alignment: str,
-    italic: bool = False,
-    lines: Optional[List[NativeTextLineLayout]] = None,
-    style_runs: Optional[List[NativeTextSpanStyle]] = None,
-    font_family_kind: str = "",
     stable_salt: str = "",
 ) -> NativeTextUnit:
     normalized_bbox = ",".join(f"{value:.2f}" for value in bbox)
     stable_payload = f"{page_index}|{normalized_bbox}|{source_text}|{stable_salt}"
     stable_id = hashlib.sha1(stable_payload.encode("utf-8")).hexdigest()[:20]
-    resolved_family_kind = font_family_kind or _font_family_kind(font_name)
-    resolved_lines = list(lines or [])
-    resolved_runs = list(style_runs or [])
-    if not resolved_runs:
-        resolved_runs = [
-            NativeTextSpanStyle(
-                text=source_text,
-                bbox=bbox,
-                font_size=max(4.0, font_size),
-                font_name=font_name,
-                color=color,
-                bold=bold,
-                italic=italic,
-                font_family_kind=resolved_family_kind,
-            )
-        ]
-    if not resolved_lines:
-        resolved_lines = [
-            NativeTextLineLayout(
-                text=source_text,
-                bbox=bbox,
-                origin=(bbox[0], bbox[3]),
-                font_size=max(4.0, font_size),
-                spans=resolved_runs,
-            )
-        ]
     return NativeTextUnit(
         page_index=page_index,
         stable_id=stable_id,
@@ -772,11 +583,7 @@ def _make_unit(
         font_name=font_name,
         color=color,
         bold=bold,
-        italic=italic,
         rotation=rotation,
-        lines=resolved_lines,
-        style_runs=resolved_runs,
-        font_family_kind=resolved_family_kind,
         alignment=alignment,
     )
 
@@ -812,33 +619,12 @@ def _classify_role(source_text: str, font_size: float, median_font_size: float) 
     return "TEXT"
 
 
-def _font_family_kind(font_name: str) -> str:
-    normalized = _font_name_keys(font_name)[1]
-    if any(marker in normalized for marker in ("mono", "courier", "consol", "code")):
-        return "mono"
-    if any(
-        marker in normalized
-        for marker in (
-            "serif",
-            "times",
-            "georgia",
-            "cambria",
-            "garamond",
-            "baskerville",
-            "minion",
-            "caslon",
-        )
-    ):
-        return "serif"
-    return "sans"
-
-
 def _dominant_span_style(
     spans: Sequence[Dict[str, Any]],
     fallback_size: float,
-) -> Tuple[float, str, int, bool, bool, str]:
+) -> Tuple[float, str, int, bool]:
     if not spans:
-        return fallback_size, "sans-serif", 0, False, False, "sans"
+        return fallback_size, "sans-serif", 0, False
     weighted: List[Tuple[int, Dict[str, Any]]] = [
         (max(1, len(str(span.get("text", "")).strip())), span) for span in spans
     ]
@@ -851,16 +637,11 @@ def _dominant_span_style(
     font_name = str(dominant.get("font") or "sans-serif")
     flags = int(dominant.get("flags", 0) or 0)
     bold = bool(flags & 16) or "bold" in font_name.lower()
-    italic = bool(flags & 2) or any(
-        marker in font_name.lower() for marker in ("italic", "oblique")
-    )
     return (
         float(median(sizes)) if sizes else fallback_size,
         font_name,
         int(dominant.get("color", 0) or 0),
         bold,
-        italic,
-        _font_family_kind(font_name),
     )
 
 
@@ -878,7 +659,7 @@ def _style_from_clip(page: Any, rect: Any, fallback_size: float) -> Dict[str, An
     spans = [
         span for line in lines for span in line.get("spans", []) if str(span.get("text", "")).strip()
     ]
-    size, name, color, bold, italic, font_family_kind = _dominant_span_style(spans, fallback_size)
+    size, name, color, bold = _dominant_span_style(spans, fallback_size)
     text_rects = [
         fitz.Rect(span["bbox"])
         for span in spans
@@ -900,8 +681,6 @@ def _style_from_clip(page: Any, rect: Any, fallback_size: float) -> Dict[str, An
         "font_name": name,
         "color": color,
         "bold": bold,
-        "italic": italic,
-        "font_family_kind": font_family_kind,
         "rotation": _rotation_from_lines(lines),
         "alignment": alignment,
     }
@@ -1161,9 +940,9 @@ def _render_native_pages(
 ) -> List[Dict[str, Any]]:
     warnings: List[Dict[str, Any]] = []
     original_mode = normalize_style_font(style_font or "") == ORIGINAL_FONT_VALUE
-    fallback_resolver = _FallbackFontResolver(None if original_mode else style_font)
+    fallback_resource = _resolve_font_resource(None if original_mode else style_font)
     original_resolver = (
-        _OriginalFontResolver(document, fallback_resolver, log)
+        _OriginalFontResolver(document, fallback_resource, log)
         if original_mode
         else None
     )
@@ -1181,27 +960,14 @@ def _render_native_pages(
             if not changed:
                 continue
 
-            font_bundles = {
-                unit.stable_id: _resolve_unit_font_bundle(
-                    unit,
-                    original_resolver=original_resolver,
-                    fallback_resolver=fallback_resolver,
+            font_resources = {
+                unit.stable_id: (
+                    original_resolver.resolve(unit)
+                    if original_resolver is not None
+                    else fallback_resource
                 )
                 for unit in changed
             }
-            for unit in changed:
-                if unit.font_fallback_reason:
-                    warnings.append(
-                        {
-                            "page": unit.page_index + 1,
-                            "stable_id": unit.stable_id,
-                            "role": unit.role,
-                            "reason": "font_fallback",
-                            "detail": unit.font_fallback_reason,
-                            "font": font_bundles[unit.stable_id].default.source_name,
-                            "bbox": list(unit.bbox),
-                        }
-                    )
             for unit in changed:
                 page.add_redact_annot(
                     fitz.Rect(unit.bbox),
@@ -1221,7 +987,7 @@ def _render_native_pages(
                     page,
                     unit,
                     occupied=occupied,
-                    font_resource=font_bundles[unit.stable_id],
+                    font_resource=font_resources[unit.stable_id],
                 )
                 if warning:
                     warnings.append(warning)
@@ -1267,160 +1033,10 @@ class _FontResource:
     font_face_css: str
     font: Optional[Any] = None
     source_name: str = ""
-    family_kind: str = "sans"
-    bold: bool = False
-    italic: bool = False
 
 
-@dataclass
-class _FontBundle:
-    default: _FontResource
-    by_style: Dict[Tuple[str, str, bool, bool], _FontResource] = field(default_factory=dict)
-    archive: Optional[Any] = None
-    font_face_css: str = ""
-
-    def resource_for(self, style: NativeTextSpanStyle) -> _FontResource:
-        return self.by_style.get(_style_resource_key(style), self.default)
-
-
-def _style_resource_key(style: NativeTextSpanStyle) -> Tuple[str, str, bool, bool]:
-    compact, family = _font_name_keys(style.font_name)
-    font_key = family or compact or str(style.font_name or "").casefold()
-    return (
-        font_key,
-        style.font_family_kind or _font_family_kind(style.font_name),
-        bool(style.bold),
-        bool(style.italic),
-    )
-
-
-def _build_font_bundle(
-    default: _FontResource,
-    by_style: Optional[Dict[Tuple[str, str, bool, bool], _FontResource]] = None,
-) -> _FontBundle:
-    style_resources = dict(by_style or {})
-    resources = [default, *style_resources.values()]
-    css_parts: List[str] = []
-    seen_css = set()
-    for resource in resources:
-        css = resource.font_face_css
-        if not css or css in seen_css:
-            continue
-        css_parts.append(css)
-        seen_css.add(css)
-    return _FontBundle(
-        default=default,
-        by_style=style_resources,
-        archive=_combine_font_archives(resources),
-        font_face_css="\n".join(css_parts),
-    )
-
-
-def _ensure_font_bundle(value: Any) -> _FontBundle:
-    if isinstance(value, _FontBundle):
-        return value
-    return _build_font_bundle(value)
-
-
-def _combine_font_archives(resources: Sequence[_FontResource]) -> Optional[Any]:
-    archives = []
-    seen = set()
-    for resource in resources:
-        archive = resource.archive
-        if archive is None:
-            continue
-        key = id(archive)
-        if key in seen:
-            continue
-        seen.add(key)
-        archives.append(archive)
-    if not archives:
-        return None
-    if len(archives) == 1:
-        return archives[0]
-    combined = fitz.Archive()
-    for archive in archives:
-        combined.add(archive)
-    return combined
-
-
-def _resolve_unit_font_bundle(
-    unit: NativeTextUnit,
-    *,
-    original_resolver: Optional["_OriginalFontResolver"],
-    fallback_resolver: "_FallbackFontResolver",
-) -> _FontBundle:
-    text = str(unit.translated_text or unit.source_text)
-    default = (
-        original_resolver.resolve(unit)
-        if original_resolver is not None
-        else fallback_resolver.resolve(unit, text)
-    )
-    by_style: Dict[Tuple[str, str, bool, bool], _FontResource] = {}
-    for style in _unit_distinct_span_styles(unit):
-        key = _style_resource_key(style)
-        if key in by_style:
-            continue
-        by_style[key] = (
-            original_resolver.resolve_style(unit, style, text)
-            if original_resolver is not None
-            else fallback_resolver.resolve_style(style, text)
-        )
-    return _build_font_bundle(default, by_style)
-
-
-def _unit_distinct_span_styles(unit: NativeTextUnit) -> List[NativeTextSpanStyle]:
-    styles: List[NativeTextSpanStyle] = []
-    seen = set()
-    for style in unit.style_runs:
-        if not style.text.strip():
-            continue
-        key = _style_resource_key(style)
-        if key in seen:
-            continue
-        seen.add(key)
-        styles.append(style)
-    return styles
-
-
-def _resolve_font_resource(
-    style_font: Optional[str],
-    *,
-    family_kind: str = "sans",
-    bold: bool = False,
-    italic: bool = False,
-    text: str = "",
-) -> _FontResource:
+def _resolve_font_resource(style_font: Optional[str]) -> _FontResource:
     _require_fitz()
-    first_loaded: Optional[_FontResource] = None
-    for candidate in _font_candidate_paths(style_font, family_kind, bold, italic):
-        resource = _load_font_resource(candidate, family_kind, bold, italic)
-        if resource is None:
-            continue
-        if first_loaded is None:
-            first_loaded = resource
-        if not text or _font_resource_supports_text(resource, text):
-            return resource
-    if first_loaded is not None:
-        return first_loaded
-    generic_family = family_kind if family_kind in {"serif", "mono"} else "sans-serif"
-    return _FontResource(
-        family=generic_family,
-        archive=None,
-        font_face_css="",
-        source_name=generic_family,
-        family_kind=family_kind,
-        bold=bold,
-        italic=italic,
-    )
-
-
-def _font_candidate_paths(
-    style_font: Optional[str],
-    family_kind: str,
-    bold: bool,
-    italic: bool,
-) -> List[Path]:
     candidates: List[Path] = []
     if style_font:
         requested = Path(style_font).expanduser()
@@ -1433,54 +1049,10 @@ def _font_candidate_paths(
                 "dejavusans.ttf": "DejaVuSans.ttf",
             }
             candidates.append(fonts_dir / aliases.get(requested.name.lower(), requested.name))
-
     if os.name == "nt":
         fonts_dir = Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts"
-        windows: Dict[str, Dict[Tuple[bool, bool], List[str]]] = {
-            "serif": {
-                (False, False): ["times.ttf", "georgia.ttf", "cambria.ttc"],
-                (True, False): ["timesbd.ttf", "georgiab.ttf", "cambriab.ttf"],
-                (False, True): ["timesi.ttf", "georgiai.ttf", "cambriai.ttf"],
-                (True, True): ["timesbi.ttf", "georgiaz.ttf", "cambriaz.ttf"],
-            },
-            "sans": {
-                (False, False): ["arial.ttf", "segoeui.ttf", "calibri.ttf"],
-                (True, False): ["arialbd.ttf", "segoeuib.ttf", "calibrib.ttf"],
-                (False, True): ["ariali.ttf", "segoeuii.ttf", "calibrii.ttf"],
-                (True, True): ["arialbi.ttf", "segoeuiz.ttf", "calibriz.ttf"],
-            },
-            "mono": {
-                (False, False): ["consola.ttf", "cour.ttf"],
-                (True, False): ["consolab.ttf", "courbd.ttf"],
-                (False, True): ["consolai.ttf", "couri.ttf"],
-                (True, True): ["consolaz.ttf", "courbi.ttf"],
-            },
-        }
-        names = windows.get(family_kind, windows["sans"]).get((bold, italic), [])
-        candidates.extend(fonts_dir / name for name in names)
         candidates.extend([fonts_dir / "arial.ttf", fonts_dir / "segoeui.ttf"])
     else:
-        linux: Dict[str, Dict[Tuple[bool, bool], List[Path]]] = {
-            "serif": {
-                (False, False): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf")],
-                (True, False): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf")],
-                (False, True): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf")],
-                (True, True): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSerif-BoldItalic.ttf")],
-            },
-            "sans": {
-                (False, False): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")],
-                (True, False): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")],
-                (False, True): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf")],
-                (True, True): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf")],
-            },
-            "mono": {
-                (False, False): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")],
-                (True, False): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf")],
-                (False, True): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf")],
-                (True, True): [Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf")],
-            },
-        }
-        candidates.extend(linux.get(family_kind, linux["sans"]).get((bold, italic), []))
         candidates.extend(
             [
                 Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
@@ -1488,101 +1060,32 @@ def _font_candidate_paths(
             ]
         )
 
-    deduped: List[Path] = []
-    seen = set()
     for candidate in candidates:
-        key = os.path.normcase(str(candidate))
-        if key in seen:
+        if not candidate.exists() or not candidate.is_file():
             continue
-        seen.add(key)
-        deduped.append(candidate)
-    return deduped
-
-
-def _load_font_resource(
-    candidate: Path,
-    family_kind: str,
-    bold: bool,
-    italic: bool,
-) -> Optional[_FontResource]:
-    if not candidate.exists() or not candidate.is_file():
-        return None
-    try:
-        archive = fitz.Archive(str(candidate.parent))
-        font = fitz.Font(fontfile=str(candidate))
-    except Exception:
-        return None
-    style_key = (
-        f"{family_kind}{'Bold' if bold else ''}{'Italic' if italic else ''}"
-    )
-    family = re.sub(r"[^A-Za-z0-9_]", "", f"DaruPdfFont{style_key}") or "DaruPdfFont"
-    css = (
-        f"@font-face {{ font-family: {family}; "
-        f"src: url('{candidate.name}'); }}"
-    )
+        try:
+            archive = fitz.Archive(str(candidate.parent))
+            font = fitz.Font(fontfile=str(candidate))
+        except Exception:
+            continue
+        family = "DaruPdfFont"
+        css = (
+            f"@font-face {{ font-family: {family}; "
+            f"src: url('{candidate.name}'); }}"
+        )
+        return _FontResource(
+            family=family,
+            archive=archive,
+            font_face_css=css,
+            font=font,
+            source_name=candidate.name,
+        )
     return _FontResource(
-        family=family,
-        archive=archive,
-        font_face_css=css,
-        font=font,
-        source_name=candidate.name,
-        family_kind=family_kind,
-        bold=bold,
-        italic=italic,
+        family="sans-serif",
+        archive=None,
+        font_face_css="",
+        source_name="sans-serif",
     )
-
-
-class _FallbackFontResolver:
-    def __init__(self, style_font: Optional[str]) -> None:
-        self.style_font = style_font
-        self._cache: Dict[Tuple[str, bool, bool, str], _FontResource] = {}
-
-    def resolve(self, unit: NativeTextUnit, text: str) -> _FontResource:
-        family_kind = unit.font_family_kind or _font_family_kind(unit.font_name)
-        key = (family_kind, bool(unit.bold), bool(unit.italic), _text_script_key(text))
-        cached = self._cache.get(key)
-        if cached is not None and (
-            not text or cached.font is None or _font_resource_supports_text(cached, text)
-        ):
-            return cached
-        resource = _resolve_font_resource(
-            self.style_font,
-            family_kind=family_kind,
-            bold=unit.bold,
-            italic=unit.italic,
-            text=text,
-        )
-        self._cache[key] = resource
-        return resource
-
-    def resolve_style(self, style: NativeTextSpanStyle, text: str) -> _FontResource:
-        family_kind = style.font_family_kind or _font_family_kind(style.font_name)
-        key = (family_kind, bool(style.bold), bool(style.italic), _text_script_key(text))
-        cached = self._cache.get(key)
-        if cached is not None and (
-            not text or cached.font is None or _font_resource_supports_text(cached, text)
-        ):
-            return cached
-        resource = _resolve_font_resource(
-            self.style_font,
-            family_kind=family_kind,
-            bold=style.bold,
-            italic=style.italic,
-            text=text,
-        )
-        self._cache[key] = resource
-        return resource
-
-    def default_resource(self) -> _FontResource:
-        return _resolve_font_resource(self.style_font)
-
-
-def _text_script_key(text: str) -> str:
-    if re.search(r"[\u0400-\u04FF]", str(text or "")):
-        return "cyrillic"
-    if re.search(r"[^\x00-\x7F]", str(text or "")):
-        return "unicode"
-    return "latin"
 
 
 def _font_name_keys(value: str) -> Tuple[str, str]:
@@ -1633,16 +1136,11 @@ class _OriginalFontResolver:
     def __init__(
         self,
         document: Any,
-        fallback_resource: Any,
+        fallback_resource: _FontResource,
         log: PdfLog,
     ) -> None:
         self.document = document
-        if isinstance(fallback_resource, _FallbackFontResolver):
-            self.fallback_resolver: Optional[_FallbackFontResolver] = fallback_resource
-            self.fallback_resource = fallback_resource.default_resource()
-        else:
-            self.fallback_resolver = None
-            self.fallback_resource = fallback_resource
+        self.fallback_resource = fallback_resource
         self.log = log
         self._temp_dir = tempfile.TemporaryDirectory(prefix="daru-pdf-fonts-")
         self._archive = fitz.Archive(self._temp_dir.name)
@@ -1654,67 +1152,19 @@ class _OriginalFontResolver:
         self._temp_dir.cleanup()
 
     def resolve(self, unit: NativeTextUnit) -> _FontResource:
-        text = str(unit.translated_text or unit.source_text)
-        return self._resolve_named_font(
-            page_index=unit.page_index,
-            font_name=unit.font_name,
-            text=text,
-            fallback=lambda: self._fallback_for(unit, text),
-            mark_fallback=lambda reason: self._mark_unit_fallback(unit, reason),
-        )
-
-    def resolve_style(
-        self,
-        unit: NativeTextUnit,
-        style: NativeTextSpanStyle,
-        text: str,
-    ) -> _FontResource:
-        return self._resolve_named_font(
-            page_index=unit.page_index,
-            font_name=style.font_name,
-            text=text,
-            fallback=lambda: self._fallback_for_style(style, text),
-            mark_fallback=lambda reason: self._mark_unit_fallback(unit, reason),
-        )
-
-    def _resolve_named_font(
-        self,
-        *,
-        page_index: int,
-        font_name: str,
-        text: str,
-        fallback: Callable[[], _FontResource],
-        mark_fallback: Callable[[str], None],
-    ) -> _FontResource:
-        entry = self._find_font_entry(page_index, font_name)
+        entry = self._find_font_entry(unit.page_index, unit.font_name)
         if entry is None:
-            self._warn_once(font_name, "not_found")
-            mark_fallback("font_fallback_not_found")
-            return fallback()
+            self._warn_once(unit.font_name, "not_found")
+            return self.fallback_resource
         resource = self._resource_from_xref(int(entry[0] or 0))
         if resource is None:
-            self._warn_once(font_name, "not_embedded")
-            mark_fallback("font_fallback_not_embedded")
-            return fallback()
+            self._warn_once(unit.font_name, "not_embedded")
+            return self.fallback_resource
+        text = str(unit.translated_text or unit.source_text)
         if not _font_resource_supports_text(resource, text):
-            self._warn_once(font_name, "missing_glyphs")
-            mark_fallback("font_fallback_missing_glyphs")
-            return fallback()
+            self._warn_once(unit.font_name, "missing_glyphs")
+            return self.fallback_resource
         return resource
-
-    def _fallback_for(self, unit: NativeTextUnit, text: str) -> _FontResource:
-        if self.fallback_resolver is not None:
-            return self.fallback_resolver.resolve(unit, text)
-        return self.fallback_resource
-
-    def _fallback_for_style(self, style: NativeTextSpanStyle, text: str) -> _FontResource:
-        if self.fallback_resolver is not None:
-            return self.fallback_resolver.resolve_style(style, text)
-        return self.fallback_resource
-
-    def _mark_unit_fallback(self, unit: NativeTextUnit, reason: str) -> None:
-        if unit.font_fallback_reason is None:
-            unit.font_fallback_reason = reason
 
     def _find_font_entry(
         self,
@@ -1781,7 +1231,6 @@ class _OriginalFontResolver:
             ),
             font=font,
             source_name=str(extracted_name or filename),
-            family_kind=_font_family_kind(extracted_name or ""),
         )
         self._resources[xref] = resource
         return resource
@@ -1809,320 +1258,76 @@ def _insert_unit(
     unit: NativeTextUnit,
     *,
     occupied: Sequence[Any],
-    font_resource: Any,
+    font_resource: _FontResource,
 ) -> Optional[Dict[str, Any]]:
     text = str(unit.translated_text or unit.source_text)
-    font_bundle = _ensure_font_bundle(font_resource)
-    line_height = _unit_line_height(unit, NORMAL_LINE_HEIGHT)
-    compact_line_height = min(line_height, COMPACT_LINE_HEIGHT)
-    css = _unit_css(unit, font_bundle, line_height=line_height)
-    compact_css = _unit_css(unit, font_bundle, line_height=compact_line_height)
-    html_text = _unit_html(unit, font_bundle, text)
+    css = _unit_css(unit, font_resource)
+    html_text = "<div>" + html.escape(text).replace("\n", "<br>") + "</div>"
     source_rect = fitz.Rect(unit.bbox)
-    candidates = _candidate_rects(
-        page.rect,
-        source_rect,
-        unit.role,
-        occupied,
-        alignment=unit.alignment,
-    )
-    relaxed_candidates = _relaxed_candidate_order(candidates)
+    candidates = _candidate_rects(page.rect, source_rect, unit.role, occupied)
 
     for candidate in candidates:
-        warning = _try_insert_htmlbox(
-            page,
-            unit,
+        spare_height, scale = page.insert_htmlbox(
             candidate,
             html_text,
-            css,
-            font_bundle,
-            scale_low=PREFERRED_NATIVE_FONT_SCALE,
-        )
-        if warning is not None or unit.rendered_bbox is not None:
-            return warning
-
-    for candidate in relaxed_candidates:
-        warning = _try_insert_htmlbox(
-            page,
-            unit,
-            candidate,
-            html_text,
-            compact_css,
-            font_bundle,
-            scale_low=PREFERRED_NATIVE_FONT_SCALE,
-        )
-        if warning is not None or unit.rendered_bbox is not None:
-            return warning
-
-    for candidate in relaxed_candidates:
-        warning = _try_insert_htmlbox(
-            page,
-            unit,
-            candidate,
-            html_text,
-            compact_css,
-            font_bundle,
+            css=css,
             scale_low=MIN_NATIVE_FONT_SCALE,
+            archive=font_resource.archive,
+            rotate=unit.rotation,
+            overlay=True,
         )
-        if warning is not None or unit.rendered_bbox is not None:
-            return warning
+        if spare_height >= 0:
+            unit.rendered_bbox = _rect_tuple(candidate)
+            unit.font_scale = float(scale)
+            return None
 
-    forced_rect = relaxed_candidates[0] if relaxed_candidates else candidates[-1]
-    warning = _try_insert_htmlbox(
-        page,
-        unit,
-        forced_rect,
-        html_text,
-        compact_css,
-        font_bundle,
-        scale_low=FORCED_FONT_SCALE,
-    )
-    if warning is not None or unit.rendered_bbox is not None:
-        return warning
-
-    warning = _try_insert_htmlbox(
-        page,
-        unit,
-        forced_rect,
-        html_text,
-        compact_css,
-        font_bundle,
-        scale_low=EMERGENCY_FONT_SCALE,
-    )
-    if warning is not None or unit.rendered_bbox is not None:
-        return warning
-
-    warning = _try_insert_htmlbox(
-        page,
-        unit,
-        forced_rect,
-        html_text,
-        compact_css,
-        font_bundle,
-        scale_low=0,
-    )
-    if warning is not None or unit.rendered_bbox is not None:
-        return warning
-
-    unit.rendered_bbox = _rect_tuple(forced_rect)
-    unit.font_scale = 0.0
-    unit.layout_warning = "translation_did_not_fit"
-    return _layout_warning(unit, "translation_did_not_fit")
-
-
-def _try_insert_htmlbox(
-    page: Any,
-    unit: NativeTextUnit,
-    candidate: Any,
-    html_text: str,
-    css: str,
-    font_bundle: _FontBundle,
-    *,
-    scale_low: float,
-) -> Optional[Dict[str, Any]]:
+    forced_rect = candidates[-1]
     spare_height, scale = page.insert_htmlbox(
-        candidate,
+        forced_rect,
         html_text,
         css=css,
-        scale_low=scale_low,
-        archive=font_bundle.archive,
+        scale_low=FORCED_FONT_SCALE,
+        archive=font_resource.archive,
         rotate=unit.rotation,
         overlay=True,
     )
     if spare_height < 0:
-        return None
-
-    unit.rendered_bbox = _rect_tuple(candidate)
+        spare_height, scale = page.insert_htmlbox(
+            forced_rect,
+            html_text,
+            css=css,
+            scale_low=0,
+            archive=font_resource.archive,
+            rotate=unit.rotation,
+            overlay=True,
+        )
+    unit.rendered_bbox = _rect_tuple(forced_rect)
     unit.font_scale = float(scale)
-    if unit.font_scale >= PREFERRED_NATIVE_FONT_SCALE:
-        return None
     reason = (
-        "font_scaled_below_minimum"
-        if unit.font_scale < MIN_NATIVE_FONT_SCALE
+        "translation_did_not_fit"
+        if spare_height < 0
         else "font_scaled_below_preferred_minimum"
     )
     unit.layout_warning = reason
-    return _layout_warning(unit, reason)
-
-
-def _layout_warning(unit: NativeTextUnit, reason: str) -> Dict[str, Any]:
     return {
         "page": unit.page_index + 1,
         "stable_id": unit.stable_id,
         "role": unit.role,
         "reason": reason,
         "scale": unit.font_scale,
-        "bbox": list(unit.rendered_bbox or unit.bbox),
+        "bbox": list(unit.rendered_bbox),
     }
 
 
-def _unit_line_height(unit: NativeTextUnit, default: float) -> float:
-    baselines = sorted(
-        line.origin[1]
-        for line in unit.lines
-        if isinstance(line.origin, tuple) and len(line.origin) == 2
-    )
-    if len(baselines) < 2:
-        return default
-    gaps = [
-        baselines[index + 1] - baselines[index]
-        for index in range(len(baselines) - 1)
-        if baselines[index + 1] > baselines[index]
-    ]
-    if not gaps:
-        return default
-    sizes = [line.font_size for line in unit.lines if line.font_size > 0]
-    if not sizes:
-        return default
-    ratio = median(gaps) / median(sizes)
-    return max(0.92, min(1.40, float(ratio)))
-
-
-def _relaxed_candidate_order(candidates: Sequence[Any]) -> List[Any]:
-    return sorted(
-        candidates,
-        key=lambda rect: (float(rect.get_area()), float(rect.width), float(rect.height)),
-        reverse=True,
-    )
-
-
-def _unit_css(
-    unit: NativeTextUnit,
-    font_resource: Any,
-    *,
-    line_height: float = NORMAL_LINE_HEIGHT,
-) -> str:
-    font_bundle = _ensure_font_bundle(font_resource)
-    default_resource = font_bundle.default
+def _unit_css(unit: NativeTextUnit, font_resource: _FontResource) -> str:
     color = f"#{unit.color & 0xFFFFFF:06x}"
     weight = "700" if unit.bold else "400"
-    font_style = "italic" if unit.italic else "normal"
     return (
-        font_bundle.font_face_css
-        + f" * {{ font-family: {default_resource.family}; font-size: {unit.font_size:.2f}pt; "
-        f"font-weight: {weight}; font-style: {font_style}; color: {color}; text-align: {unit.alignment}; "
-        f"line-height: {line_height:.2f}; margin: 0; padding: 0; }}"
+        font_resource.font_face_css
+        + f" * {{ font-family: {font_resource.family}; font-size: {unit.font_size:.2f}pt; "
+        f"font-weight: {weight}; color: {color}; text-align: {unit.alignment}; "
+        "line-height: 1.08; margin: 0; padding: 0; }"
     )
-
-
-def _unit_html(unit: NativeTextUnit, font_resource: Any, text: str) -> str:
-    font_bundle = _ensure_font_bundle(font_resource)
-    translated_lines = str(text or "").splitlines()
-    if translated_lines and len(translated_lines) == len(unit.lines):
-        rendered_lines = []
-        for translated_line, source_line in zip(translated_lines, unit.lines):
-            rendered_lines.append(
-                "<div>"
-                + _styled_line_html(translated_line, source_line.spans, unit, font_bundle)
-                + "</div>"
-            )
-        return "".join(rendered_lines)
-
-    return (
-        "<div>"
-        + _styled_line_html(
-            str(text or ""),
-            unit.style_runs if len(unit.style_runs) > 1 else [],
-            unit,
-            font_bundle,
-        ).replace("\n", "<br>")
-        + "</div>"
-    )
-
-
-def _styled_line_html(
-    text: str,
-    source_styles: Sequence[NativeTextSpanStyle],
-    unit: NativeTextUnit,
-    font_resource: Any,
-) -> str:
-    font_bundle = _ensure_font_bundle(font_resource)
-    styles = [style for style in source_styles if style.text.strip()]
-    if len(styles) <= 1:
-        style = styles[0] if styles else _unit_default_style(unit)
-        return (
-            f'<span style="{_inline_style(style, font_bundle)}">'
-            + html.escape(text)
-            + "</span>"
-        )
-    parts = _split_text_by_style_runs(text, styles)
-    return "".join(
-        f'<span style="{_inline_style(style, font_bundle)}">{html.escape(part)}</span>'
-        for part, style in zip(parts, styles)
-        if part
-    )
-
-
-def _unit_default_style(unit: NativeTextUnit) -> NativeTextSpanStyle:
-    return NativeTextSpanStyle(
-        text=unit.source_text,
-        bbox=unit.bbox,
-        font_size=unit.font_size,
-        font_name=unit.font_name,
-        color=unit.color,
-        bold=unit.bold,
-        italic=unit.italic,
-        font_family_kind=unit.font_family_kind,
-    )
-
-
-def _inline_style(style: NativeTextSpanStyle, font_resource: Any) -> str:
-    font_bundle = _ensure_font_bundle(font_resource)
-    resolved_resource = font_bundle.resource_for(style)
-    weight = "700" if style.bold else "400"
-    font_style = "italic" if style.italic else "normal"
-    color = f"#{style.color & 0xFFFFFF:06x}"
-    opacity = ""
-    if style.alpha < 255:
-        opacity = f"opacity:{max(0.0, min(1.0, style.alpha / 255)):.3f};"
-    return (
-        f"font-family:{resolved_resource.family};"
-        f"font-size:{max(4.0, style.font_size):.2f}pt;"
-        f"font-weight:{weight};"
-        f"font-style:{font_style};"
-        f"color:{color};"
-        f"{opacity}"
-    )
-
-
-def _split_text_by_style_runs(
-    text: str,
-    styles: Sequence[NativeTextSpanStyle],
-) -> List[str]:
-    if not styles:
-        return [text]
-    source_lengths = [max(1, len(style.text.strip())) for style in styles]
-    total_source = sum(source_lengths)
-    if total_source <= 0 or len(styles) == 1:
-        return [text]
-
-    parts: List[str] = []
-    start = 0
-    total_len = len(text)
-    cumulative = 0
-    for source_length in source_lengths[:-1]:
-        cumulative += source_length
-        target = int(round(total_len * cumulative / total_source))
-        split_at = _nearest_word_boundary(text, target, start)
-        parts.append(text[start:split_at])
-        start = split_at
-    parts.append(text[start:])
-    return parts
-
-
-def _nearest_word_boundary(text: str, target: int, minimum: int) -> int:
-    target = max(minimum, min(len(text), target))
-    if target >= len(text):
-        return len(text)
-    if target <= minimum:
-        return target
-    left = text.rfind(" ", minimum, target + 1)
-    right = text.find(" ", target)
-    candidates = [candidate for candidate in (left, right) if candidate >= minimum]
-    if not candidates:
-        return target
-    boundary = min(candidates, key=lambda candidate: abs(candidate - target))
-    return min(len(text), boundary + 1) if text[boundary : boundary + 1] == " " else boundary
 
 
 def _candidate_rects(
@@ -2130,7 +1335,6 @@ def _candidate_rects(
     source_rect: Any,
     role: str,
     occupied: Sequence[Any],
-    alignment: str = "left",
 ) -> List[Any]:
     base = fitz.Rect(source_rect)
     candidates = [base]
@@ -2139,11 +1343,21 @@ def _candidate_rects(
 
     width_extra = source_rect.width * 0.20
     height_extra = source_rect.height * 0.35
-    x0, x1 = _anchored_horizontal_bounds(source_rect, width_extra, alignment)
     expansions = [
-        fitz.Rect(x0, source_rect.y0, x1, source_rect.y1),
+        fitz.Rect(source_rect.x0, source_rect.y0, source_rect.x1 + width_extra, source_rect.y1),
         fitz.Rect(source_rect.x0, source_rect.y0, source_rect.x1, source_rect.y1 + height_extra),
-        fitz.Rect(x0, source_rect.y0, x1, source_rect.y1 + height_extra),
+        fitz.Rect(
+            source_rect.x0,
+            source_rect.y0,
+            source_rect.x1 + width_extra,
+            source_rect.y1 + height_extra,
+        ),
+        fitz.Rect(
+            source_rect.x0 - width_extra / 2,
+            source_rect.y0 - height_extra / 3,
+            source_rect.x1 + width_extra / 2,
+            source_rect.y1 + height_extra * 2 / 3,
+        ),
     ]
     for candidate in expansions:
         candidate &= page_rect
@@ -2152,19 +1366,6 @@ def _candidate_rects(
         if _expansion_is_free(candidate, source_rect, occupied):
             candidates.append(candidate)
     return candidates
-
-
-def _anchored_horizontal_bounds(
-    source_rect: Any,
-    width_extra: float,
-    alignment: str,
-) -> Tuple[float, float]:
-    normalized = str(alignment or "left").strip().lower()
-    if normalized == "right":
-        return (source_rect.x0 - width_extra, source_rect.x1)
-    if normalized == "center":
-        return (source_rect.x0 - width_extra / 2, source_rect.x1 + width_extra / 2)
-    return (source_rect.x0, source_rect.x1 + width_extra)
 
 
 def _expansion_is_free(candidate: Any, source_rect: Any, occupied: Sequence[Any]) -> bool:
@@ -2205,15 +1406,11 @@ def _load_translation_layer(
         for block in _iter_layer_blocks(payload):
             stable_id = str(block.get("stable_id") or "")
             unit = by_id.get(stable_id)
-            if unit is not None and not _layer_block_matches_unit(block, unit):
-                unit = None
-            if unit is None:
-                unit = _find_layer_unit_by_text_bbox(block, units)
-            if unit is None:
+            if unit is None or not _layer_block_matches_unit(block, unit):
                 continue
             translation = str(block.get("translated_text") or "").strip()
             if translation:
-                cached[unit.stable_id] = translation
+                cached[stable_id] = translation
     else:
         for block in _iter_layer_blocks(payload):
             for unit in units:
@@ -2268,27 +1465,6 @@ def _legacy_layer_block_matches_unit(block: Dict[str, Any], unit: NativeTextUnit
     )
 
 
-def _find_layer_unit_by_text_bbox(
-    block: Dict[str, Any],
-    units: Sequence[NativeTextUnit],
-) -> Optional[NativeTextUnit]:
-    source_text = str(block.get("text") or "")
-    bbox = _coerce_bbox(block.get("bbox"))
-    if not source_text or bbox is None:
-        return None
-    block_rect = fitz.Rect(bbox)
-    best_unit: Optional[NativeTextUnit] = None
-    best_score = 0.0
-    for unit in units:
-        if source_text != unit.source_text:
-            continue
-        score = _rect_overlap_score(block_rect, fitz.Rect(unit.bbox))
-        if score > best_score:
-            best_score = score
-            best_unit = unit
-    return best_unit if best_score >= 0.80 else None
-
-
 def _save_translation_layer(
     path: Optional[Path],
     *,
@@ -2312,50 +1488,6 @@ def _save_translation_layer(
                 "translated_text": unit.translated_text or unit.source_text,
                 "font_scale": unit.font_scale,
                 "layout_warning": unit.layout_warning,
-                "font_fallback_reason": unit.font_fallback_reason,
-                "style": {
-                    "font_size": unit.font_size,
-                    "font_name": unit.font_name,
-                    "font_family_kind": unit.font_family_kind,
-                    "color": unit.color,
-                    "bold": unit.bold,
-                    "italic": unit.italic,
-                    "rotation": unit.rotation,
-                    "alignment": unit.alignment,
-                },
-                "lines": [
-                    {
-                        "text": line.text,
-                        "bbox": list(line.bbox),
-                        "origin": list(line.origin),
-                        "font_size": line.font_size,
-                        "direction": list(line.direction),
-                        "writing_mode": line.writing_mode,
-                        "spans": [
-                            {
-                                "text": span.text,
-                                "bbox": list(span.bbox),
-                                "font_size": span.font_size,
-                                "font_name": span.font_name,
-                                "font_family_kind": span.font_family_kind,
-                                "color": span.color,
-                                "bold": span.bold,
-                                "italic": span.italic,
-                                "flags": span.flags,
-                                "char_flags": span.char_flags,
-                                "alpha": span.alpha,
-                                "ascender": span.ascender,
-                                "descender": span.descender,
-                                "origin": list(span.origin) if span.origin else None,
-                                "bidi": span.bidi,
-                                "char_count": span.char_count,
-                                "average_char_width": span.average_char_width,
-                            }
-                            for span in line.spans
-                        ],
-                    }
-                    for line in unit.lines
-                ],
             }
             for unit in page.units
         ]
@@ -2368,7 +1500,7 @@ def _save_translation_layer(
             }
         )
     payload = {
-        "version": 3,
+        "version": 2,
         "document_sha256": file_hash,
         "processing_mode": "native" if not ocr_pages else "hybrid",
         "native_pages": list(native_pages),
@@ -2377,16 +1509,13 @@ def _save_translation_layer(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    log(f"PDF: сохранён JSON слой v3: {path}")
+    log(f"PDF: сохранён JSON слой v2: {path}")
 
 
 def _save_output_document(
     document: Any,
     fallback_documents: Dict[int, bytes],
     output_path: Path,
-    *,
-    link_snapshots: Optional[Dict[int, List[Dict[str, Any]]]] = None,
-    page_labels: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_document = document
@@ -2395,10 +1524,6 @@ def _save_output_document(
     if fallback_documents:
         composed = fitz.open()
         metadata = document.metadata
-        try:
-            xml_metadata = document.get_xml_metadata()
-        except Exception:
-            xml_metadata = ""
         toc = document.get_toc(simple=False)
         for page_index in range(len(document)):
             fallback_bytes = fallback_documents.get(page_index)
@@ -2409,20 +1534,12 @@ def _save_output_document(
             fallback_handles.append(fallback)
             composed.insert_pdf(fallback, from_page=0, to_page=0)
         composed.set_metadata(metadata)
-        if xml_metadata:
-            try:
-                composed.set_xml_metadata(xml_metadata)
-            except Exception:
-                pass
         if toc:
             try:
                 composed.set_toc(toc)
             except Exception:
                 pass
         output_document = composed
-
-    _restore_page_labels(output_document, page_labels or [])
-    _restore_document_links(output_document, link_snapshots or {})
 
     temporary_path: Optional[Path] = None
     try:
@@ -2448,129 +1565,6 @@ def _save_output_document(
             fallback.close()
         if composed is not None:
             composed.close()
-
-
-def _snapshot_document_links(document: Any) -> Dict[int, List[Dict[str, Any]]]:
-    snapshots: Dict[int, List[Dict[str, Any]]] = {}
-    for page_index in range(len(document)):
-        try:
-            links = document[page_index].get_links()
-        except Exception:
-            links = []
-        clean_links = [
-            clean
-            for link in links
-            if (clean := _clean_link_dict(link)) is not None
-        ]
-        if clean_links:
-            snapshots[page_index] = clean_links
-    return snapshots
-
-
-def _restore_document_links(
-    document: Any,
-    snapshots: Dict[int, List[Dict[str, Any]]],
-) -> None:
-    if not snapshots:
-        return
-    for page_index, links in snapshots.items():
-        if page_index < 0 or page_index >= len(document):
-            continue
-        page = document[page_index]
-        try:
-            existing = [
-                clean
-                for link in page.get_links()
-                if (clean := _clean_link_dict(link)) is not None
-            ]
-        except Exception:
-            existing = []
-        for link in links:
-            if any(_links_equal(link, candidate) for candidate in existing):
-                continue
-            try:
-                page.insert_link(dict(link))
-                existing.append(link)
-            except Exception:
-                continue
-
-
-def _clean_link_dict(link: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not isinstance(link, dict):
-        return None
-    cleaned: Dict[str, Any] = {}
-    for key, value in link.items():
-        if key in {"xref", "id"}:
-            continue
-        if key == "from":
-            try:
-                cleaned[key] = fitz.Rect(value)
-            except Exception:
-                return None
-        elif key == "to":
-            try:
-                cleaned[key] = fitz.Point(value)
-            except Exception:
-                cleaned[key] = value
-        else:
-            cleaned[key] = value
-    return cleaned if "kind" in cleaned and "from" in cleaned else None
-
-
-def _links_equal(first: Dict[str, Any], second: Dict[str, Any]) -> bool:
-    if first.get("kind") != second.get("kind"):
-        return False
-    if not _bbox_matches_rect(first.get("from"), second.get("from")):
-        return False
-    for key in ("uri", "file", "page", "xref", "nameddest"):
-        if first.get(key) != second.get(key):
-            return False
-    return _points_equal(first.get("to"), second.get("to"))
-
-
-def _points_equal(first: Any, second: Any, tolerance: float = 0.01) -> bool:
-    if first is None and second is None:
-        return True
-    if first is None or second is None:
-        return False
-    try:
-        first_point = fitz.Point(first)
-        second_point = fitz.Point(second)
-    except Exception:
-        return first == second
-    return (
-        abs(first_point.x - second_point.x) <= tolerance
-        and abs(first_point.y - second_point.y) <= tolerance
-    )
-
-
-def _bbox_matches_rect(first: Any, second: Any, tolerance: float = 0.01) -> bool:
-    try:
-        first_rect = fitz.Rect(first)
-        second_rect = fitz.Rect(second)
-    except Exception:
-        return False
-    return all(
-        abs(a - b) <= tolerance
-        for a, b in zip(_rect_tuple(first_rect), _rect_tuple(second_rect))
-    )
-
-
-def _snapshot_page_labels(document: Any) -> List[Dict[str, Any]]:
-    try:
-        labels = document.get_page_labels()
-    except Exception:
-        return []
-    return [dict(label) for label in labels or [] if isinstance(label, dict)]
-
-
-def _restore_page_labels(document: Any, labels: Sequence[Dict[str, Any]]) -> None:
-    if not labels:
-        return
-    try:
-        document.set_page_labels([dict(label) for label in labels])
-    except Exception:
-        pass
 
 
 def _canonical_text(text: str) -> str:
@@ -2601,36 +1595,6 @@ def _coerce_span_bbox(value: Any) -> Optional[BBox]:
     return bbox  # type: ignore[return-value]
 
 
-def _coerce_point(
-    value: Any,
-    default: Tuple[float, float],
-) -> Tuple[float, float]:
-    if not isinstance(value, (tuple, list)) or len(value) != 2:
-        return default
-    try:
-        return (float(value[0]), float(value[1]))
-    except (TypeError, ValueError):
-        return default
-
-
-def _coerce_optional_point(value: Any) -> Optional[Tuple[float, float]]:
-    if not isinstance(value, (tuple, list)) or len(value) != 2:
-        return None
-    try:
-        return (float(value[0]), float(value[1]))
-    except (TypeError, ValueError):
-        return None
-
-
-def _coerce_optional_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _bbox_union(first: BBox, second: BBox) -> BBox:
     return (
         min(first[0], second[0]),
@@ -2659,14 +1623,6 @@ def _vertical_overlap_ratio(first: Any, second: Any) -> float:
     overlap = max(0.0, min(first.y1, second.y1) - max(first.y0, second.y0))
     denominator = min(first.height, second.height)
     return overlap / denominator if denominator > 0 else 0.0
-
-
-def _rect_overlap_score(first: Any, second: Any) -> float:
-    intersection = first & second
-    if intersection.is_empty:
-        return 0.0
-    denominator = min(first.get_area(), second.get_area())
-    return intersection.get_area() / denominator if denominator > 0 else 0.0
 
 
 def _rect_tuple(rect: Any) -> BBox:
