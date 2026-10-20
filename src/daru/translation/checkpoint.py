@@ -4,22 +4,27 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import tempfile
+import sqlite3
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from ..config import normalize_language_code
+from ..utils.io import write_json_atomic
+from ..utils.paths import user_data_dir
+from . import checkpoint_sqlite
+
 CheckpointLog = Callable[[str], None]
 
 CHECKPOINT_VERSION = 1
 CHECKPOINT_POLICIES = {"auto", "ignore", "reset"}
-DEFAULT_CHECKPOINT_ROOT = Path.home() / ".daru" / "checkpoints"
+DEFAULT_CHECKPOINT_ROOT = user_data_dir() / "checkpoints"
 
 
-@dataclass
+@dataclass(frozen=True)
 class CheckpointBlock:
     id: str
     source_text: str
@@ -29,7 +34,7 @@ class CheckpointBlock:
 
 
 class TranslationCheckpointStore:
-    """JSON checkpoint that can be updated after every successful batch."""
+    """Incremental SQLite checkpoint, with explicit JSON-path compatibility."""
 
     def __init__(
         self,
@@ -43,30 +48,44 @@ class TranslationCheckpointStore:
         backend: Optional[str] = None,
         resume_policy: str = "auto",
         log: Optional[CheckpointLog] = None,
+        settings_fingerprint: Optional[str] = None,
     ) -> None:
         self.path = Path(path).expanduser()
         self.job_type = str(job_type or "").strip().lower()
         self.document_sha256 = str(document_sha256 or "")
-        self.source_lang = str(source_lang or "")
-        self.target_lang = str(target_lang or "")
+        self.source_lang = normalize_language_code(source_lang, "en")
+        self.target_lang = normalize_language_code(target_lang, "ru")
+        self.settings_fingerprint = settings_fingerprint
         self.translator = str(translator or "")
         self.backend = str(backend or "")
         self._log = log or (lambda _message: None)
         self._blocks: Dict[Tuple[str, str], CheckpointBlock] = {}
+        self._dirty: Dict[Tuple[str, str], CheckpointBlock] = {}
+        self._sqlite = _is_sqlite_path(self.path)
+        self._generation: Optional[str] = None
+        self._replace = True
+        self._metadata_dirty = True
 
         policy = normalize_resume_policy(resume_policy)
-        if policy == "reset":
+        if self._sqlite and policy != "auto":
+            # Read only the generation: ignore/reset must not import old rows.
+            _payload, self._generation = checkpoint_sqlite.read_snapshot(self.path, include_blocks=False)
+            if policy == "reset":
+                self.save()  # An empty checkpoint also prevents legacy re-import.
+        elif policy == "reset":
             remove_checkpoint(self.path)
         elif policy == "auto":
             self._load_existing()
 
     @property
     def blocks(self) -> List[CheckpointBlock]:
-        return list(self._blocks.values())
+        """Return snapshots; mutations must go through upsert()."""
+        return deepcopy(list(self._blocks.values()))
 
     def set_backend(self, backend: Optional[str]) -> None:
-        if backend:
+        if backend and str(backend) != self.backend:
             self.backend = str(backend)
+            self._metadata_dirty = True
 
     def get(
         self,
@@ -105,13 +124,17 @@ class TranslationCheckpointStore:
         block_id = str(block_id or "")
         if not block_id:
             block_id = stable_text_id(namespace, source_text)
-        self._blocks[(namespace, block_id)] = CheckpointBlock(
+        block = CheckpointBlock(
             id=block_id,
             namespace=namespace,
             source_text=str(source_text or ""),
             translated_text=str(translated_text or ""),
-            extra=dict(extra or {}),
+            extra=deepcopy(dict(extra or {})),
         )
+        key = (namespace, block_id)
+        if self._blocks.get(key) != block:
+            self._blocks[key] = block
+            self._dirty[key] = block
 
     def upsert_many(
         self,
@@ -127,6 +150,8 @@ class TranslationCheckpointStore:
             )
 
     def save(self) -> None:
+        if not self._dirty and not self._metadata_dirty and not self._replace:
+            return
         payload = {
             "version": CHECKPOINT_VERSION,
             "job_type": self.job_type,
@@ -135,43 +160,41 @@ class TranslationCheckpointStore:
             "target_lang": self.target_lang,
             "translator": self.translator,
             "backend": self.backend,
+            "settings_fingerprint": self.settings_fingerprint,
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "blocks": [
-                {
-                    "id": block.id,
-                    "source_text": block.source_text,
-                    "translated_text": block.translated_text,
-                    "namespace": block.namespace,
-                    "extra": block.extra,
-                }
-                for block in sorted(
-                    self._blocks.values(),
-                    key=lambda item: (item.namespace, item.id),
-                )
-            ],
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{self.path.name}.",
-            suffix=".tmp",
-            dir=str(self.path.parent),
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-            os.replace(tmp_name, self.path)
-        finally:
-            try:
-                Path(tmp_name).unlink(missing_ok=True)
-            except OSError:
-                pass
+        if self._sqlite:
+            blocks = self._blocks if self._replace else self._dirty
+            self._generation = checkpoint_sqlite.write_batch(
+                self.path, payload, (_block_payload(block) for block in blocks.values()),
+                expected_generation=self._generation, replace=self._replace,
+            )
+        else:
+            payload["blocks"] = [_block_payload(block) for block in self._blocks.values()]
+            write_json_atomic(self.path, payload)
+        self._dirty.clear()
+        self._replace = False
+        self._metadata_dirty = False
 
     def _load_existing(self) -> None:
-        if not self.path.exists():
-            return
-        payload = _read_payload(self.path, self._log)
+        migrate = False
+        if self._sqlite:
+            try:
+                payload, self._generation = checkpoint_sqlite.read_snapshot(self.path)
+            except (sqlite3.DatabaseError, ValueError) as exc:
+                # Fail before spending translation requests on a job whose
+                # checkpoint cannot be persisted safely.
+                raise RuntimeError(f"Невозможно прочитать checkpoint {self.path}: {exc}") from exc
+            if payload is None:
+                legacy_path = self.path.with_suffix(".json")
+                payload = _read_payload(legacy_path, self._log) if legacy_path.exists() else None
+                migrate = payload is not None
+        else:
+            payload = _read_payload(self.path, self._log) if self.path.exists() else None
         if payload is None:
+            return
+        if self.settings_fingerprint is not None and payload.get("settings_fingerprint") != self.settings_fingerprint:
+            self._log("Checkpoint: настройки перевода изменились или отсутствуют; начинаем заново")
             return
         if not _payload_matches(
             payload,
@@ -208,6 +231,12 @@ class TranslationCheckpointStore:
             self._log(
                 f"Checkpoint loaded: {len(self._blocks)} translated blocks ({self.path})"
             )
+        if migrate:
+            self.save()
+            self._log(f"Checkpoint перенесён в SQLite; исходный JSON сохранён: {self.path}")
+        else:
+            self._replace = False
+            self._metadata_dirty = False
 
 
 def normalize_resume_policy(value: Optional[str]) -> str:
@@ -226,7 +255,7 @@ def default_checkpoint_path(
     path_hash = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
     safe_stem = _safe_filename(path.stem or "document")
     safe_job = _safe_filename(str(job_type or "job").lower())
-    return (root or DEFAULT_CHECKPOINT_ROOT) / f"{safe_stem}.{safe_job}.{path_hash}.checkpoint.json"
+    return (root or DEFAULT_CHECKPOINT_ROOT) / f"{safe_stem}.{safe_job}.{path_hash}.checkpoint.sqlite3"
 
 
 def file_sha256(path: Path) -> str:
@@ -254,11 +283,29 @@ def has_valid_checkpoint(
     source_lang: str,
     target_lang: str,
     log: Optional[CheckpointLog] = None,
+    settings_fingerprint: Optional[str] = None,
 ) -> bool:
-    if path is None or not Path(path).expanduser().exists():
+    if path is None:
         return False
-    payload = _read_payload(Path(path).expanduser(), log or (lambda _message: None))
+    resolved = Path(path).expanduser()
+    logger = log or (lambda _message: None)
+    sqlite_has_blocks = None
+    if _is_sqlite_path(resolved):
+        try:
+            payload, _generation = checkpoint_sqlite.read_snapshot(resolved, include_blocks=False)
+            if payload is not None:
+                sqlite_has_blocks = bool(payload.get("has_blocks"))
+        except (sqlite3.DatabaseError, ValueError) as exc:
+            logger(f"Checkpoint: невозможно проверить {resolved}: {exc}")
+            return False
+        if payload is None:
+            legacy = resolved.with_suffix(".json")
+            payload = _read_payload(legacy, logger) if legacy.exists() else None
+    else:
+        payload = _read_payload(resolved, logger) if resolved.exists() else None
     if payload is None:
+        return False
+    if settings_fingerprint is not None and payload.get("settings_fingerprint") != settings_fingerprint:
         return False
     try:
         document_hash = file_sha256(input_path)
@@ -268,11 +315,13 @@ def has_valid_checkpoint(
         payload,
         job_type=str(job_type or "").strip().lower(),
         document_sha256=document_hash,
-        source_lang=str(source_lang or ""),
-        target_lang=str(target_lang or ""),
+        source_lang=normalize_language_code(source_lang, "en"),
+        target_lang=normalize_language_code(target_lang, "ru"),
     ):
         return False
     blocks = payload.get("blocks")
+    if sqlite_has_blocks is not None:
+        return sqlite_has_blocks
     return isinstance(blocks, list) and any(
         isinstance(block, dict) and str(block.get("translated_text") or "")
         for block in blocks
@@ -282,10 +331,26 @@ def has_valid_checkpoint(
 def remove_checkpoint(path: Optional[Path]) -> None:
     if path is None:
         return
-    try:
-        Path(path).expanduser().unlink(missing_ok=True)
-    except OSError:
-        pass
+    resolved = Path(path).expanduser()
+    if _is_sqlite_path(resolved):
+        # Preserve a tombstone instead of deleting an active database/journal;
+        # otherwise an old JSON sibling could be imported again on the next run.
+        _payload, generation = checkpoint_sqlite.read_snapshot(resolved, include_blocks=False)
+        checkpoint_sqlite.write_batch(resolved, {}, (), expected_generation=generation, replace=True)
+    else:
+        try:
+            resolved.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _is_sqlite_path(path: Path) -> bool:
+    return path.suffix.lower() in {".sqlite3", ".sqlite", ".db"}
+
+
+def _block_payload(block: CheckpointBlock) -> Dict[str, Any]:
+    return {"id": block.id, "source_text": block.source_text, "translated_text": block.translated_text,
+            "namespace": block.namespace, "extra": block.extra}
 
 
 def _payload_matches(
@@ -296,8 +361,12 @@ def _payload_matches(
     source_lang: str,
     target_lang: str,
 ) -> bool:
+    try:
+        version = int(payload.get("version", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
     return (
-        int(payload.get("version", 0) or 0) == CHECKPOINT_VERSION
+        version == CHECKPOINT_VERSION
         and str(payload.get("job_type") or "").strip().lower() == job_type
         and str(payload.get("document_sha256") or "") == document_sha256
         and str(payload.get("source_lang") or "") == source_lang

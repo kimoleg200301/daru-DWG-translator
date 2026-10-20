@@ -24,20 +24,25 @@ from PySide6.QtWidgets import (
 
 from .. import APP_DISPLAY_NAME
 from ..config import (
-    LANGUAGE_CHOICES,
     ORIGINAL_FONT_LABEL,
     ORIGINAL_FONT_VALUE,
     OUTPUT_FORMAT_CHOICES,
     PDF_TYPE_CHOICES,
     STYLE_FONT_CHOICES,
+    STYLE_FONT_LABEL_BY_FILE,
     TRANSLATOR_CHOICES,
-    AppSettings,
     SettingsManager,
+    language_combo_code,
     normalize_style_font,
     populate_combo,
+    populate_language_combo,
+    set_language_combo_value,
 )
-from ..pdf.pipeline import PDF_TYPE_NATIVE, PDF_TYPE_SCANNED, _CACHE_DIR
+from ..pdf.config import PDF_TYPE_NATIVE, PDF_TYPE_SCANNED, _CACHE_DIR
 from ..translation.checkpoint import default_checkpoint_path, has_valid_checkpoint
+from ..translation.options import TranslationOptions
+from ..translation.prompts import JOB_PROMPTS
+from ..translation.progress import ProgressEvent
 from .analysis_dialog import CodexAnalysisDialog
 from .pdf_dialogs import PdfProcessingDialog
 from .settings_dialog import SettingsDialog
@@ -49,8 +54,13 @@ class MainWindow(QWidget):
         super().__init__()
         self.settings_manager = settings_manager
         self.worker: Optional[TranslateWorker] = None
+        self._close_after_worker = False
+        self._cancel_requested = False
+        self._analysis_dialog: Optional[CodexAnalysisDialog] = None
         self._pdf_input_active = False
         self._docx_input_active = False
+        self._output_path_auto = True
+        self._translated_path_auto = True
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(860, 640)
         self.setAcceptDrops(True)
@@ -71,10 +81,15 @@ class MainWindow(QWidget):
         self.pdf_type_widget = QWidget()
         pdf_type_layout = QHBoxLayout(self.pdf_type_widget)
         pdf_type_layout.setContentsMargins(0, 0, 0, 0)
-        self.pdf_type_label = QLabel("Тип PDF")
+        self.pdf_type_label = QLabel("Режим обработки PDF")
         self.pdf_type_combo = QComboBox()
         for label, code in PDF_TYPE_CHOICES:
             self.pdf_type_combo.addItem(label, code)
+        self.pdf_type_combo.setToolTip(
+            "«OCR всех страниц» обрабатывает каждую страницу как изображение.\n"
+            "«Текстовый слой + OCR при необходимости» извлекает встроенный "
+            "текст и включает OCR только для страниц без пригодного текстового слоя."
+        )
         pdf_type_layout.addWidget(self.pdf_type_label)
         pdf_type_layout.addWidget(self.pdf_type_combo)
         pdf_type_layout.addStretch()
@@ -94,6 +109,7 @@ class MainWindow(QWidget):
         self.pdf_layer_widget.setVisible(False)
 
         self.output_edit = QLineEdit()
+        self.output_edit.textEdited.connect(self._mark_output_path_manual)
         self.output_browse = QPushButton("Сохранить как...")
         self.output_browse.clicked.connect(self.select_output_file)
         self.output_format_combo = QComboBox()
@@ -121,13 +137,16 @@ class MainWindow(QWidget):
         self.codex_mode_title = QLabel("Переводчик")
         self.codex_mode_value = QLabel()
         self.source_lang_combo = QComboBox()
-        populate_combo(self.source_lang_combo, LANGUAGE_CHOICES, settings_manager.data.source_lang, editable=False)
+        populate_language_combo(self.source_lang_combo, settings_manager.data.source_lang)
         self.target_lang_combo = QComboBox()
-        populate_combo(self.target_lang_combo, LANGUAGE_CHOICES, settings_manager.data.target_lang, editable=False)
+        populate_language_combo(self.target_lang_combo, settings_manager.data.target_lang)
+        self.target_lang_combo.currentIndexChanged.connect(self.handle_target_language_change)
         self.style_font_combo = QComboBox()
         self.style_font_combo.addItem(ORIGINAL_FONT_LABEL, ORIGINAL_FONT_VALUE)
         for font_name in STYLE_FONT_CHOICES:
-            self.style_font_combo.addItem(font_name, font_name)
+            self.style_font_combo.addItem(
+                STYLE_FONT_LABEL_BY_FILE.get(font_name, font_name), font_name
+            )
 
         self.map_checkbox = QCheckBox("Сохранить CSV карту переводов")
         self.map_path_edit = QLineEdit()
@@ -140,12 +159,16 @@ class MainWindow(QWidget):
         self.extracted_browse = QPushButton("...")
         self.extracted_browse.clicked.connect(lambda: self.browse_aux_file(self.extracted_path_edit))
         self.translated_path_edit = QLineEdit()
+        self.translated_path_edit.textEdited.connect(self._mark_translated_path_manual)
         self.translated_browse = QPushButton("...")
         self.translated_browse.clicked.connect(lambda: self.browse_aux_file(self.translated_path_edit))
         self.txt_checkbox.toggled.connect(self.update_aux_controls)
 
         self.start_button = QPushButton("Запустить перевод")
         self.start_button.clicked.connect(self.start_translation)
+        self.cancel_button = QPushButton("Отменить перевод")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_translation)
         self.settings_button = QPushButton("Настройки перевода")
         self.settings_button.clicked.connect(self.open_settings)
         self.clear_log_button = QPushButton("Очистить лог")
@@ -201,6 +224,7 @@ class MainWindow(QWidget):
 
         buttons_row = QHBoxLayout()
         buttons_row.addWidget(self.start_button)
+        buttons_row.addWidget(self.cancel_button)
         buttons_row.addWidget(self.settings_button)
         buttons_row.addWidget(self.clear_log_button)
         buttons_row.addStretch()
@@ -216,8 +240,8 @@ class MainWindow(QWidget):
     def restore_from_settings(self) -> None:
         data = self.settings_manager.data
         self.translator_combo.setCurrentText(data.translator_name)
-        self.source_lang_combo.setCurrentText(data.source_lang)
-        self.target_lang_combo.setCurrentText(data.target_lang)
+        set_language_combo_value(self.source_lang_combo, data.source_lang)
+        set_language_combo_value(self.target_lang_combo, data.target_lang)
         style_font = normalize_style_font(data.style_font) or STYLE_FONT_CHOICES[0]
         style_font_index = self.style_font_combo.findData(style_font)
         if style_font_index < 0:
@@ -236,6 +260,8 @@ class MainWindow(QWidget):
         filename, _ = QFileDialog.getSaveFileName(self, "Выберите файл", str(start_dir))
         if filename:
             target.setText(filename)
+            if target is self.translated_path_edit:
+                self._translated_path_auto = False
 
     def select_input_file(self) -> None:
         start_dir = self.settings_manager.data.last_directory
@@ -263,7 +289,34 @@ class MainWindow(QWidget):
         filename, _ = QFileDialog.getSaveFileName(self, caption, str(start_dir), pattern)
         if filename:
             self.output_edit.setText(filename)
+            self._output_path_auto = False
             self.sync_output_suffix()
+
+    def _mark_output_path_manual(self, _text: str) -> None:
+        self._output_path_auto = False
+
+    def _mark_translated_path_manual(self, _text: str) -> None:
+        self._translated_path_auto = False
+
+    def _target_lang_filename_suffix(self) -> str:
+        code = language_combo_code(self.target_lang_combo, "ru").strip().lower()
+        if not code or code == "auto":
+            code = "ru"
+        safe_code = "".join(
+            char for char in code if char.isalnum() or char in {"-", "_"}
+        )
+        return safe_code or "ru"
+
+    def handle_target_language_change(self, _index: int) -> None:
+        input_path = self.input_edit.text().strip()
+        if not input_path:
+            return
+        defaults = self.derive_default_paths(Path(input_path))
+        if self._output_path_auto:
+            self.output_edit.setText(str(defaults["output"]))
+            self.sync_output_suffix()
+        if self._translated_path_auto:
+            self.translated_path_edit.setText(str(defaults["translated"]))
 
     def update_aux_controls(self) -> None:
         pdf_mode = self.is_pdf_input()
@@ -342,6 +395,8 @@ class MainWindow(QWidget):
         self.map_path_edit.setText(str(defaults["map"]))
         self.extracted_path_edit.setText(str(defaults["extracted"]))
         self.translated_path_edit.setText(str(defaults["translated"]))
+        self._output_path_auto = True
+        self._translated_path_auto = True
         if self._pdf_input_active:
             self.pdf_layer_path_edit.setText(str(defaults.get("pdf_layer", path.with_suffix(".translation.json"))))
         self.settings_manager.update(last_directory=str(path.parent))
@@ -351,6 +406,7 @@ class MainWindow(QWidget):
     def derive_default_paths(self, input_path: Path) -> Dict[str, Path]:
         stem = input_path.stem
         parent = input_path.parent
+        target_suffix = self._target_lang_filename_suffix()
         if input_path.suffix.lower() == ".pdf":
             out_suffix = ".pdf"
         elif input_path.suffix.lower() == ".docx":
@@ -359,10 +415,10 @@ class MainWindow(QWidget):
             out_suffix = ".dwg" if (self.output_format_combo.currentText() or "dwg").lower() == "dwg" else ".dxf"
         pdf_layer = parent / f"{stem}_translation.json"
         return {
-            "output": parent / f"{stem}_ru{out_suffix}",
+            "output": parent / f"{stem}_{target_suffix}{out_suffix}",
             "map": parent / f"{stem}_map.csv",
             "extracted": parent / f"{stem}_texts.txt",
-            "translated": parent / f"{stem}_texts_ru.txt",
+            "translated": parent / f"{stem}_texts_{target_suffix}.txt",
             "pdf_layer": pdf_layer,
         }
 
@@ -403,8 +459,8 @@ class MainWindow(QWidget):
             "input_path": input_obj,
             "output_path": output_obj,
             "translator_name": "codex" if codex_enabled else self.translator_combo.currentText(),
-            "source_lang": self.source_lang_combo.currentText().strip() or "en",
-            "target_lang": self.target_lang_combo.currentText().strip() or "ru",
+            "source_lang": language_combo_code(self.source_lang_combo, "en"),
+            "target_lang": language_combo_code(self.target_lang_combo, "ru"),
             "style_font": style_font or STYLE_FONT_CHOICES[0],
             "deepl_key": None if codex_enabled else data.deepl_key or None,
             "openai_key": None if codex_enabled else data.openai_key or None,
@@ -446,6 +502,7 @@ class MainWindow(QWidget):
         job_type: str,
         source_lang: str,
         target_lang: str,
+        settings_fingerprint: Optional[str] = None,
     ) -> Optional[str]:
         if not has_valid_checkpoint(
             checkpoint_path,
@@ -453,6 +510,7 @@ class MainWindow(QWidget):
             job_type=job_type,
             source_lang=source_lang,
             target_lang=target_lang,
+            settings_fingerprint=settings_fingerprint,
         ):
             return "auto"
 
@@ -534,13 +592,16 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Выполнение", "Подождите завершения текущей операции")
             return
         self.append_log(start_message)
+        self._cancel_requested = False
         self.start_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
         self.worker = TranslateWorker(params)
         self.worker.log_signal.connect(self.append_log)
         self.worker.error_signal.connect(self.handle_error)
         self.worker.finished_signal.connect(self.handle_finished)
         self.worker.analysis_ready_signal.connect(self.handle_analysis_ready)
         self.worker.cancelled_signal.connect(self.handle_cancelled)
+        self.worker.progress_signal.connect(self.handle_progress)
         self.worker.finished.connect(self.reset_worker)
         self.worker.start()
         if params.get("translator_name") == "codex":
@@ -648,6 +709,9 @@ class MainWindow(QWidget):
             job_type=checkpoint_job_type,
             source_lang=params["source_lang"],
             target_lang=params["target_lang"],
+            settings_fingerprint=TranslationOptions.from_mapping(
+                params, system_prompt_template=JOB_PROMPTS.get(checkpoint_job_type)
+            ).fingerprint(checkpoint_job_type),
         )
         if resume_policy is None:
             return
@@ -657,21 +721,53 @@ class MainWindow(QWidget):
 
     def handle_error(self, message: str) -> None:
         self.append_log(f"Ошибка: {message}")
-        QMessageBox.critical(self, "Ошибка", message)
+        if not self._close_after_worker:
+            QMessageBox.critical(self, "Ошибка", message)
         self.start_button.setEnabled(True)
         self.status_label.setText("Ошибка при переводе")
 
     def handle_analysis_ready(self, payload: Dict[str, Any]) -> None:
-        if self.worker is None:
+        if self.worker is None or self._cancel_requested:
             return
+        if self.settings_manager.data.codex_analysis_auto_approve:
+            approved_text = str(payload.get("text") or "").strip()
+            if approved_text:
+                self.worker.submit_analysis(approved_text)
+                self.append_log("Предварительный анализ подтверждён автоматически.")
+                warning = str(payload.get("warning") or "").strip()
+                if warning:
+                    self.append_log(f"Преданализ: {warning}")
+                self.status_label.setText("Перевод выполняется...")
+                return
         self.status_label.setText("Ожидание подтверждения анализа...")
         dialog = CodexAnalysisDialog(payload, self)
-        if dialog.exec() == QDialog.Accepted:
+        self._analysis_dialog = dialog
+        accepted = dialog.exec() == QDialog.Accepted
+        self._analysis_dialog = None
+        if self.worker is None:
+            return
+        if accepted:
             self.worker.submit_analysis(dialog.approved_text())
             self.status_label.setText("Перевод выполняется...")
         else:
             self.worker.submit_analysis(None)
             self.status_label.setText("Перевод отменяется...")
+
+    def handle_progress(self, event: ProgressEvent) -> None:
+        if self.worker is None or self._cancel_requested or self._analysis_dialog is not None:
+            return
+        labels = {
+            "read": "Чтение документа", "ocr": "Распознавание текста",
+            "analysis": "Анализ документа", "translate": "Перевод текста",
+            "apply": "Применение перевода", "export": "Сохранение результата",
+            "complete": "Перевод завершён",
+        }
+        label = labels[event.stage]
+        if event.completed is not None:
+            label += f": {event.completed}"
+            if event.total is not None:
+                label += f" из {event.total}"
+        self.status_label.setText(label)
 
     def handle_cancelled(self, message: str) -> None:
         self.append_log(message)
@@ -681,14 +777,24 @@ class MainWindow(QWidget):
     def handle_finished(self, payload: Dict[str, Any]) -> None:
         self.append_log(f"Готово. Результат: {payload['output_path']}")
         self.append_log(f"Движок перевода: {payload['backend']}")
-        QMessageBox.information(self, "Готово", f"Файл сохранён: {payload['output_path']}")
+        layout_warnings = list(payload.get("layout_warnings") or [])
+        for warning in layout_warnings:
+            self.append_log(f"PDF: предупреждение разметки: {warning}")
+        completion_message = f"Файл сохранён: {payload['output_path']}"
+        if layout_warnings:
+            completion_message += (
+                f"\n\nОбластей, требующих проверки: {len(layout_warnings)}. "
+                "Подробности добавлены в журнал."
+            )
+        if not self._close_after_worker:
+            QMessageBox.information(self, "Готово", completion_message)
         self.start_button.setEnabled(True)
         self.status_label.setText("Перевод завершён")
         job_type = payload.get("job_type", "cad")
         update_payload: Dict[str, Any] = {
             "translator_name": self.translator_combo.currentText(),
-            "source_lang": self.source_lang_combo.currentText().strip() or "en",
-            "target_lang": self.target_lang_combo.currentText().strip() or "ru",
+            "source_lang": language_combo_code(self.source_lang_combo, "en"),
+            "target_lang": language_combo_code(self.target_lang_combo, "ru"),
             "style_font": normalize_style_font(
                 str(self.style_font_combo.currentData() or self.style_font_combo.currentText())
             ),
@@ -718,7 +824,30 @@ class MainWindow(QWidget):
 
     def reset_worker(self) -> None:
         self.worker = None
+        self.cancel_button.setEnabled(False)
+        self.start_button.setEnabled(True)
+        if self._analysis_dialog is not None:
+            self._analysis_dialog.reject()
         self.update_aux_controls()
+        if self._close_after_worker:
+            self.close()
+
+    def cancel_translation(self) -> None:
+        if self.worker is not None:
+            self._cancel_requested = True
+            self.worker.cancel()
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("Отмена после завершения текущей операции...")
+            if self._analysis_dialog is not None:
+                self._analysis_dialog.reject()
+
+    def closeEvent(self, event) -> None:
+        if self.worker is not None:
+            self._close_after_worker = True
+            self.cancel_translation()
+            event.ignore()
+            return
+        event.accept()
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings_manager.data, self)

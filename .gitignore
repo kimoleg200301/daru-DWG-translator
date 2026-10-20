@@ -58,6 +58,7 @@ desktop.ini
 *.secret
 *.local
 .daru_gui_settings.json
+/.daru/
 
 # Runtime caches / generated data
 /cache/
@@ -76,9 +77,18 @@ desktop.ini
 *.tmp
 *.bak
 
+# Local source backups
+/rollback_files/
+
+# Local drawing inputs (keep fixtures in subdirectories trackable)
+/*.dxf
+/*.dwg
+
 # Translation and OCR intermediate files
 /map_auto.csv
 *.checkpoint.json
+*.checkpoint.sqlite3
+*.checkpoint.sqlite3-*
 *.translation.json
 *.output.json
 textract-cache.jsonl

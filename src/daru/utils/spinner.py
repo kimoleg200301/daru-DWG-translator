@@ -27,7 +27,7 @@ class Spinner:
             self._thread.start()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         if self.enabled:
             self._stop_event.set()
             if self._thread and self._thread.is_alive():

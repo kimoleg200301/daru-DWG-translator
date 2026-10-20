@@ -1,5 +1,7 @@
 """DXF/DWG translation pipeline: extract → translate → apply → save."""
 
+
+from ..translation.progress import report_progress
 import argparse
 import sys
 import tempfile
@@ -17,9 +19,10 @@ from ..translation.checkpoint import (
     stable_text_id,
 )
 from ..translation.engine import TranslationEngine
+from ..translation.job import check_cancelled
+from ..translation.options import TranslationOptions
 from ..utils.io import (
     ensure_parent,
-    paths_equal,
     read_map_csv,
     write_map_csv,
     write_translated_txt,
@@ -28,6 +31,7 @@ from ..utils.odafc import convert_with_odafc
 from ..utils.spinner import Spinner, colorize
 from . import applier
 from . import extractor
+from .entities import TextReplacer
 
 DEFAULT_MAP_CACHE = Path("map_auto.csv")
 
@@ -68,10 +72,11 @@ def apply_translations(
     log: Optional[Callable[[str], None]] = None,
 ) -> None:
     resolver = applier.FontStyleResolver(doc, style_font, log)
+    replacer = TextReplacer(pairs)
     ru_style = ""
     for layout in [doc.modelspace(), *[l for l in doc.layouts if l.name != "Model"]]:
-        applier.walk_layout(layout, pairs, ru_style, resolver)
-    applier.walk_blocks(doc, pairs, ru_style, resolver)
+        applier.walk_layout(layout, replacer, ru_style, resolver)
+    applier.walk_blocks(doc, replacer, ru_style, resolver)
 
 
 def translate_dxf(
@@ -101,6 +106,7 @@ def translate_dxf(
     codex_timeout_seconds: int = 300,
     output_format: Optional[str] = None,
     map_path: Optional[Path] = None,
+    glossary_path: Optional[Path] = None,
     save_map: bool = True,
     extracted_txt_path: Optional[Path] = None,
     translated_txt_path: Optional[Path] = None,
@@ -110,6 +116,8 @@ def translate_dxf(
     checkpoint_path: Optional[Path] = None,
     resume_policy: str = "auto",
 ) -> Dict[str, Any]:
+    options = TranslationOptions.from_mapping(locals())
+    report_progress("read")
     logger = log or (lambda message: None)
 
     input_path = input_path.expanduser()
@@ -127,6 +135,7 @@ def translate_dxf(
     document_hash = file_sha256(input_path)
     sorted_items = extractor.sort_frequency(freq)
     english_texts = [text for text, _ in sorted_items]
+    csv_cache = read_map_csv(glossary_path)
     checkpoint_store = TranslationCheckpointStore(
         path=checkpoint_path or default_checkpoint_path(input_path, "cad"),
         job_type="cad",
@@ -134,24 +143,18 @@ def translate_dxf(
         source_lang=source_lang,
         target_lang=target_lang,
         translator=translator_name,
+        settings_fingerprint=options.fingerprint("cad", glossary=csv_cache),
         resume_policy=resume_policy,
         log=logger,
     )
     logger(f"Найдено {len(english_texts)} текстовых элементов для перевода")
-    cache_lookup_path: Optional[Path] = None
-    if map_path:
-        cache_lookup_path = map_path
-    elif DEFAULT_MAP_CACHE.exists():
-        cache_lookup_path = DEFAULT_MAP_CACHE
     checkpoint_cache = checkpoint_store.text_map("cad")
     translation_cache = dict(checkpoint_cache)
     if checkpoint_cache:
         logger(f"Checkpoint: loaded {len(checkpoint_cache)} CAD translations")
-    csv_cache = read_map_csv(cache_lookup_path)
-    if csv_cache and cache_lookup_path:
-        logger(f"Loaded {len(csv_cache)} cached translations from {cache_lookup_path}")
-        for key, value in csv_cache.items():
-            translation_cache.setdefault(key, value)
+    if csv_cache and glossary_path:
+        logger(f"Загружено {len(csv_cache)} переводов из выбранного глоссария {glossary_path}")
+        translation_cache.update(csv_cache)
 
     backend_name = "cached-checkpoint" if checkpoint_cache else "cached-map"
 
@@ -170,31 +173,11 @@ def translate_dxf(
             bucket = text_to_indices.setdefault(text, [])
             bucket.append(idx)
     unique_pending = list(text_to_indices.keys())
+    report_progress("translate", cached_hits, total_items)
     if total_items == 0 or not unique_pending:
         logger("Начинаем перевод... [100%]")
     else:
-        translator = TranslationEngine(
-            provider=translator_name,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            deepl_auth_key=deepl_key,
-            openai_api_key=openai_key,
-            openai_model=openai_model,
-            openai_base_url=openai_base_url,
-            openai_project=openai_project,
-            openai_temperature=openai_temperature,
-            openai_reasoning_effort=openai_reasoning_effort,
-            openai_verbosity=openai_verbosity,
-            openai_strict_mode=openai_strict_mode,
-            openai_strict_value=openai_strict_value,
-            codex_cli_path=codex_cli_path,
-            codex_model=codex_model,
-            codex_reasoning_effort=codex_reasoning_effort,
-            codex_analysis_model=codex_analysis_model,
-            codex_analysis_reasoning_effort=codex_analysis_reasoning_effort,
-            codex_analysis_session=codex_analysis_session,
-            codex_timeout_seconds=codex_timeout_seconds,
-        )
+        translator = TranslationEngine(**options.engine_kwargs())
         backend_name = translator.backend_name()
         checkpoint_store.set_backend(backend_name)
         logger(f"Инициализирован движок перевода: {backend_name}")
@@ -203,6 +186,7 @@ def translate_dxf(
         batch_size = max(1, len(unique_pending) // 20)
         with context_factory("Переводим..."):
             for start_idx in range(0, len(unique_pending), batch_size):
+                check_cancelled()
                 chunk_texts = unique_pending[start_idx : start_idx + batch_size]
                 translated_chunk = translator.translate_many(chunk_texts)
                 for original_text, translated_text in zip(chunk_texts, translated_chunk):
@@ -217,6 +201,7 @@ def translate_dxf(
                         translation_slots[text_index] = translated_text
                         processed += 1
                 checkpoint_store.save()
+                report_progress("translate", processed, total_items)
                 percent = min(100, int(processed / total_items * 100)) if total_items else 100
                 logger(f"Начинаем перевод... [{percent}%]")
         if processed < total_items:
@@ -242,24 +227,18 @@ def translate_dxf(
         ensure_parent(map_path)
         write_map_csv(map_path, english_texts, russian_texts)
         logger(f"Сохранена карта переводов CSV: {map_path}")
-    cache_output_path: Optional[Path] = DEFAULT_MAP_CACHE
-    if save_map and map_path and paths_equal(map_path, DEFAULT_MAP_CACHE):
-        cache_output_path = None
-    if cache_output_path:
-        ensure_parent(cache_output_path)
-        write_map_csv(cache_output_path, english_texts, russian_texts)
-        if not (save_map and map_path and paths_equal(map_path, DEFAULT_MAP_CACHE)):
-            logger(f"Обновлён локальный кэш переводов: {cache_output_path}")
 
     pairs = list(zip(english_texts, russian_texts))
     pairs.sort(key=lambda x: -len(x[0]))
     logger("Применяем переводы к DXF")
+    report_progress("apply")
     apply_translations(doc, pairs, style_font=style_font, log=logger)
 
     final_output_path = _prepare_output_destination(output_path, final_format)
     ensure_parent(final_output_path)
 
     with ExitStack() as stack2:
+        report_progress("export")
         if final_format == "dwg":
             temp_dir = Path(stack2.enter_context(tempfile.TemporaryDirectory(prefix="daru_out_")))
             dxf_output = temp_dir / (final_output_path.stem + ".dxf")
@@ -331,6 +310,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             codex_timeout_seconds=getattr(args, "codex_timeout_seconds", 300),
             output_format=output_format_cli,
             map_path=map_path,
+            glossary_path=Path(args.glossary_csv) if args.glossary_csv else None,
             save_map=not args.no_map,
             extracted_txt_path=extracted_txt_path,
             translated_txt_path=translated_txt_path,
@@ -355,7 +335,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Extract, translate and reapply text for DWG/DXF files.")
     parser.add_argument("input_dxf", help="Входной DWG/DXF файл")
     parser.add_argument("output_dxf", help="Выходной DWG/DXF файл")
-    parser.add_argument("--map-csv", default="map_auto.csv", help="Путь для сохранения карты переводов CSV")
+    parser.add_argument("--map-csv", default=str(DEFAULT_MAP_CACHE), help="Путь для сохранения карты переводов CSV")
+    parser.add_argument("--glossary-csv", help="Явно выбранный CSV-глоссарий для текущего языка перевода")
     parser.add_argument("--no-map", action="store_true", help="Не сохранять CSV карту переводов")
     parser.add_argument("--extracted-txt", default="extracted_texts.txt", help="TXT с исходным текстом")
     parser.add_argument("--translated-txt", default="extracted_texts_ru.txt", help="TXT с переводом")

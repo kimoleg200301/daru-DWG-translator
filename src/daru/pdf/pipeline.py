@@ -1,8 +1,4 @@
-"""PDF translation pipeline — re-exports from the _core module.
-
-The original pdf_translation.py (~3300 lines) has been moved here as _core.py.
-This wrapper provides clean imports while allowing gradual decomposition.
-"""
+"""Compatibility facade for PDF processing and its independent data models."""
 
 from ._core import (  # noqa: F401
     PDF_TYPE_NATIVE,

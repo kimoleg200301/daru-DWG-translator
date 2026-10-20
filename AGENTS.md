@@ -14,16 +14,26 @@ The project uses a `src/` layout with the main package at `src/daru/`.
 - `daru.utils.io` — CSV/TXT file I/O, path helpers (`ensure_parent`, `paths_equal`, `read_map_csv`, `write_map_csv`)
 - `daru.utils.odafc` — ODA File Converter integration for DWG <-> DXF conversion
 - `daru.utils.spinner` — CLI spinner and colorized output
-- `daru.translation.engine` — `TranslationEngine` class with Google/DeepL/OpenAI backends, `chunked()`, text prepare/recover helpers
+- `daru.translation.engine` — compatible `TranslationEngine` facade, context and provider initialization
+- `daru.translation.providers` — Google/DeepL/OpenAI/Codex translation adapters
+- `daru.translation.options`, `contracts`, `prompts` — shared settings, cache identity, response validation and format prompts
+- `daru.translation.checkpoint` — checkpoint facade and legacy JSON migration; `checkpoint_sqlite` stores dirty rows in transactions
+- `daru.translation.job`, `progress` — cooperative cancellation and context-local stage progress; no Qt dependencies
 - `daru.translation.legacy` — `LegacyTranslationEngine` subclass
 - `daru.dxf.entities` — Shared DXF entity helpers (deduplicated from extractor and applier): dimension text, mtext, table cells, mleader text, `ENTITY_TARGETS`
 - `daru.dxf.extractor` — `extract_texts()` from DXF entities
 - `daru.dxf.applier` — Apply translation pairs to DXF entities
 - `daru.dxf.pipeline` — `translate_dxf()` full pipeline, CLI `parse_args()`/`main()`
-- `daru.pdf._core` — Original monolithic PDF pipeline (~3300 lines): OCR, Textract, region detection, rendering, export
+- `daru.pdf._core` — PDF orchestration and compatibility exports
 - `daru.pdf.pipeline` — Re-exports from `_core`
+- `daru.pdf.raster`, `pages` — streaming page loading and temporary image storage
+- `daru.pdf.ocr`, `textract` — local OCR and AWS layout extraction
+- `daru.pdf.geometry`, `imaging`, `regions` — shared geometry, masks and render-region construction
+- `daru.pdf.block_translation`, `rendering`, `export` — block translation, raster rendering and atomic PDF export
+- `daru.pdf.native`, `editable`, `layers` — native/overlay text and JSON layer persistence
 - `daru.pdf.config` — `PdfProcessingConfig`
 - `daru.pdf.models` — PDF dataclasses (`WordBox`, `TextBlock`, `MergedRegion`, etc.)
+- `daru.docx.pipeline`, `segments` — OOXML translation and formatting preservation
 - `daru.gui.app` — `main()` entry point (QApplication)
 - `daru.gui.main_window` — `MainWindow` widget
 - `daru.gui.settings_dialog` — API settings dialog
@@ -56,7 +66,9 @@ Tests cover: module imports (smoke), config/settings, file I/O utils, DXF entity
 - Relative imports within the `daru` package (`from ..translation.engine import ...`)
 - GUI uses Russian labels (the app UI is in Russian)
 - Log messages in Russian
-- `_core.py` in `daru.pdf` is the original monolithic module — treat with care, avoid large refactors without full test coverage
+- PDF stages must not import `_core.py` or `pipeline.py`; retain public facade imports and test stage changes. Rendering changes require visual regression checks (`scripts/pdf_regression_fixture.py`).
+- Tests should patch dependencies in their owning stage module, e.g. `pdf.raster.convert_from_path` or `pdf.export.images_to_pdf`.
+- Report progress through `translation.progress.report_progress`; counts belong to the current stage. Only the job runner emits `complete` after a successful pipeline return.
 - DXF entity helpers are shared via `daru.dxf.entities` — do not duplicate between extractor and applier
 - `TranslationEngine` handles provider initialization in `_init_translator()` with fallback chains
 - OpenAI integration uses Responses API for GPT-5 models and Chat Completions API for older models
@@ -65,7 +77,7 @@ Tests cover: module imports (smoke), config/settings, file I/O utils, DXF entity
 
 1. Add provider name to `TRANSLATOR_CHOICES` in `daru/config.py`
 2. Add initialization branch in `TranslationEngine._init_translator()` in `daru/translation/engine.py`
-3. Implement `_<provider>_translate_batch()` method in the same class
+3. Implement the adapter in `daru/translation/providers/` and keep result validation at the engine boundary
 
 ### Adding a new DXF entity type
 
@@ -76,6 +88,7 @@ Tests cover: module imports (smoke), config/settings, file I/O utils, DXF entity
 ## Important notes
 
 - Root-level `daru_gui.py` and `auto_translate_dxf.py` are thin wrappers that add `src/` to `sys.path` and call into the package. All logic lives in `src/daru/`.
-- The PDF pipeline (`_core.py`) is large and tightly coupled. It imports from `daru.translation.engine` directly. Gradual decomposition is planned but not yet done.
+- PDF orchestration uses independent stages. Keep configuration, data models and geometry free of network/OCR dependencies.
+- Runtime data lives in `~/.daru` (override with `DARU_DATA_DIR` before starting); default checkpoints are SQLite, explicit `.json` paths remain supported.
 - ODA File Converter must be installed separately and available in PATH for DWG support.
 - Settings are persisted to `~/.daru_gui_settings.json`.

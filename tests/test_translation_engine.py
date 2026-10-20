@@ -111,6 +111,31 @@ class TestRecoverAfterTranslation:
         assert result.endswith("  ")
 
 
+class TestLanguagePrompting:
+    def test_ai_prompt_uses_language_name_and_code(self):
+        engine = TranslationEngine(
+            provider="noop",
+            source_lang="Казахский",
+            target_lang="Русский",
+        )
+
+        content = engine._codex_system_content()
+
+        assert engine.source_lang == "kk"
+        assert engine.target_lang == "ru"
+        assert "from Казахский (kk) to Русский (ru)" in content
+
+    def test_codex_analysis_keeps_catalog_reasoning_effort(self):
+        engine = TranslationEngine(
+            provider="noop",
+            codex_reasoning_effort="none",
+            codex_analysis_reasoning_effort="max",
+        )
+
+        assert engine.codex_reasoning_effort == "none"
+        assert engine.codex_analysis_reasoning_effort == "max"
+
+
 class TestOpenAIParameters:
     def test_modern_sdk_targets_responses_endpoint(self):
         captured = []

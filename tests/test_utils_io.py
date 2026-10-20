@@ -1,6 +1,5 @@
 """Tests for daru.utils.io — file I/O helpers."""
 
-from pathlib import Path
 
 from daru.utils.io import ensure_parent, paths_equal, write_map_csv, read_map_csv, write_translated_txt
 

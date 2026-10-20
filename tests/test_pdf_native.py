@@ -7,6 +7,7 @@ import fitz
 
 from daru.pdf import native
 from daru.pdf import _core
+from daru.translation.progress import ProgressEvent, progress_scope
 
 
 class PrefixTranslationEngine:
@@ -95,9 +96,15 @@ def test_native_pdf_preserves_vector_content_and_searchable_text(tmp_path, monke
     PrefixTranslationEngine.calls = 0
     monkeypatch.setattr(native, "TranslationEngine", PrefixTranslationEngine)
 
-    result = _translate(source, output)
+    events = []
+    with progress_scope(events.append):
+        result = _translate(source, output)
 
     assert result["processing_mode"] == "native"
+    assert ProgressEvent("read", 1, 1) in events
+    assert events[-2:] == [ProgressEvent("apply"), ProgressEvent("export")]
+    translation_events = [event for event in events if event.stage == "translate"]
+    assert translation_events[-1].completed == translation_events[-1].total
     assert result["native_pages"] == [1]
     assert result["ocr_pages"] == []
     assert result["ocr_performed"] is False
@@ -207,7 +214,7 @@ def test_translation_layer_v3_reuses_exact_source_blocks(tmp_path, monkeypatch):
 
     _translate(source, first_output, layer_path=layer)
     payload = json.loads(layer.read_text(encoding="utf-8"))
-    assert payload["version"] == 3
+    assert payload["version"] == 4
     assert payload["document_sha256"]
     assert payload["native_pages"] == [1]
     assert payload["ocr_pages"] == []
@@ -268,17 +275,12 @@ def test_translation_layer_v2_reuses_by_text_and_bbox_overlap(tmp_path, monkeypa
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(native, "TranslationEngine", FailIfCreatedEngine)
+    cached = native._load_translation_layer(layer, native._file_sha256(source), page.units, lambda _m: None)
+    assert list(cached.values()) == ["Cached v2 translation 0", "Cached v2 translation 1"]
+    # A metadata-free layer remains readable explicitly, but is not an automatic cache.
+    monkeypatch.setattr(native, "TranslationEngine", PrefixTranslationEngine)
     result = _translate(source, output, layer_path=layer)
-
-    assert result["backend"] == "cached-layer"
-    document = fitz.open(output)
-    try:
-        text = document[0].get_text().replace("\u00a0", " ")
-        assert "Cached v2 translation 0" in text
-        assert "Cached v2 translation 1" in text
-    finally:
-        document.close()
+    assert result["backend"] == PrefixTranslationEngine().backend_name()
 
 
 def test_native_pdf_reuses_checkpoint_without_translator(tmp_path, monkeypatch):
@@ -357,7 +359,7 @@ def test_legacy_layer_requires_exact_text_and_bbox(tmp_path, monkeypatch):
     document = fitz.open(output)
     try:
         text = document[0].get_text().replace("\u00a0", " ")
-        assert "Legacy exact translation" in text
+        assert "Legacy exact translation" not in text
         assert "Must not be reused" not in text
         assert "Fresh translation" in text
     finally:

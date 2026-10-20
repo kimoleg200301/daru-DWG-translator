@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -34,6 +35,227 @@ def _stdin_text(value) -> str:
 def _argument_path(command, flag: str) -> Path:
     index = [str(part) for part in command].index(flag)
     return Path(command[index + 1])
+
+
+class _RecordingInput:
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, value: bytes) -> int:
+        self.data.extend(value)
+        return len(value)
+
+    def flush(self) -> None:
+        return
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeAppServerProcess:
+    def __init__(self, output: bytes) -> None:
+        self.stdin = _RecordingInput()
+        self.stdout = io.BytesIO(output)
+        self.returncode = 0
+        self.terminated = False
+        self.killed = False
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _jsonl(*messages) -> bytes:
+    return b"".join(
+        (json.dumps(message) + "\n").encode("utf-8") for message in messages
+    )
+
+
+def test_list_codex_models_uses_app_server_picker_catalog(tmp_path, monkeypatch):
+    executable = _fake_executable(tmp_path)
+    source_codex_home = tmp_path / "source-codex-home"
+    source_codex_home.mkdir()
+    (source_codex_home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    process = _FakeAppServerProcess(
+        _jsonl(
+            {"id": 0, "result": {"userAgent": "Codex"}},
+            {"method": "remoteControl/status/changed", "params": {}},
+            {
+                "id": 1,
+                "result": {
+                    "data": [
+                        {
+                            "id": "gpt-current",
+                            "model": "gpt-current",
+                            "displayName": "GPT Current",
+                            "hidden": False,
+                            "supportedReasoningEfforts": [
+                                {"reasoningEffort": "low"},
+                                {"reasoningEffort": "high"},
+                            ],
+                            "defaultReasoningEffort": "low",
+                            "inputModalities": ["text", "image"],
+                            "isDefault": True,
+                        },
+                        {
+                            "id": "hidden-model",
+                            "model": "hidden-model",
+                            "hidden": True,
+                        },
+                    ],
+                    "nextCursor": "page-2",
+                },
+            },
+            {
+                "id": 2,
+                "result": {
+                    "data": [
+                        {
+                            "id": "gpt-next",
+                            "displayName": "GPT Next",
+                            "supportedReasoningEfforts": [],
+                        }
+                    ],
+                    "nextCursor": None,
+                },
+            },
+        )
+    )
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        captured["isolated_auth"] = (
+            Path(kwargs["env"]["CODEX_HOME"]) / "auth.json"
+        ).is_file()
+        return process
+
+    monkeypatch.setattr(codex_cli.subprocess, "Popen", fake_popen)
+
+    models = codex_cli.list_codex_models(str(executable), timeout=5)
+
+    assert [model.model for model in models] == ["gpt-current", "gpt-next"]
+    assert models[0].display_name == "GPT Current"
+    assert models[0].supported_reasoning_efforts == ("low", "high")
+    assert models[0].default_reasoning_effort == "low"
+    assert models[0].input_modalities == ("text", "image")
+    assert models[0].is_default
+    assert models[1].input_modalities == ("text", "image")
+    assert captured["command"][-3:] == [
+        "app-server",
+        "--listen",
+        "stdio://",
+    ]
+    requests = [json.loads(line) for line in process.stdin.data.splitlines()]
+    assert [request["method"] for request in requests] == [
+        "initialize",
+        "initialized",
+        "model/list",
+        "model/list",
+    ]
+    assert requests[2]["params"] == {"limit": 100, "includeHidden": False}
+    assert requests[3]["params"]["cursor"] == "page-2"
+    assert process.stdin.closed
+    assert captured["isolated_auth"]
+    assert captured["kwargs"]["env"]["CODEX_HOME"] != str(source_codex_home)
+    assert "OPENAI_API_KEY" not in captured["kwargs"]["env"]
+
+
+def test_list_codex_models_reports_app_server_errors(tmp_path, monkeypatch):
+    executable = _fake_executable(tmp_path)
+    process = _FakeAppServerProcess(
+        _jsonl(
+            {"id": 0, "result": {}},
+            {"id": 1, "error": {"code": -32601, "message": "Method not found"}},
+        )
+    )
+    monkeypatch.setattr(
+        codex_cli.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+
+    with pytest.raises(codex_cli.CodexCliError, match="Method not found"):
+        codex_cli.list_codex_models(str(executable), timeout=5)
+
+
+def test_stop_app_server_kills_windows_process_tree(monkeypatch):
+    calls = []
+
+    class HangingProcess:
+        pid = 321
+
+        def __init__(self):
+            self.stdin = _RecordingInput()
+            self.stdout = io.BytesIO()
+            self.wait_calls = 0
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise subprocess.TimeoutExpired("codex", timeout)
+            return 0
+
+        def terminate(self):
+            raise AssertionError("Windows should terminate the whole process tree")
+
+        def kill(self):
+            raise AssertionError("taskkill should allow the launcher to exit")
+
+    class FinishedReader:
+        def join(self, timeout=None):
+            calls.append(("join", timeout))
+
+        def is_alive(self):
+            return False
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _completed(command)
+
+    monkeypatch.setattr(codex_cli.os, "name", "nt")
+    monkeypatch.setattr(codex_cli.subprocess, "run", fake_run)
+    process = HangingProcess()
+
+    codex_cli._stop_app_server(process, FinishedReader())
+
+    taskkill = calls[0][0]
+    assert taskkill == ["taskkill.exe", "/PID", "321", "/T", "/F"]
+    assert calls[1] == ("join", 1)
+    assert process.stdin.closed
+    assert process.stdout.closed
+
+
+def test_codex_clients_keep_catalog_reasoning_efforts():
+    inspection = {
+        "executable": "codex.exe",
+        "version": "codex-cli 1.0",
+        "supports_ignore_user_config": True,
+        "supports_image": True,
+    }
+
+    structured = codex_cli.CodexCliStructuredClient(
+        model="gpt-next",
+        reasoning_effort="max",
+        _inspection=inspection,
+    )
+    translator = codex_cli.CodexCliTranslator(
+        model="gpt-next",
+        reasoning_effort="none",
+        _inspection=inspection,
+    )
+
+    assert structured.reasoning_effort == "max"
+    assert translator.reasoning_effort == "none"
 
 
 def test_windows_cmd_launcher_uses_call_for_paths_with_spaces(monkeypatch):
@@ -732,6 +954,127 @@ def test_invalid_json_is_retried_once(tmp_path, monkeypatch):
     assert translation_calls == 2
 
 
+@pytest.mark.parametrize("blank", ["", " \t\n"])
+def test_blank_seventh_translation_is_retried_once(tmp_path, monkeypatch, blank):
+    prompts = []
+    items = [
+        {"id": f"{index}:0", "text": f"Source text {index + 1}"}
+        for index in range(8)
+    ]
+
+    def fake_run(command, **kwargs):
+        prompts.append(_stdin_text(kwargs["input"]))
+        translations = [
+            {
+                "id": item["id"],
+                "text": (
+                    blank if index == 6 and len(prompts) == 1 else f"Перевод {index + 1}"
+                ),
+            }
+            for index, item in enumerate(items)
+        ]
+        # The failing item is identified by its requested position, not response order.
+        _argument_path(command, "--output-last-message").write_text(
+            json.dumps(
+                {"translations": list(reversed(translations))}, ensure_ascii=False
+            ),
+            encoding="utf-8",
+        )
+        return _completed(command)
+
+    monkeypatch.setattr(codex_cli.subprocess, "run", fake_run)
+    translator = codex_cli.CodexCliTranslator(
+        _inspection={
+            "executable": str(_fake_executable(tmp_path)),
+            "version": "codex-cli test",
+            "supports_ignore_user_config": True,
+        }
+    )
+
+    assert translator.translate(items, instructions="Translate to Russian.") == [
+        f"Перевод {index + 1}" for index in range(8)
+    ]
+    assert len(prompts) == 2
+    assert "never return empty or whitespace-only text" in prompts[1]
+    assert '"id": "6:0"' in prompts[1]
+    assert '"text": "Source text 7"' in prompts[1]
+
+
+@pytest.mark.parametrize("blank", ["", " \t\n"])
+def test_repeated_blank_translation_reports_source_after_two_attempts(
+    tmp_path, monkeypatch, blank
+):
+    calls = []
+    source = "Inspect the safety circuit. " + "Long detail " * 30
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        _argument_path(command, "--output-last-message").write_text(
+            json.dumps({"translations": [{"id": "6:0", "text": blank}]}),
+            encoding="utf-8",
+        )
+        return _completed(command)
+
+    monkeypatch.setattr(codex_cli.subprocess, "run", fake_run)
+    translator = codex_cli.CodexCliTranslator(
+        _inspection={
+            "executable": str(_fake_executable(tmp_path)),
+            "version": "codex-cli test",
+            "supports_ignore_user_config": True,
+        }
+    )
+
+    with pytest.raises(codex_cli.CodexCliStructuredOutputError) as error:
+        translator.translate(
+            [{"id": "6:0", "text": source}], instructions="Translate to Russian."
+        )
+
+    assert len(calls) == 2
+    message = str(error.value)
+    assert "пустой перевод фрагмента 1" in message
+    assert "id: '6:0'" in message
+    assert "Исходный текст: 'Inspect the safety circuit." in message
+    assert "…" in message
+    assert len(message) < 320
+
+
+def test_blank_sources_allow_blank_translations_without_retry(tmp_path, monkeypatch):
+    calls = []
+    items = [
+        {"id": "empty", "text": ""},
+        {"id": "whitespace", "text": " \t\n"},
+        {"id": "text", "text": "Inspect the safety circuit."},
+    ]
+    expected = ["", "\n", "Проверьте цепь безопасности."]
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        _argument_path(command, "--output-last-message").write_text(
+            json.dumps(
+                {
+                    "translations": [
+                        {"id": item["id"], "text": value}
+                        for item, value in zip(items, expected)
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return _completed(command)
+
+    monkeypatch.setattr(codex_cli.subprocess, "run", fake_run)
+    translator = codex_cli.CodexCliTranslator(
+        _inspection={
+            "executable": str(_fake_executable(tmp_path)),
+            "version": "codex-cli test",
+            "supports_ignore_user_config": True,
+        }
+    )
+
+    assert translator.translate(items, instructions="Translate to Russian.") == expected
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [
@@ -928,8 +1271,8 @@ def test_engine_analyzes_document_once_and_reuses_profile(monkeypatch):
     sampled_items, analysis_instructions, model, effort = analysis_calls[0]
     assert len(sampled_items) <= 120
     assert sum(len(item["text"]) for item in sampled_items) <= 12000
-    assert "before translation from en to ru" in analysis_instructions
-    assert "target language (ru)" in analysis_instructions
+    assert "before translation from Английский (en) to Русский (ru)" in analysis_instructions
+    assert "target language (Русский (ru))" in analysis_instructions
     assert model == "gpt-5.5"
     assert effort == "high"
     assert init_calls[0]["model"] == "gpt-5.4-mini"

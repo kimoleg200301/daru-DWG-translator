@@ -32,6 +32,28 @@ def test_docx_mode_configures_output_and_controls(tmp_path):
     app.processEvents()
 
 
+def test_target_language_updates_default_output_suffix(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    settings = SettingsManager(path=tmp_path / "settings.json")
+    window = MainWindow(settings)
+    source = tmp_path / "manual.dxf"
+
+    window.set_input_file(source)
+
+    assert Path(window.output_edit.text()) == tmp_path / "manual_ru.dwg"
+    assert Path(window.translated_path_edit.text()) == tmp_path / "manual_texts_ru.txt"
+
+    kk_index = window.target_lang_combo.findData("kk")
+    assert kk_index >= 0
+    window.target_lang_combo.setCurrentIndex(kk_index)
+
+    assert Path(window.output_edit.text()) == tmp_path / "manual_kk.dwg"
+    assert Path(window.translated_path_edit.text()) == tmp_path / "manual_texts_kk.txt"
+
+    window.close()
+    app.processEvents()
+
+
 def test_codex_mode_hides_api_translator_and_removes_api_keys(tmp_path):
     app = QApplication.instance() or QApplication([])
     settings = SettingsManager(path=tmp_path / "settings.json")

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from ..translation.progress import report_progress
+
 import hashlib
 import html
-import json
 import math
 import os
 import re
@@ -22,6 +23,11 @@ from ..translation.checkpoint import (
     default_checkpoint_path,
 )
 from ..translation.engine import TranslationEngine
+from ..translation.job import check_cancelled
+from ..translation.options import TranslationOptions
+from ..utils.io import write_json_atomic
+from .layers import read_layer_payload
+from .watermarks import preserve_watermarks
 
 try:  # pragma: no cover - dependency guard
     import fitz  # type: ignore
@@ -43,21 +49,9 @@ EMERGENCY_FONT_SCALE = 0.50
 NORMAL_LINE_HEIGHT = 1.08
 COMPACT_LINE_HEIGHT = 1.0
 
-NATIVE_PDF_SYSTEM_PROMPT = (
-    "You are a professional technical translator of elevator operation and maintenance manuals. "
-    "Translate the provided values from {source_lang} to {target_lang}. "
-    "The values belong to the SAME searchable PDF document and are supplied in reading order. "
-    "Use precise safety terminology, preserve the force of warnings and prohibitions, and keep "
-    "terminology consistent across headings, paragraphs, lists, captions, and table cells. "
-    "Do not add explanations, omit content, or rewrite technical meaning. Preserve company and "
-    "brand names, model identifiers, addresses, URLs, phone numbers, units, and every token matching "
-    "'[[DARU_P_*]]' exactly and in the same position. Ignore source line wrapping and repair only "
-    "obvious line-break hyphenation. Each item may contain a type field describing its document role. "
-    "Respond with strict JSON: "
-    '{"translations": [{"id": "<id>", "text": "<translated>"}, ...]}'
-)
+from ..translation.prompts import NATIVE_PDF_SYSTEM_PROMPT
 
-_LIST_PREFIX_RE = re.compile(r"^\s*(?:[•●▪◆◇\-–—]|\(?\d{1,3}[.)]|[A-Za-z][.)])\s+")
+_LIST_PREFIX_RE = re.compile(r"^\s*(?:\d{1,3}、\s*|(?:[•●▪◆◇\-–—]|\(?\d{1,3}[.),]|\d+(?:\.\d+)+|[A-Za-z][.)])\s+)")
 _TOC_LEADER_RE = re.compile(r"\.{3,}\s*\d+\s*$")
 _DAMAGED_RE = re.compile(r"[\uFFFD\u0000-\u0008\u000B\u000C\u000E-\u001F]")
 _PLACEHOLDER_RE = re.compile(r"\[\[DARU_P_[A-Z]+\]\]")
@@ -138,6 +132,8 @@ class NativeTextUnit:
     bold: bool
     italic: bool
     rotation: int
+    layout_bounds: Optional[BBox] = None
+    framed_label: bool = False
     lines: List[NativeTextLineLayout] = field(default_factory=list)
     style_runs: List[NativeTextSpanStyle] = field(default_factory=list)
     font_family_kind: str = "sans"
@@ -200,6 +196,7 @@ def translate_native_pdf(
 ) -> Dict[str, object]:
     """Translate searchable PDF pages while preserving their native page content."""
 
+    options = TranslationOptions.from_mapping(locals(), system_prompt_template=NATIVE_PDF_SYSTEM_PROMPT)
     _require_fitz()
     input_path = Path(input_path).expanduser()
     output_path = Path(output_path).expanduser().with_suffix(".pdf")
@@ -218,14 +215,20 @@ def translate_native_pdf(
         source_lang=source_lang,
         target_lang=target_lang,
         translator=translator_name,
+        settings_fingerprint=options.fingerprint("pdf-native"),
         resume_policy=resume_policy,
         log=log,
     )
     document = fitz.open(str(input_path))
     try:
+        report_progress("read", 0, len(document))
         link_snapshots = _snapshot_document_links(document)
         page_labels = _snapshot_page_labels(document)
-        pages = [_extract_page(document[index], index, source_lang) for index in range(len(document))]
+        pages = []
+        for index in range(len(document)):
+            check_cancelled()
+            pages.append(_extract_page(document[index], index, source_lang))
+            report_progress("read", index + 1, len(document))
         native_pages = [page.page_index + 1 for page in pages if page.is_native]
         ocr_pages = [page.page_index + 1 for page in pages if not page.is_native]
         units = [unit for page in pages if page.is_native for unit in page.units]
@@ -245,7 +248,11 @@ def translate_native_pdf(
                 )
 
         cached = _checkpoint_native_cache(checkpoint_store, units, log)
-        layer_cached = _load_translation_layer(layer_json_path, file_hash, units, log)
+        layer_cached = (
+            _load_translation_layer(layer_json_path, file_hash, units, log,
+                                    expected_identity=options.cache_identity(file_hash, "pdf-native"))
+            if resume_policy == "auto" else {}
+        )
         for key, value in layer_cached.items():
             cached.setdefault(key, value)
         backend = _translate_units(
@@ -275,11 +282,13 @@ def translate_native_pdf(
             checkpoint_store=checkpoint_store,
         )
 
+        report_progress("apply")
         layout_warnings = _render_native_pages(document, pages, style_font, log)
         fallback_documents: Dict[int, bytes] = {}
         for page_index in (page.page_index for page in pages if not page.is_native):
             fallback_documents[page_index] = fallback_page_translator(page_index)
 
+        report_progress("export")
         _save_output_document(
             document,
             fallback_documents,
@@ -290,6 +299,7 @@ def translate_native_pdf(
         _save_translation_layer(
             layer_json_path,
             file_hash=file_hash,
+            cache_identity=options.cache_identity(file_hash, "pdf-native"),
             pages=pages,
             native_pages=native_pages,
             ocr_pages=ocr_pages,
@@ -338,8 +348,14 @@ def _file_sha256(path: Path) -> str:
 
 
 def _extract_page(page: Any, page_index: int, source_lang: str) -> NativePage:
-    data = page.get_text("dict", sort=True)
-    text_blocks = [block for block in data.get("blocks", []) if block.get("type") == 0]
+    # Watermark Forms retain their original transform and transparency. They
+    # must not become translation units or influence paragraph/table bounds.
+    with preserve_watermarks(page):
+        return _extract_page_content(page, page_index, source_lang)
+
+
+def _extract_page_content(page: Any, page_index: int, source_lang: str) -> NativePage:
+    text_blocks = _native_text_blocks(page)
     raw_text = "".join(
         str(span.get("text", ""))
         for block in text_blocks
@@ -363,9 +379,8 @@ def _extract_page(page: Any, page_index: int, source_lang: str) -> NativePage:
         if str(span.get("text", "")).strip() and float(span.get("size", 0) or 0) > 0
     ]
     median_font_size = median(page_font_sizes) if page_font_sizes else 10.0
-    table_cells = _extract_table_cells(page, page_index, source_lang, median_font_size)
-    accepted_cell_rects = [fitz.Rect(unit.bbox) for unit in table_cells]
-    units = list(table_cells)
+    cell_rects = _table_cell_rects(page, text_blocks)
+    units: List[NativeTextUnit] = []
 
     for block in text_blocks:
         block_units = _units_from_block(
@@ -373,16 +388,13 @@ def _extract_page(page: Any, page_index: int, source_lang: str) -> NativePage:
             page_index=page_index,
             source_lang=source_lang,
             median_font_size=median_font_size,
+            cell_rects=cell_rects,
         )
-        for unit in block_units:
-            unit_rect = fitz.Rect(unit.bbox)
-            if any(
-                _rect_contains_center(cell_rect, unit_rect)
-                for cell_rect in accepted_cell_rects
-            ):
-                continue
-            units.append(unit)
+        units.extend(block_units)
 
+    units = _merge_justified_cell_paragraphs(page, units, text_blocks=text_blocks)
+    units = _merge_framed_labels(page, units)
+    units = _split_units_around_artwork(page, units)
     units.sort(key=lambda unit: (unit.bbox[1], unit.bbox[0], unit.stable_id))
     return NativePage(
         page_index=page_index,
@@ -392,68 +404,290 @@ def _extract_page(page: Any, page_index: int, source_lang: str) -> NativePage:
     )
 
 
-def _extract_table_cells(
-    page: Any,
-    page_index: int,
-    source_lang: str,
-    median_font_size: float,
+def _native_text_blocks(page: Any) -> List[Dict[str, Any]]:
+    """Keep visible glyph anchors, including in spans padded with spaces.
+
+    TableFinder's text extraction may slice words at inferred cell boundaries.
+    Always take text and typography from the original complete PDF spans.
+    """
+    data = page.get_text(
+        "rawdict", sort=True,
+        flags=fitz.TEXTFLAGS_RAWDICT & ~fitz.TEXT_PRESERVE_IMAGES,
+    )
+    blocks = [block for block in data.get("blocks", []) if block.get("type") == 0]
+    for block in blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                chars = span.pop("chars", [])
+                span["text"] = "".join(char["c"] for char in chars)
+                visible = [char for char in chars if char["c"].strip()]
+                if visible:
+                    span["bbox"] = _bbox_union_many([char["bbox"] for char in visible])
+                    span["origin"] = visible[0]["origin"]
+    return blocks
+
+
+def _merge_framed_labels(page: Any, units: List[NativeTextUnit]) -> List[NativeTextUnit]:
+    """Recover wrapped callouts even when a source line protrudes below its box."""
+    frames = []
+    for drawing in page.get_drawings():
+        fill = drawing.get("fill")
+        items = drawing.get("items", [])
+        border = len(items) > 1 and all(item[0] in {"re", "l"} for item in items)
+        if fill is not None and min(fill) < 0.95 and not border:
+            continue
+        for item in items:
+            if item[0] != "re":
+                continue
+            rect = fitz.Rect(item[1])
+            if 15 <= rect.width <= 160 and 8 <= rect.height <= 50:
+                frames.append(rect)
+    result = list(units)
+    for frame in sorted(frames, key=lambda rect: rect.get_area()):
+        members = []
+        for unit in result:
+            if unit.framed_label or unit.rotation:
+                continue
+            rect = fitz.Rect(unit.bbox)
+            if (rect.x0 >= frame.x0 - 1 and rect.x1 <= frame.x1 + 1 and
+                    rect.y0 >= frame.y0 - 1 and rect.y0 <= frame.y1 + unit.font_size * 0.5 and
+                    rect.y1 <= frame.y1 + unit.font_size * 1.5):
+                members.append(unit)
+        if not members or not any(frame.contains(fitz.Point(u.bbox[0], u.bbox[1])) for u in members):
+            continue
+        members.sort(key=lambda unit: (unit.bbox[1], unit.bbox[0]))
+        first = members[0]
+        merged = _make_unit(
+            page_index=first.page_index,
+            bbox=_bbox_union_many([unit.bbox for unit in members]), role="CELL",
+            source_text=_normalize_block_text([unit.source_text for unit in members]),
+            font_size=first.font_size, font_name=first.font_name, color=first.color,
+            bold=first.bold, italic=first.italic, rotation=first.rotation, alignment="center",
+            lines=[line for unit in members for line in unit.lines],
+            style_runs=[span for unit in members for span in unit.style_runs],
+            font_family_kind=first.font_family_kind, stable_salt="framed-label",
+        )
+        merged.layout_bounds = _rect_tuple(frame + (1, 0.5, -1, -0.5))
+        merged.framed_label = True
+        member_ids = {id(unit) for unit in members}
+        result = [unit for unit in result if id(unit) not in member_ids]
+        result.append(merged)
+    return result
+
+
+def _merge_justified_cell_paragraphs(
+    page: Any, units: List[NativeTextUnit], *, text_blocks: Sequence[Dict[str, Any]] = (),
 ) -> List[NativeTextUnit]:
-    units: List[NativeTextUnit] = []
+    """Recover justified prose split into PDF word-lines and separate blocks.
+
+    Cell geometry alone is insufficient: require a wrapped paragraph with a
+    justified line spanning a narrow cell. Keep every original glyph/style
+    anchor, and leave unaffected units (including their cache IDs) untouched.
+    """
+    by_cell: Dict[BBox, List[NativeTextUnit]] = {}
+    for unit in units:
+        if unit.layout_bounds is None or unit.rotation or unit.framed_label:
+            continue
+        if any(line.writing_mode or line.direction != (1.0, 0.0) for line in unit.lines):
+            continue
+        by_cell.setdefault(unit.layout_bounds, []).append(unit)
+
+    removed = set()
+    recovered: List[NativeTextUnit] = []
+    occupied = None
+    for cell, members in by_cell.items():
+        size = median(unit.font_size for unit in members)
+        width, height = cell[2] - cell[0], cell[3] - cell[1]
+        if len(members) < 2 or width >= size * 20 or height > size * 24:
+            continue
+        segments = []
+        for unit in members:
+            for line in unit.lines:
+                spans = [{"text": span.text, "bbox": span.bbox, "size": span.font_size,
+                          "font": span.font_name, "flags": span.flags, "color": span.color}
+                         for span in line.spans]
+                segments.append({"text": line.text, "bbox": line.bbox, "spans": spans,
+                                 "font_size": line.font_size, "baseline_y": line.origin[1],
+                                 "dir": line.direction, "cell": cell, "layout": line,
+                                 "owners": {id(unit)}, "original_lines": {id(line)}})
+        segments.sort(key=lambda segment: (segment["baseline_y"], segment["bbox"][0]))
+        rows = []
+        for segment in segments:
+            if rows and abs(segment["baseline_y"] - rows[-1][0]["baseline_y"]) < size * 0.25:
+                rows[-1].append(segment)
+            else:
+                rows.append([segment])
+        joined = []
+        for row in rows:
+            gaps = [right["bbox"][0] - left["bbox"][2] for left, right in zip(row, row[1:])]
+            bbox = _bbox_union_many([segment["bbox"] for segment in row])
+            styles = [_dominant_span_style(segment["spans"], size) for segment in row]
+            justified = (
+                len(row) > 1 and gaps and max(gaps) > size * 1.5
+                and all(len(segment["text"].split()) == 1 for segment in row)
+                and all(0 <= gap <= size * 4 for gap in gaps)
+                and bbox[2] - bbox[0] >= width * 0.75
+                and bbox[0] - cell[0] <= size and cell[2] - bbox[2] <= size
+                and all(style[1:5] == styles[0][1:5] for style in styles)
+                and max(style[0] for style in styles) - min(style[0] for style in styles) <= size * 0.15
+                and not any(_LIST_PREFIX_RE.match(segment["text"]) for segment in row[1:])
+            )
+            if not justified:
+                joined.extend(row)
+                continue
+            first = row[0]
+            span_styles = [span for segment in row for span in segment["layout"].spans]
+            text = " ".join(segment["text"].strip() for segment in row)
+            layout = NativeTextLineLayout(
+                text=text, bbox=bbox, origin=first["layout"].origin,
+                font_size=first["font_size"], direction=first["dir"], spans=span_styles,
+            )
+            joined.append({**first, "text": text, "bbox": bbox, "layout": layout,
+                           "spans": [span for segment in row for span in segment["spans"]],
+                           "owners": set().union(*(segment["owners"] for segment in row)),
+                           "original_lines": set().union(*(segment["original_lines"] for segment in row)),
+                           "justified": True})
+        if not any(segment.get("justified") for segment in joined):
+            continue
+        for fragment in _group_paragraph_segments(joined, stop_at_sentence=True):
+            lines = fragment["lines"]
+            owners = set().union(*(line["owners"] for line in lines))
+            originals = set().union(*(line["original_lines"] for line in lines))
+            original_units = [unit for unit in members if id(unit) in owners]
+            if (len(owners) < 2 or len(lines) < 2 or not any(line.get("justified") for line in lines)
+                    or originals != {id(line) for unit in original_units for line in unit.lines}):
+                continue
+            source = _normalize_block_text([line["text"] for line in lines])
+            if len(source.split()) < 5:
+                continue
+            represented = {(span.text, span.bbox) for unit in original_units for span in unit.style_runs}
+            # Numeric-only and one-letter fragments do not become translation
+            # units. Never redact them by expanding across their glyphs here.
+            if any(
+                bbox is not None and fitz.Rect(bbox).intersects(fitz.Rect(fragment["bbox"]))
+                and _containing_cell(bbox, [fitz.Rect(cell)]) is not None
+                and (str(span.get("text", "")), bbox) not in represented
+                for block in text_blocks for line in block.get("lines", [])
+                if tuple(line.get("dir", (1.0, 0.0))) == (1.0, 0.0) and not line.get("wmode", 0)
+                for span in line.get("spans", []) if str(span.get("text", "")).strip()
+                for bbox in [_coerce_span_bbox(span.get("bbox"))]
+            ):
+                continue
+            if occupied is None:
+                occupied = _page_nontext_occupied(page, text_rects=[fitz.Rect(unit.bbox) for unit in units])
+            if any(fitz.Rect(fragment["bbox"]).intersects(obstacle) for obstacle in occupied):
+                continue
+            font_size, font_name, color, bold, italic, family = _dominant_span_style(
+                [span for line in lines for span in line["spans"]], size,
+            )
+            layouts = [line["layout"] for line in lines]
+            merged = _make_unit(
+                page_index=original_units[0].page_index, bbox=fragment["bbox"], role="CELL",
+                source_text=source, font_size=font_size, font_name=font_name, color=color,
+                bold=bold, italic=italic, rotation=0,
+                alignment=_fragment_alignment(lines, fragment["bbox"], cell),
+                lines=layouts, style_runs=[span for line in layouts for span in line.spans],
+                font_family_kind=family, stable_salt="justified-cell-paragraph",
+            )
+            merged.layout_bounds = cell
+            removed.update(owners)
+            recovered.append(merged)
+    return [unit for unit in units if id(unit) not in removed] + recovered
+
+
+def _split_units_around_artwork(page: Any, units: List[NativeTextUnit]) -> List[NativeTextUnit]:
+    """Keep changes in column width when a paragraph wraps around a figure."""
+    obstacles = _page_nontext_occupied(page, text_rects=[fitz.Rect(unit.bbox) for unit in units])
+    result = []
+    for unit in units:
+        rect = fitz.Rect(unit.bbox)
+        if (unit.framed_label or unit.rotation or unit.alignment != "left" or
+                len(unit.lines) < 3 or rect.width < unit.font_size * 12):
+            result.append(unit)
+            continue
+        nearby = [other for other in obstacles if other.intersects(rect)]
+        bands: List[Tuple[bool, float, List[NativeTextLineLayout]]] = []
+        for line in unit.lines:
+            right = rect.x1
+            for other in nearby:
+                overlap_y = min(line.bbox[3], other.y1) - max(line.bbox[1], other.y0)
+                if (overlap_y > unit.font_size * 0.2 and
+                        other.x0 >= line.bbox[2] + 1 and other.x0 < right):
+                    right = other.x0 - 1
+            constrained = right < rect.x1 - unit.font_size
+            if bands and bands[-1][0] == constrained:
+                previous = bands[-1]
+                # A band must still contain every original line assigned to it.
+                if min(previous[1], right) >= max(item.bbox[2] for item in previous[2] + [line]):
+                    bands[-1] = (constrained, min(previous[1], right), previous[2] + [line])
+                    continue
+            bands.append((constrained, right, [line]))
+        if len(bands) == 1 or not any(band[0] for band in bands):
+            result.append(unit)
+            continue
+        for index, (_, right, lines) in enumerate(bands):
+            bbox = _bbox_union_many([line.bbox for line in lines])
+            fragment = _make_unit(
+                page_index=unit.page_index, bbox=bbox, role=unit.role,
+                source_text=_normalize_block_text([line.text for line in lines]),
+                font_size=unit.font_size, font_name=unit.font_name, color=unit.color,
+                bold=unit.bold, italic=unit.italic, rotation=unit.rotation,
+                alignment=unit.alignment, lines=lines,
+                style_runs=[span for line in lines for span in line.spans],
+                font_family_kind=unit.font_family_kind, stable_salt=f"artwork-band:{index}",
+            )
+            bounds = fitz.Rect(unit.layout_bounds or page.rect)
+            bounds.x1 = min(bounds.x1, right)
+            bounds.y0 = max(bounds.y0, bbox[1])
+            if index + 1 < len(bands):
+                bounds.y1 = min(bounds.y1, bands[index + 1][2][0].bbox[1])
+            fragment.layout_bounds = _rect_tuple(bounds)
+            result.append(fragment)
+    return result
+
+
+def _table_cell_rects(page: Any, text_blocks: Sequence[Dict[str, Any]] = ()) -> List[Any]:
+    """Table geometry constrains layout and validates narrow prose recovery."""
+    cells: List[Any] = []
     try:
         finder = page.find_tables()
     except Exception:
-        return units
+        return cells
 
-    for table_index, table in enumerate(getattr(finder, "tables", [])):
-        try:
-            values = table.extract()
-        except Exception:
+    for table in getattr(finder, "tables", []):
+        if table.row_count < 2 or table.col_count < 2:
             continue
-        nonempty = [
-            value
-            for row in values
-            for value in row
-            if isinstance(value, str) and value.strip()
-        ]
-        total_cells = max(1, int(table.row_count) * int(table.col_count))
-        density = len(nonempty) / total_cells
-        if table.row_count < 2 or table.col_count < 2 or len(nonempty) < 4 or density < 0.4:
-            continue
-
-        for row_index, row in enumerate(table.rows):
-            for column_index, cell in enumerate(row.cells):
-                if cell is None:
-                    continue
-                try:
-                    source_text = str(values[row_index][column_index] or "").strip()
-                except (IndexError, TypeError):
-                    source_text = str(page.get_textbox(fitz.Rect(cell)) or "").strip()
-                source_text = _normalize_block_text(source_text.splitlines())
-                if not _text_needs_translation(source_text, source_lang):
-                    continue
+        for row in table.rows:
+            for cell in row.cells:
                 bbox = _coerce_bbox(cell)
-                if bbox is None:
-                    continue
-                style = _style_from_clip(page, fitz.Rect(bbox), median_font_size)
-                role = "CELL"
-                units.append(
-                    _make_unit(
-                        page_index=page_index,
-                        bbox=bbox,
-                        role=role,
-                        source_text=source_text,
-                        font_size=style["font_size"],
-                        font_name=style["font_name"],
-                        color=style["color"],
-                        bold=style["bold"] or row_index == 0,
-                        italic=style["italic"],
-                        rotation=style["rotation"],
-                        alignment=style["alignment"],
-                        font_family_kind=style["font_family_kind"],
-                        stable_salt=f"table:{table_index}:{row_index}:{column_index}",
-                    )
-                )
-    return units
+                if bbox is not None and fitz.Rect(bbox) not in cells:
+                    cells.append(fitz.Rect(bbox))
+    segments = [segment for block in text_blocks for line in block.get("lines", [])
+                for segment in _split_line_segments(line)]
+    valid = []
+    for cell in cells:
+        cuts_text = False
+        for segment in segments:
+            r = fitz.Rect(segment["bbox"])
+            if not cell.y0 + 1 < (r.y0 + r.y1) / 2 < cell.y1 - 1:
+                continue
+            if r.x0 < cell.x1 - 1 and r.x1 > cell.x0 + 1:
+                if r.x0 < cell.x0 - 0.5 or r.x1 > cell.x1 + 0.5:
+                    cuts_text = True
+                    break
+        if not cuts_text:
+            valid.append(cell)
+    return sorted(valid, key=lambda rect: rect.get_area())
+
+
+def _containing_cell(bbox: BBox, cells: Sequence[Any]) -> Optional[BBox]:
+    rect = fitz.Rect(bbox)
+    for cell in cells:
+        # Reject inferred borders that pass through a word or a complete line.
+        tolerance = fitz.Rect(cell) + (-0.5, -1.0, 0.5, 1.0)
+        if tolerance.contains(rect):
+            return _rect_tuple(cell)
+    return None
 
 
 def _units_from_block(
@@ -462,8 +696,9 @@ def _units_from_block(
     page_index: int,
     source_lang: str,
     median_font_size: float,
+    cell_rects: Sequence[Any] = (),
 ) -> List[NativeTextUnit]:
-    fragments = _split_block_fragments(block)
+    fragments = _split_block_fragments(block, cell_rects=cell_rects)
     units: List[NativeTextUnit] = []
     for fragment_index, fragment in enumerate(fragments):
         lines = fragment["lines"]
@@ -489,35 +724,63 @@ def _units_from_block(
             for line_layout in line_layouts
             for span_style in line_layout.spans
         ]
-        units.append(
-            _make_unit(
-                page_index=page_index,
-                bbox=fragment["bbox"],
-                role=role,
-                source_text=source_text,
-                font_size=font_size,
-                font_name=font_name,
-                color=color,
-                bold=bold,
-                italic=italic,
-                rotation=rotation,
-                alignment="left",
-                lines=line_layouts,
-                style_runs=style_runs,
-                font_family_kind=font_family_kind,
-                stable_salt=f"fragment:{fragment_index}",
-            )
+        cell = _containing_cell(fragment["bbox"], cell_rects)
+        unit = _make_unit(
+            page_index=page_index,
+            bbox=fragment["bbox"],
+            role="CELL" if cell and role != "TOC" else role,
+            source_text=source_text,
+            font_size=font_size,
+            font_name=font_name,
+            color=color,
+            bold=bold,
+            italic=italic,
+            rotation=rotation,
+            alignment=_fragment_alignment(lines, fragment["bbox"], cell),
+            lines=line_layouts,
+            style_runs=style_runs,
+            font_family_kind=font_family_kind,
+            stable_salt=f"fragment:{fragment_index}",
         )
+        unit.layout_bounds = cell
+        units.append(unit)
     return units
 
 
-def _split_block_fragments(block: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _split_block_fragments(
+    block: Dict[str, Any], *, cell_rects: Sequence[Any] = (),
+) -> List[Dict[str, Any]]:
     segments: List[Dict[str, Any]] = []
     for line in block.get("lines", []):
         segments.extend(_split_line_segments(line))
     if not segments:
         return []
     segments.sort(key=lambda segment: (segment["baseline_y"], segment["bbox"][0]))
+    joined: List[Dict[str, Any]] = []
+    for segment in segments:
+        segment["cell"] = _containing_cell(segment["bbox"], cell_rects)
+        previous = joined[-1] if joined else None
+        if previous and segment["cell"] is not None and segment["cell"] == previous["cell"]:
+            size = min(segment["font_size"], previous["font_size"])
+            gap = segment["bbox"][0] - previous["bbox"][2]
+            cell_width = segment["cell"][2] - segment["cell"][0]
+            max_gap = size * (2.5 if cell_width < size * 10 else 1.5)
+            if (cell_width < size * 20 and
+                    abs(segment["baseline_y"] - previous["baseline_y"]) < size * 0.25 and
+                    0 <= gap < max_gap):
+                previous["text"] += " " + segment["text"]
+                previous["spans"].extend(segment["spans"])
+                previous["bbox"] = _bbox_union(previous["bbox"], segment["bbox"])
+                continue
+        joined.append(segment)
+    segments = joined
+
+    return _group_paragraph_segments(segments)
+
+
+def _group_paragraph_segments(
+    segments: Sequence[Dict[str, Any]], *, stop_at_sentence: bool = False,
+) -> List[Dict[str, Any]]:
 
     fragments: List[Dict[str, Any]] = []
     for segment in segments:
@@ -526,6 +789,10 @@ def _split_block_fragments(block: Dict[str, Any]) -> List[Dict[str, Any]]:
         best_score = -1.0
         for fragment in fragments:
             previous_line = fragment["lines"][-1]
+            if not _segments_share_paragraph(previous_line, segment):
+                continue
+            if stop_at_sentence and previous_line["text"].rstrip().endswith((".", ":", ";", "!", "?")):
+                continue
             baseline_gap = float(segment["baseline_y"]) - float(previous_line["baseline_y"])
             same_baseline = abs(baseline_gap) <= max(
                 1.5,
@@ -568,6 +835,56 @@ def _split_block_fragments(block: Dict[str, Any]) -> List[Dict[str, Any]]:
     return fragments
 
 
+def _segments_share_paragraph(first: Dict[str, Any], second: Dict[str, Any]) -> bool:
+    if first.get("cell") != second.get("cell") or first.get("dir") != second.get("dir"):
+        return False
+    if _TOC_LEADER_RE.search(first["text"]) or _TOC_LEADER_RE.search(second["text"]):
+        return False
+    if not any(char.isalpha() for char in first["text"]):
+        return False
+    if _LIST_PREFIX_RE.match(second["text"]):
+        return False
+    first_style = _dominant_span_style(first["spans"], first["font_size"])
+    second_style = _dominant_span_style(second["spans"], second["font_size"])
+    if first_style[3:5] != second_style[3:5]:
+        return False
+    size = max(first_style[0], second_style[0])
+    if abs(first_style[0] - second_style[0]) > size * 0.15:
+        return False
+    a, b = fitz.Rect(first["bbox"]), fitz.Rect(second["bbox"])
+    if size < 20 and abs(a.x0 - b.x0) > size * 3:
+        # Separate centered captions from nearby prose and adjacent columns.
+        cell = first.get("cell")
+        if not (cell and cell[2] - cell[0] < size * 20 and
+                abs((a.x0 + a.x1) - (b.x0 + b.x1)) < size):
+            return False
+    if first["text"].rstrip().endswith((".", ":", ";")) and b.x0 - a.x0 > size:
+        return False
+    return True
+
+
+def _fragment_alignment(
+    lines: Sequence[Dict[str, Any]], bbox: BBox, cell: Optional[BBox],
+) -> str:
+    size = max(1.0, float(lines[0]["font_size"]))
+    rects = [fitz.Rect(line["bbox"]) for line in lines]
+    if len(rects) > 1:
+        lefts = [rect.x0 for rect in rects]
+        centers = [(rect.x0 + rect.x1) / 2 for rect in rects]
+        rights = [rect.x1 for rect in rects]
+        if max(lefts) - min(lefts) > size * 0.5:
+            if max(centers) - min(centers) < size * 0.5:
+                return "center"
+            if max(rights) - min(rights) < size * 0.3:
+                return "right"
+    if cell:
+        left, right = bbox[0] - cell[0], cell[2] - bbox[2]
+        # Full-width prose has equal tiny margins too; that is not centering.
+        if min(left, right) > size and abs(left - right) < size * 0.7:
+            return "center"
+    return "left"
+
+
 def _split_line_segments(line: Dict[str, Any]) -> List[Dict[str, Any]]:
     spans = [
         span
@@ -599,6 +916,7 @@ def _split_line_segments(line: Dict[str, Any]) -> List[Dict[str, Any]]:
         bboxes = [
             bbox
             for span in group
+            if str(span.get("text", "")).strip()
             if (bbox := _coerce_bbox(span.get("bbox"))) is not None
         ]
         if not bboxes:
@@ -789,13 +1107,11 @@ def _normalize_block_text(lines: Sequence[str]) -> str:
         return clean_lines[0]
 
     output = clean_lines[0]
-    preserve_breaks = bool(_LIST_PREFIX_RE.match(clean_lines[0]))
     for current in clean_lines[1:]:
         if output.endswith("-") and current[:1].islower():
             output = output[:-1] + current
-        elif preserve_breaks or _LIST_PREFIX_RE.match(current):
+        elif _LIST_PREFIX_RE.match(current):
             output += "\n" + current
-            preserve_breaks = True
         else:
             output += " " + current
     return output.strip()
@@ -803,6 +1119,8 @@ def _normalize_block_text(lines: Sequence[str]) -> str:
 
 def _classify_role(source_text: str, font_size: float, median_font_size: float) -> str:
     stripped = source_text.strip()
+    if _TOC_LEADER_RE.search(stripped):
+        return "TOC"
     if _LIST_PREFIX_RE.match(stripped):
         return "LIST"
     if font_size >= max(14.0, median_font_size * 1.35):
@@ -962,7 +1280,10 @@ def _protect_text(text: str) -> ProtectedText:
 
 
 def _looks_like_address_line(line: str) -> bool:
-    if _CONTACT_LINE_RE.search(line):
+    if re.match(
+        r"^\s*(?:address|head\s+office|factory|zip|p\.?\s*c\.?|tel\.?|fax|e-?mail)\s*:",
+        line, re.IGNORECASE,
+    ):
         return True
     return bool(re.search(r"\d", line) and _LOCATION_LINE_RE.search(line))
 
@@ -1035,6 +1356,7 @@ def _translate_units(
     codex_timeout_seconds: int = 300,
     checkpoint_store: Optional[TranslationCheckpointStore] = None,
 ) -> str:
+    options = TranslationOptions.from_mapping(locals(), system_prompt_template=NATIVE_PDF_SYSTEM_PROMPT)
     pending: List[NativeTextUnit] = []
     for unit in units:
         cached_value = cached.get(unit.stable_id)
@@ -1044,6 +1366,7 @@ def _translate_units(
         else:
             pending.append(unit)
 
+    report_progress("translate", len(units) - len(pending), len(units))
     if not pending:
         if not units:
             return "not-required"
@@ -1051,29 +1374,7 @@ def _translate_units(
             return "cached-checkpoint"
         return "cached-layer"
 
-    translator = TranslationEngine(
-        provider=translator_name,
-        source_lang=source_lang,
-        target_lang=target_lang,
-        deepl_auth_key=deepl_key,
-        openai_api_key=openai_key,
-        openai_model=openai_model,
-        openai_base_url=openai_base_url,
-        openai_project=openai_project,
-        openai_temperature=openai_temperature,
-        openai_reasoning_effort=openai_reasoning_effort,
-        openai_verbosity=openai_verbosity,
-        openai_strict_mode=openai_strict_mode,
-        openai_strict_value=openai_strict_value,
-        codex_cli_path=codex_cli_path,
-        codex_model=codex_model,
-        codex_reasoning_effort=codex_reasoning_effort,
-        codex_analysis_model=codex_analysis_model,
-        codex_analysis_reasoning_effort=codex_analysis_reasoning_effort,
-        codex_analysis_session=codex_analysis_session,
-        codex_timeout_seconds=codex_timeout_seconds,
-        system_prompt_template=NATIVE_PDF_SYSTEM_PROMPT,
-    )
+    translator = TranslationEngine(**options.engine_kwargs())
     translator.set_document_context(
         [unit.protected.value for unit in units],
         context_label="NATIVE PDF MANUAL",
@@ -1086,6 +1387,7 @@ def _translate_units(
 
     processed = 0
     for batch in _translation_batches(pending):
+        check_cancelled()
         values = [unit.protected.value for unit in batch]
         try:
             translated = translator.translate_many(values)
@@ -1125,6 +1427,7 @@ def _translate_units(
             checkpoint_store.save()
 
         processed += len(batch)
+        report_progress("translate", len(units) - len(pending) + processed, len(units))
         percent = int(processed / len(pending) * 100)
         log(f"PDF: перевод текстового слоя... [{percent}%]")
     return backend
@@ -1169,6 +1472,7 @@ def _render_native_pages(
     )
     try:
         for page_model in pages:
+            check_cancelled()
             if not page_model.is_native:
                 continue
             page = document[page_model.page_index]
@@ -1181,73 +1485,98 @@ def _render_native_pages(
             if not changed:
                 continue
 
-            font_bundles = {
-                unit.stable_id: _resolve_unit_font_bundle(
-                    unit,
-                    original_resolver=original_resolver,
-                    fallback_resolver=fallback_resolver,
-                )
-                for unit in changed
-            }
-            for unit in changed:
-                if unit.font_fallback_reason:
-                    warnings.append(
-                        {
-                            "page": unit.page_index + 1,
-                            "stable_id": unit.stable_id,
-                            "role": unit.role,
-                            "reason": "font_fallback",
-                            "detail": unit.font_fallback_reason,
-                            "font": font_bundles[unit.stable_id].default.source_name,
-                            "bbox": list(unit.bbox),
-                        }
+            # Keep decorative watermark glyphs out of redactions and layout.
+            with preserve_watermarks(page):
+                font_bundles = {
+                    unit.stable_id: _resolve_unit_font_bundle(
+                        unit,
+                        original_resolver=original_resolver,
+                        fallback_resolver=fallback_resolver,
                     )
-            for unit in changed:
-                page.add_redact_annot(
-                    fitz.Rect(unit.bbox),
-                    fill=None,
-                    cross_out=False,
+                    for unit in changed
+                }
+                for unit in changed:
+                    if unit.font_fallback_reason:
+                        warnings.append(
+                            {
+                                "page": unit.page_index + 1,
+                                "stable_id": unit.stable_id,
+                                "role": unit.role,
+                                "reason": "font_fallback",
+                                "detail": unit.font_fallback_reason,
+                                "font": font_bundles[unit.stable_id].default.source_name,
+                                "bbox": list(unit.bbox),
+                            }
+                        )
+                for unit in changed:
+                    for line in unit.lines:
+                        page.add_redact_annot(
+                            fitz.Rect(line.bbox), fill=None, cross_out=False,
+                        )
+                page.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                    text=fitz.PDF_REDACT_TEXT_REMOVE,
                 )
-            page.apply_redactions(
-                images=fitz.PDF_REDACT_IMAGE_NONE,
-                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-                text=fitz.PDF_REDACT_TEXT_REMOVE,
-            )
 
-            occupied = [fitz.Rect(unit.bbox) for unit in page_model.units]
-            occupied.extend(_page_nontext_occupied(page))
-            for unit in changed:
-                warning = _insert_unit(
-                    page,
-                    unit,
-                    occupied=occupied,
-                    font_resource=font_bundles[unit.stable_id],
+                occupied = [fitz.Rect(unit.bbox) for unit in page_model.units]
+                occupied.extend(_page_nontext_occupied(page, text_rects=occupied))
+                occupied.extend(
+                    fitz.Rect(span["bbox"])
+                    for block in _native_text_blocks(page)
+                    for line in block.get("lines", [])
+                    for span in line.get("spans", [])
+                    if str(span.get("text", "")).strip()
                 )
-                if warning:
-                    warnings.append(warning)
-                    log(
-                        f"PDF: предупреждение верстки, стр. {unit.page_index + 1}, "
-                        f"блок {unit.stable_id}, масштаб {unit.font_scale:.2f}"
+                for unit in changed:
+                    warning = _insert_unit(
+                        page,
+                        unit,
+                        occupied=occupied,
+                        font_resource=font_bundles[unit.stable_id],
                     )
+                    if warning:
+                        warnings.append(warning)
+                        log(
+                            f"PDF: предупреждение верстки, стр. {unit.page_index + 1}, "
+                            f"блок {unit.stable_id}, масштаб {unit.font_scale:.2f}"
+                        )
+                    if unit.rendered_bbox is not None:
+                        occupied.append(fitz.Rect(unit.rendered_bbox))
     finally:
         if original_resolver is not None:
             original_resolver.close()
     return warnings
 
 
-def _page_nontext_occupied(page: Any) -> List[Any]:
+def _page_nontext_occupied(page: Any, *, text_rects: Sequence[Any] = ()) -> List[Any]:
     occupied: List[Any] = []
     try:
         for drawing in page.get_drawings():
             rect = drawing.get("rect")
             if rect is None:
                 continue
-            drawing_rect = fitz.Rect(rect)
-            drawing_rect.x0 -= 0.75
-            drawing_rect.y0 -= 0.75
-            drawing_rect.x1 += 0.75
-            drawing_rect.y1 += 0.75
-            occupied.append(drawing_rect)
+            items = drawing.get("items", [])
+            if (len(items) == 1 and items[0][0] == "re" and
+                    drawing.get("fill") is not None and drawing.get("color") is None and
+                    any(fitz.Rect(rect).contains(text_rect) for text_rect in text_rects)):
+                # A solid color behind source text is its background, not a
+                # diagram that should force the translation into a tiny font.
+                continue
+            if (items and all(item[0] in {"l", "re"} for item in items) and
+                    (drawing.get("fill") is None or any(item[0] == "re" for item in items))):
+                # An enclosing table border is not an occupied solid rectangle.
+                for item in items:
+                    if item[0] == "l":
+                        a, b = item[1:3]
+                        boxes = [fitz.Rect(min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y))]
+                    else:
+                        r = fitz.Rect(item[1])
+                        boxes = [fitz.Rect(r.x0, r.y0, r.x1, r.y0), fitz.Rect(r.x0, r.y1, r.x1, r.y1),
+                                 fitz.Rect(r.x0, r.y0, r.x0, r.y1), fitz.Rect(r.x1, r.y0, r.x1, r.y1)]
+                    occupied.extend(box + (-0.75, -0.75, 0.75, 0.75) for box in boxes)
+            else:
+                occupied.append(fitz.Rect(rect) + (-0.75, -0.75, 0.75, 0.75))
     except Exception:
         pass
     try:
@@ -1424,6 +1753,19 @@ def _font_candidate_paths(
     candidates: List[Path] = []
     if style_font:
         requested = Path(style_font).expanduser()
+        variants = {
+            "times": ("times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf"),
+            "arial": ("arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf"),
+            "calibri": ("calibri.ttf", "calibrib.ttf", "calibrii.ttf", "calibriz.ttf"),
+            "segoeui": ("segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf"),
+            "georgia": ("georgia.ttf", "georgiab.ttf", "georgiai.ttf", "georgiaz.ttf"),
+        }
+        names = variants.get(requested.stem.lower())
+        if names:
+            variant = names[int(bold) + 2 * int(italic)]
+            candidates.append(requested.with_name(variant))
+            if os.name == "nt" and not requested.is_absolute():
+                candidates.append(Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts" / variant)
         candidates.append(requested)
         if os.name == "nt" and not requested.is_absolute():
             fonts_dir = Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts"
@@ -1813,20 +2155,25 @@ def _insert_unit(
 ) -> Optional[Dict[str, Any]]:
     text = str(unit.translated_text or unit.source_text)
     font_bundle = _ensure_font_bundle(font_resource)
+    if unit.role == "TOC" and _insert_toc_unit(page, unit, font_bundle):
+        return None
     line_height = _unit_line_height(unit, NORMAL_LINE_HEIGHT)
     compact_line_height = min(line_height, COMPACT_LINE_HEIGHT)
     css = _unit_css(unit, font_bundle, line_height=line_height)
     compact_css = _unit_css(unit, font_bundle, line_height=compact_line_height)
     html_text = _unit_html(unit, font_bundle, text)
-    source_rect = fitz.Rect(unit.bbox)
+    source_rect = fitz.Rect(unit.layout_bounds if unit.framed_label else unit.bbox)
     candidates = _candidate_rects(
-        page.rect,
+        (page.rect & fitz.Rect(unit.layout_bounds)) if unit.layout_bounds else page.rect,
         source_rect,
-        unit.role,
+        "TEXT" if unit.layout_bounds else unit.role,
         occupied,
         alignment=unit.alignment,
+        rotation=unit.rotation,
     )
     relaxed_candidates = _relaxed_candidate_order(candidates)
+    if _insert_single_line_unit(page, unit, font_bundle, candidates):
+        return None
 
     for candidate in candidates:
         warning = _try_insert_htmlbox(
@@ -1910,6 +2257,75 @@ def _insert_unit(
     return _layout_warning(unit, "translation_did_not_fit")
 
 
+def _insert_single_line_unit(
+    page: Any, unit: NativeTextUnit, fonts: _FontBundle, candidates: Sequence[Any],
+) -> bool:
+    """Preserve the native baseline without fitting an EM box into a glyph box."""
+    text = str(unit.translated_text or unit.source_text)
+    resource = fonts.default
+    if len(unit.lines) != 1 or "\n" in text or unit.rotation or resource.font is None or unit.framed_label:
+        return False
+    if not _font_resource_supports_text(resource, text):
+        return False
+    styles = unit.style_runs or unit.lines[0].spans
+    if any(_style_resource_key(span) != _style_resource_key(_unit_default_style(unit)) or
+           abs(span.font_size - unit.font_size) > 0.1 or span.color != unit.color or span.alpha != 255
+           for span in styles):
+        return False
+    width = resource.font.text_length(text, fontsize=unit.font_size)
+    for candidate in candidates:
+        if width > candidate.width:
+            continue
+        left = candidate.x0
+        if unit.alignment == "center":
+            left += (candidate.width - width) / 2
+        elif unit.alignment == "right":
+            left = candidate.x1 - width
+        page.insert_font(fontname=resource.family, fontbuffer=resource.font.buffer)
+        color = tuple(((unit.color >> shift) & 255) / 255 for shift in (16, 8, 0))
+        page.insert_text((left, unit.lines[0].origin[1]), text, fontname=resource.family,
+                         fontsize=unit.font_size, color=color)
+        unit.rendered_bbox = _rect_tuple(candidate)
+        unit.font_scale = 1.0
+        return True
+    return False
+
+
+def _insert_toc_unit(page: Any, unit: NativeTextUnit, fonts: _FontBundle) -> bool:
+    """Keep the page-number column fixed instead of translating literal leaders."""
+    match = re.match(r"^(.*?)\s*\.{3,}\s*(\d+)\s*$", unit.translated_text or unit.source_text)
+    resource = fonts.default
+    if match is None or resource.font is None or unit.rotation:
+        return False
+    if not _font_resource_supports_text(resource, match.group(0)):
+        return False
+    title, number = match.groups()
+    size = unit.font_size
+    font = resource.font
+    rect = fitz.Rect(unit.bbox)
+    number_width = font.text_length(number, fontsize=size)
+    available = max(size, rect.width - number_width - size * 1.5)
+    title_width = font.text_length(title, fontsize=size)
+    scale = min(1.0, available / max(1.0, title_width))
+    baseline = unit.lines[0].origin[1] if unit.lines else rect.y1 - size * 0.2
+    name = resource.family
+    page.insert_font(fontname=name, fontbuffer=font.buffer)
+    color = tuple(((unit.color >> shift) & 255) / 255 for shift in (16, 8, 0))
+    for x, value, font_size in (
+        (rect.x0, title, size * scale),
+        (rect.x1 - number_width, number, size),
+    ):
+        page.insert_text((x, baseline), value, fontname=name, fontsize=font_size, color=color)
+    dot_width = font.text_length(".", fontsize=size)
+    start = rect.x0 + title_width * scale + size * 0.4
+    count = int(max(0, rect.x1 - number_width - size * 0.4 - start) / max(0.1, dot_width))
+    if count:
+        page.insert_text((start, baseline), "." * count, fontname=name, fontsize=size, color=color)
+    unit.rendered_bbox = unit.bbox
+    unit.font_scale = scale
+    return True
+
+
 def _try_insert_htmlbox(
     page: Any,
     unit: NativeTextUnit,
@@ -1936,11 +2352,12 @@ def _try_insert_htmlbox(
     unit.font_scale = float(scale)
     if unit.font_scale >= PREFERRED_NATIVE_FONT_SCALE:
         return None
-    reason = (
-        "font_scaled_below_minimum"
-        if unit.font_scale < MIN_NATIVE_FONT_SCALE
-        else "font_scaled_below_preferred_minimum"
-    )
+    if unit.font_scale < EMERGENCY_FONT_SCALE:
+        reason = "font_scaled_below_readable_minimum"
+    elif unit.font_scale < MIN_NATIVE_FONT_SCALE:
+        reason = "font_scaled_below_minimum"
+    else:
+        reason = "font_scaled_below_preferred_minimum"
     unit.layout_warning = reason
     return _layout_warning(unit, reason)
 
@@ -2018,8 +2435,12 @@ def _unit_html(unit: NativeTextUnit, font_resource: Any, text: str) -> str:
             )
         return "".join(rendered_lines)
 
+    indent = 0.0
+    if len(unit.lines) > 1 and unit.alignment == "left" and not unit.rotation:
+        indent = max(0.0, min(unit.font_size * 3, unit.lines[0].bbox[0] - unit.bbox[0]))
+    opening = f'<div style="text-indent:{indent:.2f}pt">' if indent > 0.5 else "<div>"
     return (
-        "<div>"
+        opening
         + _styled_line_html(
             str(text or ""),
             unit.style_runs if len(unit.style_runs) > 1 else [],
@@ -2028,6 +2449,84 @@ def _unit_html(unit: NativeTextUnit, font_resource: Any, text: str) -> str:
         ).replace("\n", "<br>")
         + "</div>"
     )
+
+
+class EditableTextInserter:
+    """Shared HTMLBox writer for exact OCR boxes and native text units."""
+
+    def __init__(self, style_font: Optional[str] = None) -> None:
+        self._resolver = _FallbackFontResolver(style_font)
+
+    def insert_units(
+        self,
+        page: Any,
+        units: Sequence[NativeTextUnit],
+        *,
+        allow_expansion: bool = False,
+        occupied: Sequence[Any] = (),
+    ) -> List[Dict[str, Any]]:
+        warnings: List[Dict[str, Any]] = []
+        for unit in units:
+            text = str(unit.translated_text or unit.source_text or "").strip()
+            if not text or fitz.Rect(unit.bbox).is_empty:
+                continue
+            font_bundle = _resolve_unit_font_bundle(
+                unit,
+                original_resolver=None,
+                fallback_resolver=self._resolver,
+            )
+            if allow_expansion:
+                warning = _insert_unit(
+                    page,
+                    unit,
+                    occupied=occupied,
+                    font_resource=font_bundle,
+                )
+            else:
+                warning = self._insert_exact(page, unit, font_bundle)
+            if warning is not None:
+                warnings.append(warning)
+        return warnings
+
+    @staticmethod
+    def _insert_exact(
+        page: Any,
+        unit: NativeTextUnit,
+        font_bundle: _FontBundle,
+    ) -> Optional[Dict[str, Any]]:
+        html_text = _unit_html(
+            unit,
+            font_bundle,
+            str(unit.translated_text or unit.source_text),
+        )
+        css = _unit_css(unit, font_bundle)
+        compact_css = _unit_css(
+            unit,
+            font_bundle,
+            line_height=COMPACT_LINE_HEIGHT,
+        )
+        warning: Optional[Dict[str, Any]] = None
+        for attempt_css, scale_low in (
+            (css, PREFERRED_NATIVE_FONT_SCALE),
+            (compact_css, PREFERRED_NATIVE_FONT_SCALE),
+            (compact_css, MIN_NATIVE_FONT_SCALE),
+            (compact_css, FORCED_FONT_SCALE),
+            (compact_css, EMERGENCY_FONT_SCALE),
+            (compact_css, 0.0),
+        ):
+            warning = _try_insert_htmlbox(
+                page,
+                unit,
+                fitz.Rect(unit.bbox),
+                html_text,
+                attempt_css,
+                font_bundle,
+                scale_low=scale_low,
+            )
+            if unit.rendered_bbox is not None:
+                return warning
+        unit.layout_warning = "translation_did_not_fit"
+        return _layout_warning(unit, "translation_did_not_fit")
 
 
 def _styled_line_html(
@@ -2131,20 +2630,50 @@ def _candidate_rects(
     role: str,
     occupied: Sequence[Any],
     alignment: str = "left",
+    rotation: int = 0,
 ) -> List[Any]:
     base = fitz.Rect(source_rect)
     candidates = [base]
     if role == "CELL":
         return candidates
 
-    width_extra = source_rect.width * 0.20
-    height_extra = source_rect.height * 0.35
-    x0, x1 = _anchored_horizontal_bounds(source_rect, width_extra, alignment)
-    expansions = [
-        fitz.Rect(x0, source_rect.y0, x1, source_rect.y1),
-        fitz.Rect(source_rect.x0, source_rect.y0, source_rect.x1, source_rect.y1 + height_extra),
-        fitz.Rect(x0, source_rect.y0, x1, source_rect.y1 + height_extra),
-    ]
+    expansions: List[Any] = []
+    ratios = [(0.20, 0.0)]
+    if rotation % 180 == 0:
+        ratios.extend([(0.50, 0.0), (1.00, 0.0), (1.50, 0.0), (2.00, 0.0), (3.00, 0.0)])
+    ratios.extend((
+        (0.0, 0.35),
+        (0.20, 0.35),
+        (0.50, 0.50),
+        (1.00, 0.50),
+        (1.50, 1.00),
+    ))
+    for width_ratio, height_ratio in ratios:
+        width_extra = source_rect.width * width_ratio
+        height_extra = source_rect.height * height_ratio
+        if str(alignment or "left").strip().lower() == "center":
+            symmetric_room = max(
+                0.0,
+                2.0
+                * min(
+                    source_rect.x0 - page_rect.x0,
+                    page_rect.x1 - source_rect.x1,
+                ),
+            )
+            width_extra = min(width_extra, symmetric_room)
+        x0, x1 = _anchored_horizontal_bounds(
+            source_rect,
+            width_extra,
+            alignment,
+        )
+        expansions.append(
+            fitz.Rect(
+                x0,
+                source_rect.y0,
+                x1,
+                source_rect.y1 + height_extra,
+            )
+        )
     for candidate in expansions:
         candidate &= page_rect
         if candidate.is_empty or candidate in candidates:
@@ -2184,20 +2713,21 @@ def _load_translation_layer(
     file_hash: str,
     units: Sequence[NativeTextUnit],
     log: PdfLog,
+    *,
+    expected_identity: Optional[dict] = None,
 ) -> Dict[str, str]:
     if path is None or not path.exists():
         return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log(f"PDF: не удалось прочитать JSON слой {path}: {exc}")
-        return {}
-    if not isinstance(payload, dict):
+    payload = read_layer_payload(path, log, expected_identity)
+    if not payload:
         return {}
 
     by_id = {unit.stable_id: unit for unit in units}
     cached: Dict[str, str] = {}
-    version = int(payload.get("version", 1) or 1)
+    try:
+        version = int(payload.get("version", 1) or 1)
+    except (TypeError, ValueError, OverflowError):
+        return {}
     if version >= 2:
         if str(payload.get("document_sha256") or "") != file_hash:
             log("PDF: JSON слой относится к другой версии исходного файла")
@@ -2246,26 +2776,34 @@ def _checkpoint_native_cache(
 
 
 def _iter_layer_blocks(payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
-    for page in payload.get("pages") or []:
+    pages = payload.get("pages")
+    if not isinstance(pages, list):
+        return
+    for page in pages:
         if not isinstance(page, dict):
             continue
-        for block in page.get("blocks") or page.get("regions") or []:
+        try:
+            page_index = int(page.get("page_index", 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        blocks = page.get("blocks") or page.get("regions") or []
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
             if isinstance(block, dict):
-                yield block
+                yield {**block, "page_index": page_index}
 
 
 def _layer_block_matches_unit(block: Dict[str, Any], unit: NativeTextUnit) -> bool:
     return (
         str(block.get("text") or "") == unit.source_text
+        and block.get("page_index", unit.page_index) == unit.page_index
         and _bbox_matches(block.get("bbox"), unit.bbox)
     )
 
 
 def _legacy_layer_block_matches_unit(block: Dict[str, Any], unit: NativeTextUnit) -> bool:
-    return (
-        str(block.get("text") or "") == unit.source_text
-        and _bbox_matches(block.get("bbox"), unit.bbox)
-    )
+    return _layer_block_matches_unit(block, unit)
 
 
 def _find_layer_unit_by_text_bbox(
@@ -2280,6 +2818,8 @@ def _find_layer_unit_by_text_bbox(
     best_unit: Optional[NativeTextUnit] = None
     best_score = 0.0
     for unit in units:
+        if block.get("page_index", unit.page_index) != unit.page_index:
+            continue
         if source_text != unit.source_text:
             continue
         score = _rect_overlap_score(block_rect, fitz.Rect(unit.bbox))
@@ -2297,6 +2837,7 @@ def _save_translation_layer(
     native_pages: Sequence[int],
     ocr_pages: Sequence[int],
     log: PdfLog,
+    cache_identity: Optional[dict] = None,
 ) -> None:
     if path is None:
         return
@@ -2308,6 +2849,8 @@ def _save_translation_layer(
                 "role": unit.role,
                 "bbox": list(unit.bbox),
                 "rendered_bbox": list(unit.rendered_bbox or unit.bbox),
+                "layout_bounds": list(unit.layout_bounds) if unit.layout_bounds else None,
+                "framed_label": unit.framed_label,
                 "text": unit.source_text,
                 "translated_text": unit.translated_text or unit.source_text,
                 "font_scale": unit.font_scale,
@@ -2368,16 +2911,16 @@ def _save_translation_layer(
             }
         )
     payload = {
-        "version": 3,
+        "version": 4,
+        "cache_identity": cache_identity,
         "document_sha256": file_hash,
         "processing_mode": "native" if not ocr_pages else "hybrid",
         "native_pages": list(native_pages),
         "ocr_pages": list(ocr_pages),
         "pages": payload_pages,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    log(f"PDF: сохранён JSON слой v3: {path}")
+    write_json_atomic(path, payload)
+    log(f"PDF: сохранён JSON слой v4: {path}")
 
 
 def _save_output_document(
@@ -2401,6 +2944,7 @@ def _save_output_document(
             xml_metadata = ""
         toc = document.get_toc(simple=False)
         for page_index in range(len(document)):
+            check_cancelled()
             fallback_bytes = fallback_documents.get(page_index)
             if fallback_bytes is None:
                 composed.insert_pdf(document, from_page=page_index, to_page=page_index)
@@ -2453,6 +2997,7 @@ def _save_output_document(
 def _snapshot_document_links(document: Any) -> Dict[int, List[Dict[str, Any]]]:
     snapshots: Dict[int, List[Dict[str, Any]]] = {}
     for page_index in range(len(document)):
+        check_cancelled()
         try:
             links = document[page_index].get_links()
         except Exception:
@@ -2652,12 +3197,6 @@ def _bbox_union_many(values: Sequence[BBox]) -> BBox:
 def _horizontal_overlap_ratio(first: Any, second: Any) -> float:
     overlap = max(0.0, min(first.x1, second.x1) - max(first.x0, second.x0))
     denominator = min(first.width, second.width)
-    return overlap / denominator if denominator > 0 else 0.0
-
-
-def _vertical_overlap_ratio(first: Any, second: Any) -> float:
-    overlap = max(0.0, min(first.y1, second.y1) - max(first.y0, second.y0))
-    denominator = min(first.height, second.height)
     return overlap / denominator if denominator > 0 else 0.0
 
 

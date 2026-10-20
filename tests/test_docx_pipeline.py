@@ -11,6 +11,7 @@ import pytest
 from lxml import etree
 
 from daru.docx import pipeline
+from daru.translation.progress import ProgressEvent, progress_scope
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -215,13 +216,19 @@ def test_translate_docx_preserves_structure_and_translates_visible_text(
     _make_docx(source)
     monkeypatch.setattr(pipeline, "TranslationEngine", FakeTranslationEngine)
 
-    result = pipeline.translate_docx(
-        input_path=source,
-        output_path=output,
-        translator_name="fake",
-        source_lang="en",
-        target_lang="ru",
-    )
+    events = []
+    with progress_scope(events.append):
+        result = pipeline.translate_docx(
+            input_path=source,
+            output_path=output,
+            translator_name="fake",
+            source_lang="en",
+            target_lang="ru",
+        )
+    assert events[0] == ProgressEvent("read")
+    assert events[-2:] == [ProgressEvent("apply"), ProgressEvent("export")]
+    translation_events = [event for event in events if event.stage == "translate"]
+    assert translation_events[-1].completed == translation_events[-1].total
 
     document = _read_part(output, "word/document.xml")
     text = _all_text(document)

@@ -12,8 +12,11 @@ from ezdxf.fonts import fonts
 
 from ..config import ORIGINAL_FONT_VALUE, normalize_style_font
 from .entities import (
-    ENTITY_TARGETS,
+    TextReplacer,
+    TranslationPairs,
     get_dim_override_text,
+    iter_block_definitions,
+    iter_text_entities,
     safe_get_mleader_text,
     safe_mtext_text,
     safe_set_mleader_text,
@@ -212,7 +215,7 @@ class FontStyleResolver:
 
 def process_entity(
     e,
-    pairs: List[Tuple[str, str]],
+    pairs: TranslationPairs,
     ru_style: str,
     style_resolver: Optional[FontStyleResolver] = None,
 ):
@@ -272,25 +275,24 @@ def process_entity(
 
 def walk_layout(
     layout,
-    pairs: List[Tuple[str, str]],
+    pairs: TranslationPairs,
     ru_style: str,
     style_resolver: Optional[FontStyleResolver] = None,
 ):
-    for e in layout:
-        if e.dxftype() in ENTITY_TARGETS:
-            process_entity(e, pairs, ru_style, style_resolver)
+    replacer = pairs if isinstance(pairs, TextReplacer) else TextReplacer(pairs)
+    for e in iter_text_entities(layout):
+        process_entity(e, replacer, ru_style, style_resolver)
 
 
 def walk_blocks(
     doc,
-    pairs: List[Tuple[str, str]],
+    pairs: TranslationPairs,
     ru_style: str,
     style_resolver: Optional[FontStyleResolver] = None,
 ):
-    for block in doc.blocks:
-        for e in block:
-            if e.dxftype() in ENTITY_TARGETS:
-                process_entity(e, pairs, ru_style, style_resolver)
+    replacer = pairs if isinstance(pairs, TextReplacer) else TextReplacer(pairs)
+    for block in iter_block_definitions(doc):
+        walk_layout(block, replacer, ru_style, style_resolver)
 
 
 def parse_args():
@@ -331,11 +333,12 @@ def main():
 
     doc = ezdxf.readfile(args.input_dxf)
     resolver = FontStyleResolver(doc, style_font, print)
-    walk_layout(doc.modelspace(), pairs, "", resolver)
+    replacer = TextReplacer(pairs)
+    walk_layout(doc.modelspace(), replacer, "", resolver)
     for layout in doc.layouts:
         if layout.name != "Model":
-            walk_layout(layout, pairs, "", resolver)
-    walk_blocks(doc, pairs, "", resolver)
+            walk_layout(layout, replacer, "", resolver)
+    walk_blocks(doc, replacer, "", resolver)
     doc.saveas(args.output_dxf)
     print("Saved:", args.output_dxf)
 

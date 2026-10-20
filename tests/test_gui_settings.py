@@ -1,6 +1,7 @@
 """GUI tests for model-dependent OpenAI API settings."""
 
 import os
+import threading
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -10,6 +11,10 @@ from PySide6.QtWidgets import QApplication
 from daru.config import OPENAI_DEFAULT_BASE_URL, AppSettings
 from daru.gui import settings_dialog
 from daru.gui.settings_dialog import SettingsDialog
+
+
+def _combo_texts(combo):
+    return [combo.itemText(index) for index in range(combo.count())]
 
 
 def test_openai_fields_follow_selected_model():
@@ -63,6 +68,7 @@ def test_codex_mode_switches_setting_groups():
             codex_reasoning_effort="medium",
             codex_analysis_model="gpt-5.5",
             codex_analysis_reasoning_effort="high",
+            codex_analysis_auto_approve=True,
             codex_timeout_seconds=420,
         )
     )
@@ -72,6 +78,7 @@ def test_codex_mode_switches_setting_groups():
     assert dialog.codex_reasoning_combo.currentText() == "medium"
     assert dialog.codex_analysis_model_combo.currentText() == "gpt-5.5"
     assert dialog.codex_analysis_reasoning_combo.currentText() == "high"
+    assert dialog.codex_analysis_auto_approve_checkbox.isChecked()
     assert dialog.codex_timeout_spin.value() == 420
 
     values = dialog.get_values()
@@ -80,11 +87,131 @@ def test_codex_mode_switches_setting_groups():
     assert values["codex_model"] == "gpt-5.4-mini"
     assert values["codex_analysis_model"] == "gpt-5.5"
     assert values["codex_analysis_reasoning_effort"] == "high"
+    assert values["codex_analysis_auto_approve"] is True
 
     dialog.codex_enabled_checkbox.setChecked(False)
     app.processEvents()
     assert not dialog.api_widget.isHidden()
     assert dialog.codex_widget.isHidden()
+
+    dialog.close()
+    app.processEvents()
+
+
+def test_codex_model_choices_are_replaced_from_cli_catalog():
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        AppSettings(
+            codex_enabled=True,
+            codex_model="saved-translation-model",
+            codex_analysis_model="saved-analysis-model",
+        )
+    )
+    models = [
+        settings_dialog.CodexModelInfo(
+            model="account-default",
+            display_name="Account Default",
+            supported_reasoning_efforts=("low", "high"),
+            default_reasoning_effort="low",
+            input_modalities=("text", "image"),
+            is_default=True,
+        ),
+        settings_dialog.CodexModelInfo(
+            model="account-fast",
+            display_name="Account Fast",
+            supported_reasoning_efforts=("low",),
+            default_reasoning_effort="low",
+            input_modalities=("text",),
+        ),
+    ]
+    dialog._codex_catalog_generation = 1
+    dialog._codex_catalog_loading = True
+
+    dialog._codex_models_loaded(1, models)
+
+    assert _combo_texts(dialog.codex_model_combo) == [
+        "account-default",
+        "account-fast",
+        "saved-translation-model",
+    ]
+    assert _combo_texts(dialog.codex_analysis_model_combo) == [
+        "account-default",
+        "account-fast",
+        "saved-analysis-model",
+    ]
+    assert dialog.codex_model_combo.currentText() == "saved-translation-model"
+    assert dialog.codex_analysis_model_combo.currentText() == "saved-analysis-model"
+    assert dialog.codex_refresh_button.isEnabled()
+
+    dialog.codex_model_combo.setCurrentText("account-fast")
+    dialog.codex_analysis_model_combo.setCurrentText("account-fast")
+    app.processEvents()
+    assert _combo_texts(dialog.codex_reasoning_combo) == ["low"]
+    assert _combo_texts(dialog.codex_analysis_reasoning_combo) == ["low"]
+
+    dialog.close()
+    app.processEvents()
+
+
+def test_codex_catalog_worker_is_ignored_after_dialog_closes(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    started = threading.Event()
+    release = threading.Event()
+    warnings = []
+
+    def delayed_failure(_path, *, timeout):
+        started.set()
+        assert release.wait(timeout=2)
+        raise RuntimeError("late failure")
+
+    monkeypatch.setattr(settings_dialog, "list_codex_models", delayed_failure)
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+    dialog = SettingsDialog(AppSettings(codex_enabled=True))
+
+    dialog._refresh_codex_models(show_errors=True)
+    assert started.wait(timeout=1)
+    worker = dialog._codex_catalog_thread
+    dialog.reject()
+    release.set()
+    assert worker is not None
+    worker.join(timeout=2)
+    app.processEvents()
+
+    assert warnings == []
+    assert not dialog._codex_catalog_loading
+
+
+def test_codex_model_catalog_failure_keeps_existing_choices(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    warnings = []
+    monkeypatch.setattr(
+        settings_dialog.QMessageBox,
+        "warning",
+        lambda _parent, _title, message: warnings.append(message),
+    )
+    dialog = SettingsDialog(
+        AppSettings(
+            codex_enabled=True,
+            codex_model="saved-model",
+            codex_analysis_model="saved-analysis",
+        )
+    )
+    before_translation = _combo_texts(dialog.codex_model_combo)
+    before_analysis = _combo_texts(dialog.codex_analysis_model_combo)
+    dialog._codex_catalog_generation = 1
+    dialog._codex_catalog_loading = True
+    dialog._codex_catalog_show_errors = True
+
+    dialog._codex_models_failed(1, "app-server unavailable")
+
+    assert _combo_texts(dialog.codex_model_combo) == before_translation
+    assert _combo_texts(dialog.codex_analysis_model_combo) == before_analysis
+    assert "app-server unavailable" in dialog.codex_refresh_button.toolTip()
+    assert warnings and "оставлены без изменений" in warnings[0]
 
     dialog.close()
     app.processEvents()
@@ -142,6 +269,7 @@ def test_codex_check_reauthenticates_once_after_expired_session(monkeypatch):
     checks = []
     logins = []
     messages = []
+    refreshes = []
 
     def fake_check(path, *, timeout, model, reasoning_effort):
         checks.append((path, timeout, model, reasoning_effort))
@@ -177,12 +305,18 @@ def test_codex_check_reauthenticates_once_after_expired_session(monkeypatch):
             codex_timeout_seconds=30,
         )
     )
+    monkeypatch.setattr(
+        dialog,
+        "_refresh_codex_models",
+        lambda *, show_errors: refreshes.append(show_errors),
+    )
 
     dialog._test_codex_cli()
 
     assert logins == [("C:/tools/codex.exe", 120)]
     assert len(checks) == 2
     assert messages == ["Перевод / Преданализ:\ngpt-5.4-mini/low: доступна"]
+    assert refreshes == [False]
 
     dialog.close()
     app.processEvents()
@@ -223,6 +357,12 @@ def test_codex_install_button_runs_installer_after_confirmation(monkeypatch):
     )
 
     dialog = SettingsDialog(AppSettings(codex_enabled=True, codex_timeout_seconds=30))
+    refreshes = []
+    monkeypatch.setattr(
+        dialog,
+        "_refresh_codex_models",
+        lambda *, show_errors: refreshes.append(show_errors),
+    )
     dialog._install_codex_cli()
 
     executable = "C:/Users/admin/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe"
@@ -234,6 +374,7 @@ def test_codex_install_button_runs_installer_after_confirmation(monkeypatch):
     assert "https://chatgpt.com/codex/install.ps1" in questions[0]
     assert "codex login" in questions[0]
     assert messages == ["installed\n\nlogged in"]
+    assert refreshes == [False]
 
     dialog.close()
     app.processEvents()

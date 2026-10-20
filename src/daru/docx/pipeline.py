@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from ..translation.progress import report_progress
+
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
@@ -16,6 +19,8 @@ from ..translation.checkpoint import (
     stable_text_id,
 )
 from ..translation.engine import TranslationEngine
+from ..translation.job import check_cancelled
+from ..translation.options import TranslationOptions
 from ..utils.io import ensure_parent, paths_equal
 from .segments import (
     DocumentModel,
@@ -28,17 +33,7 @@ from .segments import (
     schedule_unit_replacement,
 )
 
-DOCX_SYSTEM_PROMPT = (
-    "You are a professional technical document translator. "
-    "Translate the provided values from {source_lang} to {target_lang}. "
-    "All values belong to the SAME editable DOCX document, so keep terminology consistent. "
-    "Preserve numbers, model names, identifiers, URLs, tab characters, and marker tokens "
-    "matching '[[DARU_FMT_N]]' and '[[/DARU_FMT_N]]' exactly and in the same order. "
-    "Use the full sentence around tab characters as translation context and do not "
-    "translate any marker token. "
-    "Respond with strict JSON: "
-    '{"translations": [{"id": "<id>", "text": "<translated>"}, ...]}'
-)
+from ..translation.prompts import DOCX_SYSTEM_PROMPT
 
 
 def translate_docx(
@@ -71,11 +66,13 @@ def translate_docx(
 ) -> Dict[str, Any]:
     """Translate visible DOCX text without OCR while preserving the OOXML package."""
 
+    options = TranslationOptions.from_mapping(locals(), system_prompt_template=DOCX_SYSTEM_PROMPT)
     logger = log or (lambda _message: None)
     input_path = input_path.expanduser()
     output_path = output_path.expanduser().with_suffix(".docx")
 
     _validate_paths(input_path, output_path)
+    report_progress("read")
     logger(f"DOCX: загружаем документ: {input_path}")
 
     document_hash = file_sha256(input_path)
@@ -86,6 +83,7 @@ def translate_docx(
         source_lang=source_lang,
         target_lang=target_lang,
         translator=translator_name,
+        settings_fingerprint=options.fingerprint("docx"),
         resume_policy=resume_policy,
         log=logger,
     )
@@ -101,29 +99,7 @@ def translate_docx(
     def get_translator() -> TranslationEngine:
         nonlocal backend_name, translator
         if translator is None:
-            translator = TranslationEngine(
-                provider=translator_name,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                deepl_auth_key=deepl_key,
-                openai_api_key=openai_key,
-                openai_model=openai_model,
-                openai_base_url=openai_base_url,
-                openai_project=openai_project,
-                openai_temperature=openai_temperature,
-                openai_reasoning_effort=openai_reasoning_effort,
-                openai_verbosity=openai_verbosity,
-                openai_strict_mode=openai_strict_mode,
-                openai_strict_value=openai_strict_value,
-                codex_cli_path=codex_cli_path,
-                codex_model=codex_model,
-                codex_reasoning_effort=codex_reasoning_effort,
-                codex_analysis_model=codex_analysis_model,
-                codex_analysis_reasoning_effort=codex_analysis_reasoning_effort,
-                codex_analysis_session=codex_analysis_session,
-                codex_timeout_seconds=codex_timeout_seconds,
-                system_prompt_template=DOCX_SYSTEM_PROMPT,
-            )
+            translator = TranslationEngine(**options.engine_kwargs())
             translator.set_document_context(
                 [unit.source_text for unit in model.units],
                 context_label="DOCX DOCUMENT",
@@ -136,7 +112,9 @@ def translate_docx(
     if model.units:
         backend_name = _translate_units(model, get_translator, logger, checkpoint_store)
 
+    report_progress("apply")
     modified_parts = apply_scheduled_replacements(model)
+    report_progress("export")
     _write_atomic_docx(input_path, output_path, original_parts, modified_parts)
     logger(f"DOCX: файл сохранен: {output_path}")
 
@@ -170,9 +148,9 @@ def _load_document_model(
             if "word/document.xml" not in names:
                 raise RuntimeError("Файл не содержит word/document.xml и не является DOCX")
             for name in names:
-                data = archive.read(name)
-                original_parts[name] = data
                 if is_text_part(name):
+                    data = archive.read(name)
+                    original_parts[name] = data
                     parsed_parts[name] = parse_xml_part(name, data)
     except BadZipFile as exc:
         raise RuntimeError(f"Некорректный DOCX ZIP-контейнер: {input_path}") from exc
@@ -263,6 +241,7 @@ def _translate_with_progress(
             pending_indices.append(index)
 
     logger(f"{prefix}... [0%]")
+    report_progress("translate", cached_count, len(values))
     if not pending_values:
         logger(f"{prefix}... [100%]")
         return [item if item is not None else "" for item in result]
@@ -271,6 +250,7 @@ def _translate_with_progress(
     batch_size = max(1, min(50, (len(values) + 19) // 20))
     processed = cached_count
     for start in range(0, len(pending_values), batch_size):
+        check_cancelled()
         batch = pending_values[start : start + batch_size]
         batch_indices = pending_indices[start : start + batch_size]
         translated = translator.translate_many(batch)
@@ -286,6 +266,7 @@ def _translate_with_progress(
             )
         checkpoint_store.save()
         processed = min(len(values), processed + len(translated))
+        report_progress("translate", processed, len(values))
         percent = min(100, int(processed / len(values) * 100))
         logger(f"{prefix}... [{percent}%]")
     return [item if item is not None else "" for item in result]
@@ -318,8 +299,14 @@ def _write_atomic_docx(
             "w",
         ) as output_archive:
             for info in source_archive.infolist():
-                data = modified_parts.get(info.filename, original_parts[info.filename])
-                output_archive.writestr(info, data)
+                check_cancelled()
+                if info.filename in modified_parts:
+                    output_archive.writestr(info, modified_parts[info.filename])
+                elif info.filename in original_parts:
+                    output_archive.writestr(info, original_parts[info.filename])
+                else:
+                    with source_archive.open(info) as source, output_archive.open(info, "w") as target:
+                        shutil.copyfileobj(source, target, length=1024 * 1024)
 
         os.replace(temporary_path, output_path)
         temporary_path = None

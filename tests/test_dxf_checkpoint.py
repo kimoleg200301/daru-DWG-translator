@@ -2,12 +2,14 @@ import pytest
 import ezdxf
 
 from daru.dxf import pipeline
+from daru.translation.progress import ProgressEvent, progress_scope
 
 
-def test_dxf_resume_uses_checkpoint_after_batch_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize("suffix", ["json", "sqlite3"])
+def test_dxf_resume_uses_checkpoint_after_batch_failure(tmp_path, monkeypatch, suffix):
     source = tmp_path / "source.dxf"
     output = tmp_path / "translated.dxf"
-    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint = tmp_path / f"checkpoint.{suffix}"
     document = ezdxf.new()
     modelspace = document.modelspace()
     modelspace.add_text("Alpha text")
@@ -36,7 +38,8 @@ def test_dxf_resume_uses_checkpoint_after_batch_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "TranslationEngine", FailingAfterFirstBatch)
     monkeypatch.setattr(pipeline, "DEFAULT_MAP_CACHE", tmp_path / "missing-map.csv")
 
-    with pytest.raises(RuntimeError, match="boom"):
+    events = []
+    with pytest.raises(RuntimeError, match="boom"), progress_scope(events.append):
         pipeline.translate_dxf(
             input_path=source,
             output_path=output,
@@ -50,6 +53,10 @@ def test_dxf_resume_uses_checkpoint_after_batch_failure(tmp_path, monkeypatch):
         )
 
     assert checkpoint.exists()
+    assert [event for event in events if event.stage == "translate"] == [
+        ProgressEvent("translate", 0, 3), ProgressEvent("translate", 1, 3),
+    ]
+    assert not any(event.stage in {"apply", "export", "complete"} for event in events)
 
     class ResumeEngine(FailingAfterFirstBatch):
         received = []

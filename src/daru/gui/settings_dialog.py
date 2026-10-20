@@ -1,9 +1,10 @@
 """Translation backend settings dialog."""
 
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -41,16 +42,35 @@ from ..translation.codex_cli import (
     CODEX_INSTALLER_COMMAND,
     CODEX_REASONING_EFFORTS,
     CodexCliAuthenticationError,
+    CodexModelInfo,
     check_codex_cli,
     install_or_update_codex_cli,
+    list_codex_models,
     login_codex_cli,
 )
 from .pdf_dialogs import PdfTextractSettingsDialog
 
 
+class _CodexCatalogSignals(QObject):
+    loaded = Signal(int, object)
+    failed = Signal(int, str)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: AppSettings, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._codex_models: Dict[str, CodexModelInfo] = {}
+        self._codex_catalog_generation = 0
+        self._codex_catalog_loading = False
+        self._codex_catalog_attempted_path: Optional[str] = None
+        self._codex_catalog_loaded_path: Optional[str] = None
+        self._codex_catalog_show_errors = False
+        # Keep the signal source independent from the dialog's C++ lifetime: a
+        # background probe may finish after the dialog has already been deleted.
+        self._codex_catalog_signals = _CodexCatalogSignals()
+        self._codex_catalog_signals.loaded.connect(self._codex_models_loaded)
+        self._codex_catalog_signals.failed.connect(self._codex_models_failed)
+        self._codex_catalog_thread: Optional[threading.Thread] = None
         self.setWindowTitle("Настройки перевода")
         layout = QVBoxLayout(self)
         self._pdf_mode_values: Dict[str, Any] = {
@@ -153,11 +173,19 @@ class SettingsDialog(QDialog):
         codex_path_layout.addWidget(self.codex_path_edit)
         codex_path_layout.addWidget(self.codex_path_browse)
 
+        initial_translation_model = settings.codex_model or CODEX_DEFAULT_MODEL
+        initial_analysis_model = (
+            settings.codex_analysis_model or CODEX_DEFAULT_ANALYSIS_MODEL
+        )
+        initial_codex_models = tuple(
+            dict.fromkeys((initial_translation_model, initial_analysis_model))
+        )
+
         self.codex_model_combo = QComboBox()
         populate_combo(
             self.codex_model_combo,
-            ("gpt-5.4-mini", "gpt-5.5", "gpt-5.4"),
-            settings.codex_model or CODEX_DEFAULT_MODEL,
+            initial_codex_models,
+            initial_translation_model,
         )
         self.codex_reasoning_combo = QComboBox()
         populate_combo(
@@ -169,8 +197,8 @@ class SettingsDialog(QDialog):
         self.codex_analysis_model_combo = QComboBox()
         populate_combo(
             self.codex_analysis_model_combo,
-            ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
-            settings.codex_analysis_model or CODEX_DEFAULT_ANALYSIS_MODEL,
+            initial_codex_models,
+            initial_analysis_model,
         )
         self.codex_analysis_reasoning_combo = QComboBox()
         populate_combo(
@@ -182,6 +210,15 @@ class SettingsDialog(QDialog):
             ),
             editable=False,
         )
+        self.codex_analysis_auto_approve_checkbox = QCheckBox(
+            "Автоматически подтверждать преданализ"
+        )
+        self.codex_analysis_auto_approve_checkbox.setChecked(
+            bool(settings.codex_analysis_auto_approve)
+        )
+        self.codex_analysis_auto_approve_checkbox.setToolTip(
+            "Не показывать окно проверки и сразу использовать подготовленный преданализ."
+        )
         self.codex_timeout_spin = QSpinBox()
         self.codex_timeout_spin.setRange(10, 3600)
         self.codex_timeout_spin.setSuffix(" с")
@@ -190,6 +227,10 @@ class SettingsDialog(QDialog):
         )
         self.codex_test_button = QPushButton("Проверить Codex CLI")
         self.codex_test_button.clicked.connect(self._test_codex_cli)
+        self.codex_refresh_button = QPushButton("Обновить список моделей")
+        self.codex_refresh_button.clicked.connect(
+            lambda: self._refresh_codex_models(show_errors=True)
+        )
         self.codex_install_button = QPushButton("Установить/обновить Codex CLI")
         self.codex_install_button.clicked.connect(self._install_codex_cli)
 
@@ -201,7 +242,9 @@ class SettingsDialog(QDialog):
             "Reasoning преданализа",
             self.codex_analysis_reasoning_combo,
         )
+        codex_form.addRow(self.codex_analysis_auto_approve_checkbox)
         codex_form.addRow("Таймаут", self.codex_timeout_spin)
+        codex_form.addRow(self.codex_refresh_button)
         codex_form.addRow(self.codex_install_button)
         codex_form.addRow(self.codex_test_button)
         layout.addWidget(self.codex_widget)
@@ -212,6 +255,13 @@ class SettingsDialog(QDialog):
 
         self.openai_model_combo.currentTextChanged.connect(self._update_openai_param_visibility)
         self.codex_enabled_checkbox.toggled.connect(self._update_backend_visibility)
+        self.codex_path_edit.editingFinished.connect(self._codex_path_changed)
+        self.codex_model_combo.currentTextChanged.connect(
+            self._update_translation_reasoning_choices
+        )
+        self.codex_analysis_model_combo.currentTextChanged.connect(
+            self._update_analysis_reasoning_choices
+        )
         self._update_openai_param_visibility(self.openai_model_combo.currentText())
         self._update_backend_visibility(self.codex_enabled_checkbox.isChecked())
 
@@ -219,6 +269,21 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._load_codex_models_if_needed)
+
+    def done(self, result: int) -> None:
+        # Invalidate queued worker results so closing a settings dialog never
+        # produces a late popup or mutates a subsequently reused dialog.
+        self._codex_catalog_generation += 1
+        self._codex_catalog_loading = False
+        self._codex_catalog_show_errors = False
+        self._codex_catalog_attempted_path = None
+        self.codex_refresh_button.setEnabled(True)
+        self.codex_refresh_button.setText("Обновить список моделей")
+        super().done(result)
 
     def get_values(self) -> Dict[str, Any]:
         return {
@@ -233,6 +298,9 @@ class SettingsDialog(QDialog):
             "codex_analysis_reasoning_effort": (
                 self.codex_analysis_reasoning_combo.currentText().strip()
                 or CODEX_DEFAULT_ANALYSIS_REASONING_EFFORT
+            ),
+            "codex_analysis_auto_approve": (
+                self.codex_analysis_auto_approve_checkbox.isChecked()
             ),
             "codex_timeout_seconds": self.codex_timeout_spin.value(),
             "deepl_key": self.deepl_edit.text().strip(),
@@ -272,6 +340,187 @@ class SettingsDialog(QDialog):
     def _update_backend_visibility(self, codex_enabled: bool) -> None:
         self.api_widget.setVisible(not codex_enabled)
         self.codex_widget.setVisible(codex_enabled)
+        if codex_enabled and self.isVisible():
+            QTimer.singleShot(0, self._load_codex_models_if_needed)
+
+    def _load_codex_models_if_needed(self) -> None:
+        if not self.isVisible() or not self.codex_enabled_checkbox.isChecked():
+            return
+        path = self.codex_path_edit.text().strip()
+        if self._codex_catalog_attempted_path == path:
+            return
+        self._refresh_codex_models(show_errors=False)
+
+    def _codex_path_changed(self) -> None:
+        if self.codex_enabled_checkbox.isChecked() and self.isVisible():
+            self._load_codex_models_if_needed()
+
+    def _retain_current_codex_models(self, tooltip: str) -> None:
+        self._codex_models = {}
+        current_translation = self.codex_model_combo.currentText().strip()
+        current_analysis = self.codex_analysis_model_combo.currentText().strip()
+        options = tuple(
+            dict.fromkeys(
+                value for value in (current_translation, current_analysis) if value
+            )
+        )
+        populate_combo(self.codex_model_combo, options, current_translation)
+        populate_combo(self.codex_analysis_model_combo, options, current_analysis)
+        self.codex_model_combo.setToolTip(tooltip)
+        self.codex_analysis_model_combo.setToolTip(tooltip)
+        self._codex_catalog_loaded_path = None
+        self._update_translation_reasoning_choices(current_translation)
+        self._update_analysis_reasoning_choices(current_analysis)
+
+    def _update_codex_reasoning_choices(
+        self,
+        model: str,
+        combo: QComboBox,
+        fallback_default: str,
+    ) -> None:
+        info = self._codex_models.get(model)
+        efforts = (
+            info.supported_reasoning_efforts
+            if info and info.supported_reasoning_efforts
+            else CODEX_REASONING_EFFORTS
+        )
+        default_effort = (
+            info.default_reasoning_effort
+            if info and info.default_reasoning_effort in efforts
+            else fallback_default
+        )
+        if default_effort not in efforts and efforts:
+            default_effort = efforts[0]
+        current = combo.currentText().strip()
+        selected = current if current in efforts else default_effort
+        populate_combo(combo, efforts, selected, editable=False)
+
+    def _update_translation_reasoning_choices(self, model: str) -> None:
+        self._update_codex_reasoning_choices(
+            model,
+            self.codex_reasoning_combo,
+            CODEX_DEFAULT_REASONING_EFFORT,
+        )
+
+    def _update_analysis_reasoning_choices(self, model: str) -> None:
+        self._update_codex_reasoning_choices(
+            model,
+            self.codex_analysis_reasoning_combo,
+            CODEX_DEFAULT_ANALYSIS_REASONING_EFFORT,
+        )
+
+    def _refresh_codex_models(self, *, show_errors: bool) -> None:
+        path = self.codex_path_edit.text().strip()
+        if self._codex_catalog_loading and self._codex_catalog_attempted_path == path:
+            return
+
+        if (
+            self._codex_catalog_loaded_path is not None
+            and path != self._codex_catalog_loaded_path
+        ):
+            self._retain_current_codex_models(
+                "Путь к Codex CLI изменён. Каталог ожидает обновления."
+            )
+
+        self._codex_catalog_generation += 1
+        generation = self._codex_catalog_generation
+        self._codex_catalog_loading = True
+        self._codex_catalog_attempted_path = path
+        self._codex_catalog_show_errors = show_errors
+        self.codex_refresh_button.setEnabled(False)
+        self.codex_refresh_button.setText("Загрузка списка моделей...")
+        self.codex_refresh_button.setToolTip("")
+        timeout = min(20, self.codex_timeout_spin.value())
+        signals = self._codex_catalog_signals
+        discover_models = list_codex_models
+
+        def load() -> None:
+            try:
+                models = discover_models(path, timeout=timeout)
+            except Exception as exc:
+                signals.failed.emit(generation, str(exc))
+                return
+            signals.loaded.emit(generation, models)
+
+        self._codex_catalog_thread = threading.Thread(
+            target=load,
+            name="daru-codex-catalog",
+            daemon=True,
+        )
+        self._codex_catalog_thread.start()
+
+    def _finish_codex_model_refresh(self, generation: int) -> bool:
+        if generation != self._codex_catalog_generation:
+            return False
+        self._codex_catalog_loading = False
+        self.codex_refresh_button.setEnabled(True)
+        self.codex_refresh_button.setText("Обновить список моделей")
+        return True
+
+    def _codex_models_loaded(
+        self,
+        generation: int,
+        models: object,
+    ) -> None:
+        if not self._finish_codex_model_refresh(generation):
+            return
+        if not isinstance(models, list):
+            self._codex_models_failed(
+                generation,
+                "Codex CLI вернул некорректный список моделей.",
+            )
+            return
+
+        catalog = {
+            model.model: model
+            for model in models
+            if isinstance(model, CodexModelInfo) and model.model
+        }
+        if not catalog:
+            self._codex_models_failed(
+                generation,
+                "Codex CLI не сообщил ни одной доступной модели.",
+            )
+            return
+
+        self._codex_models = catalog
+        self._codex_catalog_loaded_path = self._codex_catalog_attempted_path
+        self.codex_refresh_button.setToolTip(
+            "Список моделей получен из установленного Codex CLI."
+        )
+        options = tuple(catalog)
+        for combo in (self.codex_model_combo, self.codex_analysis_model_combo):
+            current = combo.currentText().strip()
+            populate_combo(combo, options, current)
+            combo.setToolTip(
+                "Список получен из установленного Codex CLI. "
+                "Сохранённая модель остаётся доступной для совместимости."
+            )
+        self._update_translation_reasoning_choices(
+            self.codex_model_combo.currentText()
+        )
+        self._update_analysis_reasoning_choices(
+            self.codex_analysis_model_combo.currentText()
+        )
+
+    def _codex_models_failed(self, generation: int, message: str) -> None:
+        if self._codex_catalog_loading:
+            if not self._finish_codex_model_refresh(generation):
+                return
+        elif generation != self._codex_catalog_generation:
+            return
+        self.codex_refresh_button.setToolTip(
+            "Не удалось обновить список моделей. Сохранённые значения не изменены.\n"
+            + message
+        )
+        if self._codex_catalog_show_errors:
+            QMessageBox.warning(
+                self,
+                "Codex CLI",
+                "Не удалось получить список доступных моделей. "
+                "Сохранённые значения оставлены без изменений.\n\n"
+                + message,
+            )
 
     def _browse_codex_cli(self) -> None:
         current = self.codex_path_edit.text().strip()
@@ -284,6 +533,7 @@ class SettingsDialog(QDialog):
         )
         if path:
             self.codex_path_edit.setText(path)
+            self._refresh_codex_models(show_errors=True)
 
     def _install_codex_cli(self) -> None:
         answer = QMessageBox.question(
@@ -325,6 +575,7 @@ class SettingsDialog(QDialog):
             "Codex CLI",
             f"{result.message}\n\n{login_message}",
         )
+        self._refresh_codex_models(show_errors=False)
 
     def _test_codex_cli(self) -> None:
         profiles: Dict[tuple[str, str], list[str]] = {}
@@ -345,6 +596,7 @@ class SettingsDialog(QDialog):
 
         cli_path = self.codex_path_edit.text().strip()
         check_timeout = min(60, self.codex_timeout_spin.value())
+        reauthenticated = False
         for attempt in range(2):
             results = []
             try:
@@ -375,6 +627,7 @@ class SettingsDialog(QDialog):
                         cli_path,
                         timeout=max(120, self.codex_timeout_spin.value()),
                     )
+                    reauthenticated = True
                 except RuntimeError as login_error:
                     QMessageBox.critical(self, "Codex CLI", str(login_error))
                     return
@@ -385,6 +638,11 @@ class SettingsDialog(QDialog):
                 QMessageBox.critical(self, "Codex CLI", str(exc))
                 return
             QMessageBox.information(self, "Codex CLI", "\n\n".join(results))
+            if reauthenticated:
+                self._retain_current_codex_models(
+                    "Авторизация Codex CLI изменилась. Каталог ожидает обновления."
+                )
+                self._refresh_codex_models(show_errors=False)
             return
 
     def _open_pdf_settings(self) -> None:

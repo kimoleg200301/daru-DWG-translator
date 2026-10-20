@@ -216,3 +216,39 @@ def test_main_window_submits_edited_analysis_and_cancel(monkeypatch, tmp_path):
     window.worker = None
     window.close()
     app.processEvents()
+
+
+def test_main_window_auto_approves_analysis_without_dialog(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    manager = SettingsManager(path=tmp_path / "settings.json")
+    manager.update(codex_analysis_auto_approve=True)
+    window = MainWindow(manager)
+
+    class FakeWorker:
+        def __init__(self):
+            self.responses = []
+
+        def submit_analysis(self, text):
+            self.responses.append(text)
+
+    class UnexpectedDialog:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("Диалог не должен открываться при автоподтверждении")
+
+    fake_worker = FakeWorker()
+    window.worker = fake_worker
+    monkeypatch.setattr(main_window, "CodexAnalysisDialog", UnexpectedDialog)
+
+    window.handle_analysis_ready(_payload(text="Автоматический анализ"))
+
+    assert fake_worker.responses == ["Автоматический анализ"]
+    assert window.status_label.text() == "Перевод выполняется..."
+    log_messages = [
+        window.log_view.item(index).text()
+        for index in range(window.log_view.count())
+    ]
+    assert "Предварительный анализ подтверждён автоматически." in log_messages
+
+    window.worker = None
+    window.close()
+    app.processEvents()

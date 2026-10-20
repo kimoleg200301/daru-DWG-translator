@@ -1,6 +1,5 @@
-from .pipeline import translate_pdf, process_pdf
 from .config import PdfProcessingConfig
-from .models import (
+from .config import (
     PDF_PROCESSING_TEXTRACT,
     PDF_PROCESSING_TEXTRACT_VISION,
     PDF_TYPE_SCANNED,
@@ -16,3 +15,13 @@ __all__ = [
     "PDF_PROCESSING_TEXTRACT",
     "PDF_PROCESSING_TEXTRACT_VISION",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"translate_pdf", "process_pdf"}:
+        from . import pipeline
+
+        value = getattr(pipeline, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

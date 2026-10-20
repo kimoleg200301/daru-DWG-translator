@@ -7,9 +7,19 @@ import os
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from ..translation.codex_cli import CodexCliStructuredClient
+from .config import (  # Public option aliases retained for existing callers.
+    VISION_IMAGE_QUALITY_STABLE,
+    VISION_IMAGE_QUALITY_HIGH,
+    VISION_IMAGE_QUALITY_ORIGINAL as VISION_IMAGE_QUALITY_ORIGINAL,
+    VISION_IMAGE_QUALITIES,
+    VISION_IMAGE_QUALITY_MAX_PIXELS,
+    VISION_REQUEST_MODE_BATCHED,
+    VISION_REQUEST_MODE_SINGLE_PAGE,
+    VISION_REQUEST_MODES,
+)
 
 try:  # pragma: no cover - optional dependency guard
     from PIL import Image  # type: ignore
@@ -23,25 +33,6 @@ QA_SCHEMA_VERSION = 4
 CODEX_LAYOUT_MAX_BLOCKS_PER_REQUEST = 16
 CODEX_QA_MAX_REGIONS_PER_REQUEST = 16
 CODEX_VISION_MAX_IMAGE_PIXELS = 4_000_000
-VISION_IMAGE_QUALITY_STABLE = "stable"
-VISION_IMAGE_QUALITY_HIGH = "high"
-VISION_IMAGE_QUALITY_ORIGINAL = "original"
-VISION_IMAGE_QUALITIES = {
-    VISION_IMAGE_QUALITY_STABLE,
-    VISION_IMAGE_QUALITY_HIGH,
-    VISION_IMAGE_QUALITY_ORIGINAL,
-}
-VISION_IMAGE_QUALITY_MAX_PIXELS = {
-    VISION_IMAGE_QUALITY_STABLE: 4_000_000,
-    VISION_IMAGE_QUALITY_HIGH: 10_000_000,
-    VISION_IMAGE_QUALITY_ORIGINAL: None,
-}
-VISION_REQUEST_MODE_BATCHED = "batched"
-VISION_REQUEST_MODE_SINGLE_PAGE = "single_page"
-VISION_REQUEST_MODES = {
-    VISION_REQUEST_MODE_BATCHED,
-    VISION_REQUEST_MODE_SINGLE_PAGE,
-}
 
 SEMANTIC_TYPES = {
     "body",

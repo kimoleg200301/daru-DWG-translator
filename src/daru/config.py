@@ -1,9 +1,12 @@
 """Application-wide constants, settings dataclass, and settings manager."""
 
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple
+
+from .utils.io import write_json_atomic
 
 try:
     from PySide6.QtWidgets import QComboBox
@@ -12,28 +15,69 @@ except ImportError:
 
 SETTINGS_PATH = Path.home() / ".daru_gui_settings.json"
 
-LANGUAGE_CHOICES = [
-    "auto",
-    "en",
-    "ru",
-    "de",
-    "fr",
-    "es",
-    "it",
-    "pl",
-    "uk",
-    "zh",
-    "ja",
-    "ko",
-]
+LANGUAGE_OPTIONS: Tuple[Tuple[str, str], ...] = (
+    ("Автоопределение", "auto"),
+    ("Азербайджанский", "az"),
+    ("Английский", "en"),
+    ("Арабский", "ar"),
+    ("Армянский", "hy"),
+    ("Белорусский", "be"),
+    ("Болгарский", "bg"),
+    ("Венгерский", "hu"),
+    ("Вьетнамский", "vi"),
+    ("Греческий", "el"),
+    ("Датский", "da"),
+    ("Иврит", "he"),
+    ("Индонезийский", "id"),
+    ("Испанский", "es"),
+    ("Итальянский", "it"),
+    ("Казахский", "kk"),
+    ("Китайский", "zh"),
+    ("Корейский", "ko"),
+    ("Кыргызский", "ky"),
+    ("Латышский", "lv"),
+    ("Литовский", "lt"),
+    ("Малайский", "ms"),
+    ("Немецкий", "de"),
+    ("Нидерландский", "nl"),
+    ("Норвежский", "no"),
+    ("Польский", "pl"),
+    ("Португальский", "pt"),
+    ("Румынский", "ro"),
+    ("Русский", "ru"),
+    ("Сербский", "sr"),
+    ("Словацкий", "sk"),
+    ("Словенский", "sl"),
+    ("Тайский", "th"),
+    ("Турецкий", "tr"),
+    ("Узбекский", "uz"),
+    ("Украинский", "uk"),
+    ("Финский", "fi"),
+    ("Французский", "fr"),
+    ("Хинди", "hi"),
+    ("Хорватский", "hr"),
+    ("Чешский", "cs"),
+    ("Шведский", "sv"),
+    ("Эстонский", "et"),
+    ("Японский", "ja"),
+)
+LANGUAGE_CHOICES = [code for _, code in LANGUAGE_OPTIONS]
+LANGUAGE_LABEL_BY_CODE = {code: label for label, code in LANGUAGE_OPTIONS}
+_LANGUAGE_CODE_BY_LOOKUP = {
+    key.casefold(): code
+    for label, code in LANGUAGE_OPTIONS
+    for key in (label, code)
+}
 
 STYLE_FONT_CHOICES = [
     "Arial.ttf",
     "ArialUnicode.ttf",
+    "times.ttf",
     "Roboto-Regular.ttf",
     "NotoSans-Regular.ttf",
     "DejaVuSans.ttf",
 ]
+STYLE_FONT_LABEL_BY_FILE = {"times.ttf": "Times New Roman"}
 ORIGINAL_FONT_VALUE = "original"
 ORIGINAL_FONT_LABEL = "Оригинал"
 
@@ -201,8 +245,8 @@ def normalize_openai_base_url(value: str) -> str:
 OUTPUT_FORMAT_CHOICES = ["dwg", "dxf"]
 
 PDF_TYPE_CHOICES: Tuple[Tuple[str, str], ...] = (
-    ("Отсканированный", "scanned"),
-    ("Текстовый слой", "native"),
+    ("OCR всех страниц", "scanned"),
+    ("Текстовый слой + OCR при необходимости", "native"),
 )
 
 TRANSLATOR_CHOICES = [
@@ -229,6 +273,65 @@ def normalize_style_font(value: str) -> str:
     if normalized.casefold() in {ORIGINAL_FONT_VALUE, ORIGINAL_FONT_LABEL.casefold()}:
         return ORIGINAL_FONT_VALUE
     return normalized
+
+
+def normalize_language_code(value: str, default: str = "") -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return default
+    return _LANGUAGE_CODE_BY_LOOKUP.get(normalized.casefold(), normalized)
+
+
+def language_prompt_label(
+    value: str,
+    default: str = "",
+    *,
+    allow_auto: bool = False,
+) -> str:
+    code = normalize_language_code(value, default)
+    if not code:
+        return default
+    if code.casefold() == "auto":
+        if allow_auto:
+            return "auto-detected"
+        code = normalize_language_code(default, default)
+    label = LANGUAGE_LABEL_BY_CODE.get(code.casefold())
+    if label:
+        return f"{label} ({code})"
+    return code
+
+
+def set_language_combo_value(combo: "QComboBox", value: str) -> None:
+    normalized = normalize_language_code(value)
+    index = combo.findData(normalized) if normalized else 0
+    if normalized and index < 0:
+        combo.addItem(normalized, normalized)
+        index = combo.findData(normalized)
+    combo.setCurrentIndex(index if index >= 0 else 0)
+
+
+def populate_language_combo(
+    combo: "QComboBox",
+    current: str = "",
+    editable: bool = False,
+) -> None:
+    combo.blockSignals(True)
+    combo.clear()
+    seen = set()
+    for label, code in LANGUAGE_OPTIONS:
+        if code and code not in seen:
+            combo.addItem(label, code)
+            seen.add(code)
+    combo.setEditable(editable)
+    set_language_combo_value(combo, current)
+    combo.blockSignals(False)
+
+
+def language_combo_code(combo: "QComboBox", default: str = "") -> str:
+    value = combo.currentData()
+    if value is None:
+        value = combo.currentText()
+    return normalize_language_code(str(value), default) or default
 
 
 def populate_combo(
@@ -267,6 +370,7 @@ class AppSettings:
     codex_reasoning_effort: str = "low"
     codex_analysis_model: str = "gpt-5.5"
     codex_analysis_reasoning_effort: str = "high"
+    codex_analysis_auto_approve: bool = False
     codex_timeout_seconds: int = 300
     source_lang: str = "en"
     target_lang: str = "ru"
@@ -309,17 +413,46 @@ class AppSettings:
     last_directory: str = str(Path.home())
 
     def to_dict(self) -> Dict[str, Any]:
-        return self.__dict__.copy()
+        return {item.name: getattr(self, item.name) for item in fields(self)}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AppSettings":
         defaults = cls()
-        for key, value in data.items():
-            if hasattr(defaults, key):
-                setattr(defaults, key, value)
+        if not isinstance(data, dict):
+            return defaults
+        valid = {}
+        for item in fields(cls):
+            key = item.name
+            if key not in data:
+                continue
+            value = data[key]
+            default = getattr(defaults, key)
+            if isinstance(default, bool):
+                if not isinstance(value, bool):
+                    continue
+            elif isinstance(default, str):
+                if not isinstance(value, str):
+                    continue
+            elif isinstance(default, (int, float)):
+                if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                    continue
+                try:
+                    numeric = float(value)
+                    if not math.isfinite(numeric):
+                        continue
+                    if isinstance(default, int) and not numeric.is_integer():
+                        continue
+                    value = type(default)(numeric)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            valid[key] = value
+            setattr(defaults, key, value)
+        data = valid
 
         defaults.translator_name = normalize_translator_name(defaults.translator_name)
         defaults.style_font = normalize_style_font(defaults.style_font)
+        defaults.source_lang = normalize_language_code(defaults.source_lang, "en")
+        defaults.target_lang = normalize_language_code(defaults.target_lang, "ru")
         if defaults.translator_name == "codex" and "codex_enabled" not in data:
             defaults.codex_enabled = True
             defaults.translator_name = "google"
@@ -359,6 +492,11 @@ class AppSettings:
             )
         except (TypeError, ValueError):
             defaults.pdf_vision_codex_timeout_seconds = 300
+        defaults.pdf_dpi = max(72, defaults.pdf_dpi)
+        defaults.pdf_min_confidence = max(0, min(100, defaults.pdf_min_confidence))
+        defaults.pdf_blur_kernel = max(1, defaults.pdf_blur_kernel)
+        defaults.pdf_dilation_kernel = max(1, defaults.pdf_dilation_kernel)
+        defaults.openai_strict_value = max(0.0, min(1.0, defaults.openai_strict_value))
         legacy_level = _legacy_openai_level(defaults.openai_strict_value)
         if "openai_reasoning_effort" not in data and defaults.openai_strict_mode == "effort":
             defaults.openai_reasoning_effort = legacy_level
@@ -395,20 +533,16 @@ class SettingsManager:
         try:
             with self.path.open("r", encoding="utf-8") as fh:
                 raw = json.load(fh)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError, UnicodeError):
             return
         self._settings = AppSettings.from_dict(raw)
 
     def save(self) -> None:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("w", encoding="utf-8") as fh:
-                json.dump(self._settings.to_dict(), fh, ensure_ascii=False, indent=2)
+            write_json_atomic(self.path, self._settings.to_dict())
         except OSError:
             pass
 
     def update(self, **kwargs: Any) -> None:
-        for key, value in kwargs.items():
-            if hasattr(self._settings, key):
-                setattr(self._settings, key, value)
+        self._settings = AppSettings.from_dict({**self._settings.to_dict(), **kwargs})
         self.save()

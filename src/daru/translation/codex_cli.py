@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import locale
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -58,6 +60,18 @@ class CodexCliInstallResult:
     executable: str
     version: str
     message: str
+
+
+@dataclass(frozen=True)
+class CodexModelInfo:
+    """One picker-visible model reported by the Codex app server."""
+
+    model: str
+    display_name: str
+    supported_reasoning_efforts: tuple[str, ...]
+    default_reasoning_effort: str
+    input_modalities: tuple[str, ...]
+    is_default: bool = False
 
 
 def _noop_log(_message: str) -> None:
@@ -241,6 +255,296 @@ def _decode_process_output(value: bytes | str | None) -> str:
         except (LookupError, UnicodeDecodeError):
             continue
     return value.decode("utf-8", errors="replace")
+
+
+def _send_app_server_message(
+    process: subprocess.Popen[bytes],
+    message: Mapping[str, Any],
+) -> None:
+    if process.stdin is None:
+        raise CodexCliError("Codex app-server не открыл канал ввода.")
+    payload = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
+    try:
+        process.stdin.write(payload)
+        process.stdin.flush()
+    except (BrokenPipeError, OSError) as exc:
+        raise CodexCliError("Codex app-server закрыл канал ввода.") from exc
+
+
+def _wait_for_app_server_response(
+    messages: "queue.Queue[bytes | None]",
+    request_id: int,
+    *,
+    deadline: float,
+) -> Dict[str, Any]:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CodexCliError(
+                "Codex app-server не вернул список моделей за отведённое время."
+            )
+        try:
+            line = messages.get(timeout=remaining)
+        except queue.Empty as exc:
+            raise CodexCliError(
+                "Codex app-server не вернул список моделей за отведённое время."
+            ) from exc
+        if line is None:
+            raise CodexCliError(
+                "Codex app-server завершился до получения списка моделей."
+            )
+
+        text = _decode_process_output(line).strip()
+        if not text:
+            continue
+        try:
+            response = json.loads(text)
+        except json.JSONDecodeError:
+            # User plugins and older CLI builds can write diagnostics to stdout.
+            continue
+        if not isinstance(response, dict) or response.get("id") != request_id:
+            continue
+        error = response.get("error")
+        if error:
+            if isinstance(error, Mapping):
+                details = str(error.get("message") or error)
+            else:
+                details = str(error)
+            raise CodexCliError(f"Codex app-server отклонил запрос: {details}")
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise CodexCliError(
+                "Codex app-server вернул некорректный ответ на `model/list`."
+            )
+        return result
+
+
+def _stop_app_server(
+    process: subprocess.Popen[bytes],
+    reader: threading.Thread,
+) -> None:
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt" and getattr(process, "pid", None):
+            try:
+                subprocess.run(
+                    [
+                        "taskkill.exe",
+                        "/PID",
+                        str(process.pid),
+                        "/T",
+                        "/F",
+                    ],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+                pass
+        else:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    reader.join(timeout=1)
+    if not reader.is_alive() and process.stdout is not None:
+        # Closing a BufferedReader while another thread is blocked in readline()
+        # can deadlock on Windows, so only close after the reader reached EOF.
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+
+
+def _parse_codex_model(entry: Mapping[str, Any]) -> CodexModelInfo | None:
+    if entry.get("hidden") is True:
+        return None
+    model = str(entry.get("model") or entry.get("id") or "").strip()
+    if not model:
+        return None
+
+    efforts: List[str] = []
+    raw_efforts = entry.get("supportedReasoningEfforts")
+    if isinstance(raw_efforts, list):
+        for raw_effort in raw_efforts:
+            if isinstance(raw_effort, Mapping):
+                value = str(raw_effort.get("reasoningEffort") or "").strip()
+            else:
+                value = str(raw_effort or "").strip()
+            if value and value not in efforts:
+                efforts.append(value)
+
+    raw_modalities = entry.get("inputModalities", ["text", "image"])
+    modalities = (
+        tuple(str(value).strip() for value in raw_modalities if str(value).strip())
+        if isinstance(raw_modalities, list)
+        else ("text", "image")
+    )
+    return CodexModelInfo(
+        model=model,
+        display_name=str(entry.get("displayName") or model).strip() or model,
+        supported_reasoning_efforts=tuple(efforts),
+        default_reasoning_effort=str(
+            entry.get("defaultReasoningEffort") or ""
+        ).strip(),
+        input_modalities=modalities,
+        is_default=bool(entry.get("isDefault", False)),
+    )
+
+
+def list_codex_models(
+    cli_path: str = "",
+    *,
+    timeout: int = 15,
+) -> List[CodexModelInfo]:
+    """Return the model picker catalog exposed by the installed Codex CLI."""
+
+    executable = resolve_codex_cli(cli_path)
+    effective_timeout = max(1, int(timeout))
+    deadline = time.monotonic() + effective_timeout
+    raw_models: List[Mapping[str, Any]] = []
+
+    with _request_temp_directory(prefix="daru-codex-models-") as root:
+        with tempfile.TemporaryFile() as stderr_file:
+            try:
+                process = subprocess.Popen(
+                    _launcher_command(
+                        executable,
+                        ["app-server", "--listen", "stdio://"],
+                    ),
+                    cwd=str(root),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    env=_sanitized_environment(
+                        _isolated_codex_environment(root)
+                    ),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except FileNotFoundError as exc:
+                raise CodexCliError(
+                    f"Не удалось запустить Codex CLI: {executable}"
+                ) from exc
+            except OSError as exc:
+                raise CodexCliError(f"Не удалось запустить Codex CLI: {exc}") from exc
+
+            messages: "queue.Queue[bytes | None]" = queue.Queue()
+
+            def read_stdout() -> None:
+                try:
+                    if process.stdout is not None:
+                        for line in iter(process.stdout.readline, b""):
+                            messages.put(line)
+                finally:
+                    messages.put(None)
+
+            reader = threading.Thread(
+                target=read_stdout,
+                name="daru-codex-model-list",
+                daemon=True,
+            )
+            reader.start()
+            error: CodexCliError | None = None
+            try:
+                _send_app_server_message(
+                    process,
+                    {
+                        "method": "initialize",
+                        "id": 0,
+                        "params": {
+                            "clientInfo": {
+                                "name": "daru",
+                                "title": "Daru DWG Translator",
+                                "version": "1",
+                            }
+                        },
+                    },
+                )
+                _wait_for_app_server_response(messages, 0, deadline=deadline)
+                _send_app_server_message(
+                    process,
+                    {"method": "initialized", "params": {}},
+                )
+
+                request_id = 1
+                cursor = ""
+                seen_cursors = set()
+                while True:
+                    params: Dict[str, Any] = {
+                        "limit": 100,
+                        "includeHidden": False,
+                    }
+                    if cursor:
+                        params["cursor"] = cursor
+                    _send_app_server_message(
+                        process,
+                        {"method": "model/list", "id": request_id, "params": params},
+                    )
+                    result = _wait_for_app_server_response(
+                        messages,
+                        request_id,
+                        deadline=deadline,
+                    )
+                    data = result.get("data")
+                    if not isinstance(data, list):
+                        raise CodexCliError(
+                            "Codex app-server вернул некорректный каталог моделей."
+                        )
+                    raw_models.extend(
+                        entry for entry in data if isinstance(entry, Mapping)
+                    )
+
+                    next_cursor = str(result.get("nextCursor") or "").strip()
+                    if not next_cursor:
+                        break
+                    if next_cursor in seen_cursors:
+                        raise CodexCliError(
+                            "Codex app-server зациклил пагинацию каталога моделей."
+                        )
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
+                    request_id += 1
+            except CodexCliError as exc:
+                error = exc
+            finally:
+                _stop_app_server(process, reader)
+
+            if error is not None:
+                stderr_file.seek(0)
+                details = _compact_error_details(
+                    _decode_process_output(stderr_file.read())
+                )
+                if details:
+                    raise CodexCliError(f"{error}\n\nCodex app-server:\n{details}") from error
+                raise error
+
+    models: List[CodexModelInfo] = []
+    seen_models = set()
+    for raw_model in raw_models:
+        model = _parse_codex_model(raw_model)
+        if model is not None and model.model not in seen_models:
+            models.append(model)
+            seen_models.add(model.model)
+    if not models:
+        raise CodexCliError("Codex CLI не сообщил ни одной доступной модели.")
+    return models
 
 
 def _run_process(
@@ -764,7 +1068,7 @@ class CodexCliStructuredClient:
         self.supports_image = bool(info.get("supports_image", False))
         self.model = (model or CODEX_DEFAULT_ANALYSIS_MODEL).strip()
         effort = (reasoning_effort or "medium").strip().lower()
-        self.reasoning_effort = effort if effort in CODEX_REASONING_EFFORTS else "medium"
+        self.reasoning_effort = effort or "medium"
         self.timeout_seconds = max(10, int(timeout_seconds))
         self.log = log
 
@@ -904,9 +1208,7 @@ class CodexCliTranslator:
         self.supports_ignore_user_config = bool(info["supports_ignore_user_config"])
         self.model = (model or CODEX_DEFAULT_MODEL).strip()
         effort = (reasoning_effort or CODEX_DEFAULT_REASONING_EFFORT).strip().lower()
-        self.reasoning_effort = (
-            effort if effort in CODEX_REASONING_EFFORTS else CODEX_DEFAULT_REASONING_EFFORT
-        )
+        self.reasoning_effort = effort or CODEX_DEFAULT_REASONING_EFFORT
         self.timeout_seconds = max(10, int(timeout_seconds))
 
     def translate(
@@ -924,6 +1226,17 @@ class CodexCliTranslator:
                     instructions=instructions,
                     retry=attempt > 0,
                 )
+                for index, item in enumerate(items):
+                    item_id = str(item["id"])
+                    source = item["text"]
+                    if source.strip() and not mapping[item_id].strip():
+                        source_preview = " ".join(source.split())
+                        if len(source_preview) > 200:
+                            source_preview = source_preview[:200] + "…"
+                        raise CodexCliStructuredOutputError(
+                            f"Codex CLI вернул пустой перевод фрагмента {index + 1} "
+                            f"(id: {item_id!r}). Исходный текст: {source_preview!r}."
+                        )
                 return [mapping[item_id] for item_id in expected_ids]
             except CodexCliStructuredOutputError as exc:
                 last_error = exc
@@ -942,11 +1255,7 @@ class CodexCliTranslator:
 
         selected_model = (model or CODEX_DEFAULT_ANALYSIS_MODEL).strip()
         effort = (reasoning_effort or CODEX_DEFAULT_ANALYSIS_REASONING_EFFORT).strip().lower()
-        selected_effort = (
-            effort
-            if effort in CODEX_REASONING_EFFORTS
-            else CODEX_DEFAULT_ANALYSIS_REASONING_EFFORT
-        )
+        selected_effort = effort or CODEX_DEFAULT_ANALYSIS_REASONING_EFFORT
         last_error: CodexCliStructuredOutputError | None = None
         for attempt in range(2):
             try:
@@ -1068,8 +1377,11 @@ class CodexCliTranslator:
         schema = _translation_schema(expected_ids)
         payload = json.dumps({"items": list(items)}, ensure_ascii=False)
         retry_note = (
-            "\n\nThe previous response failed structural validation. Return every requested "
-            "id exactly once and no additional fields."
+            "\n\nThe previous response failed validation. Return every requested "
+            "id exactly once and no additional fields. Return a non-empty translation for "
+            "every non-empty source item; never return empty or whitespace-only text for "
+            "a non-empty source. Preserve identifiers or symbols unchanged when they do "
+            "not need translation."
             if retry
             else ""
         )
@@ -1161,6 +1473,7 @@ __all__ = [
     "CodexCliError",
     "CodexCliAuthenticationError",
     "CodexCliInstallResult",
+    "CodexModelInfo",
     "CodexCliStructuredClient",
     "CodexCliStructuredOutputError",
     "CodexCliTransientError",
@@ -1168,6 +1481,7 @@ __all__ = [
     "check_codex_cli",
     "install_or_update_codex_cli",
     "inspect_codex_cli",
+    "list_codex_models",
     "login_codex_cli",
     "resolve_codex_cli",
 ]

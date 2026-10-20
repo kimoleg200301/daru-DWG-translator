@@ -9,8 +9,10 @@ from typing import Dict, Iterable, List, Tuple
 import ezdxf
 
 from .entities import (
-    ENTITY_TARGETS,
     get_dim_override_text,
+    iter_block_definitions,
+    iter_text_entities,
+    safe_get_mleader_text,
     safe_mtext_text,
     safe_table_cell_text,
 )
@@ -27,7 +29,7 @@ def record_text(bag: List[Tuple[str, str, str]], kind: str, detail: str, text: s
 
 def process_entity(e, bag: List[Tuple[str, str, str]], prefix: str = "") -> None:
     dxft = e.dxftype()
-    kind = prefix or dxft
+    kind = f"{prefix}:{dxft}" if prefix else dxft
 
     if dxft == "TEXT":
         record_text(bag, kind, "", e.dxf.text or "")
@@ -46,15 +48,7 @@ def process_entity(e, bag: List[Tuple[str, str, str]], prefix: str = "") -> None
         return
 
     if dxft in ("MULTILEADER", "MLEADER", "LEADER"):
-        for meth in ("get_mtext", "mtext"):
-            try:
-                v = getattr(e, meth)
-                v = v() if callable(v) else v
-                if isinstance(v, str) and v.strip():
-                    record_text(bag, kind, "", v)
-                    break
-            except Exception:
-                continue
+        record_text(bag, kind, "", safe_get_mleader_text(e))
         return
 
     if dxft == "TABLE":
@@ -80,18 +74,16 @@ def process_entity(e, bag: List[Tuple[str, str, str]], prefix: str = "") -> None
 
 
 def walk_layout(layout, bag):
-    for e in layout:
-        if e.dxftype() in ENTITY_TARGETS or e.dxftype() in ("INSERT", "MINSERT"):
-            process_entity(e, bag)
+    for e in iter_text_entities(layout):
+        process_entity(e, bag)
 
 
 def walk_blocks(doc, bag):
-    for block in doc.blocks:
+    for block in iter_block_definitions(doc):
         name = block.name
         prefix = f"BLOCK:{name}" if name else "BLOCK"
-        for e in block:
-            if e.dxftype() in ENTITY_TARGETS or e.dxftype() in ("INSERT", "MINSERT"):
-                process_entity(e, bag, prefix)
+        for e in iter_text_entities(block):
+            process_entity(e, bag, prefix)
 
 
 def collect_text_bag(doc) -> List[Tuple[str, str, str]]:
@@ -144,9 +136,7 @@ def build_entity_types(bag: Iterable[Tuple[str, str, str]]) -> Dict[str, str]:
         key = (txt or "").strip()
         if not key:
             continue
-        base_type = kind.split(":")[0] if ":" in kind else kind
-        if base_type.startswith("BLOCK"):
-            base_type = kind.split(":")[-1] if ":" in kind else "BLOCK"
+        base_type = kind.rsplit(":", 1)[-1]
         bucket = type_counts.setdefault(key, {})
         bucket[base_type] = bucket.get(base_type, 0) + 1
     result: Dict[str, str] = {}

@@ -1,7 +1,5 @@
 """Tests for daru.config — AppSettings and SettingsManager."""
 
-import json
-from pathlib import Path
 
 from daru.config import (
     OPENAI_DEFAULT_BASE_URL,
@@ -10,9 +8,13 @@ from daru.config import (
     ORIGINAL_FONT_VALUE,
     AppSettings,
     LANGUAGE_CHOICES,
+    LANGUAGE_LABEL_BY_CODE,
+    LANGUAGE_OPTIONS,
     SettingsManager,
     TRANSLATOR_CHOICES,
     get_openai_model_profile,
+    language_prompt_label,
+    normalize_language_code,
     normalize_openai_base_url,
     normalize_style_font,
     normalize_translator_name,
@@ -33,6 +35,7 @@ class TestAppSettings:
         assert s.codex_reasoning_effort == "low"
         assert s.codex_analysis_model == "gpt-5.5"
         assert s.codex_analysis_reasoning_effort == "high"
+        assert s.codex_analysis_auto_approve is False
         assert s.codex_timeout_seconds == 300
         assert s.pdf_vision_backend == "openai_api"
         assert s.pdf_vision_model == "gpt-5.5"
@@ -64,6 +67,7 @@ class TestAppSettings:
         assert s.source_lang == "en"  # default preserved
         assert s.codex_analysis_model == "gpt-5.5"
         assert s.codex_analysis_reasoning_effort == "high"
+        assert s.codex_analysis_auto_approve is False
         assert s.pdf_vision_model == "gpt-5.5"
         assert s.pdf_vision_backend == "openai_api"
         assert s.pdf_vision_request_mode == "batched"
@@ -123,6 +127,7 @@ class TestSettingsManager:
             target_lang="de",
             codex_analysis_model="gpt-5.4",
             codex_analysis_reasoning_effort="xhigh",
+            codex_analysis_auto_approve=True,
         )
 
         mgr2 = SettingsManager(path=path)
@@ -130,6 +135,7 @@ class TestSettingsManager:
         assert mgr2.data.target_lang == "de"
         assert mgr2.data.codex_analysis_model == "gpt-5.4"
         assert mgr2.data.codex_analysis_reasoning_effort == "xhigh"
+        assert mgr2.data.codex_analysis_auto_approve is True
 
     def test_load_missing_file(self, tmp_path):
         path = tmp_path / "nonexistent.json"
@@ -155,6 +161,25 @@ class TestConstants:
         assert len(LANGUAGE_CHOICES) > 0
         assert "en" in LANGUAGE_CHOICES
         assert "ru" in LANGUAGE_CHOICES
+        assert "kk" in LANGUAGE_CHOICES
+
+    def test_language_options_are_localized_and_sorted(self):
+        labels = [label for label, _code in LANGUAGE_OPTIONS]
+
+        assert labels == sorted(labels, key=str.casefold)
+        assert LANGUAGE_CHOICES == [code for _label, code in LANGUAGE_OPTIONS]
+        assert LANGUAGE_LABEL_BY_CODE["ru"] == "Русский"
+        assert LANGUAGE_LABEL_BY_CODE["kk"] == "Казахский"
+
+    def test_normalize_language_code_accepts_localized_labels(self):
+        assert normalize_language_code("Русский") == "ru"
+        assert normalize_language_code("Казахский") == "kk"
+        assert normalize_language_code("en") == "en"
+
+    def test_language_prompt_label_includes_name_and_code(self):
+        assert language_prompt_label("ru") == "Русский (ru)"
+        assert language_prompt_label("Казахский") == "Казахский (kk)"
+        assert language_prompt_label("auto", "auto", allow_auto=True) == "auto-detected"
 
     def test_translator_choices(self):
         assert TRANSLATOR_CHOICES == ["google", "deepl", "chatgpt", "codex", "noop"]
